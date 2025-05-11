@@ -44,6 +44,7 @@ class HSTUFlashAttentionFunctionGPU
       const std::optional<at::Tensor>& seq_offsets,
       bool causal,
       const std::optional<at::Tensor>& num_targets,
+      const std::optional<at::Tensor>& attn_scale,
       int64_t max_attn_len,
       int64_t min_full_attn_seq_len,
       int64_t contextual_seq_len,
@@ -58,7 +59,8 @@ class HSTUFlashAttentionFunctionGPU
          k,
          v,
          seq_offsets.value_or(at::Tensor()),
-         num_targets.value_or(at::Tensor())});
+         num_targets.value_or(at::Tensor()),
+         attn_scale.value_or(at::Tensor())});
     ctx->saved_data["max_seq_len"] = max_seq_len;
     ctx->saved_data["alpha"] = alpha;
     ctx->saved_data["causal"] = causal;
@@ -78,6 +80,7 @@ class HSTUFlashAttentionFunctionGPU
         seq_offsets, // seq_offsets
         causal, // causal
         num_targets, // num_targets
+        attn_scale, // attn_scale
         max_attn_len, // max_attn_len
         min_full_attn_seq_len, // min_full_attn_seq_len
         contextual_seq_len, // contextual_seq_len
@@ -97,10 +100,13 @@ class HSTUFlashAttentionFunctionGPU
     auto v = saved_tensors[2];
     auto seq_offsets = saved_tensors[3];
     auto num_targets = saved_tensors[4];
+    auto attn_scale = saved_tensors[5];
     auto seq_offsets_opt =
         seq_offsets.defined() ? std::optional(seq_offsets) : std::nullopt;
     auto num_targets_opt =
         num_targets.defined() ? std::optional(num_targets) : std::nullopt;
+    auto attn_scale_opt =
+        attn_scale.defined() ? std::optional(attn_scale) : std::nullopt;
 
     auto dq = at::empty_like(q);
     auto dk = at::empty_like(k);
@@ -119,6 +125,7 @@ class HSTUFlashAttentionFunctionGPU
         seq_offsets_opt, // seq_offsets
         saved_data["causal"].toBool(), // causal
         num_targets_opt, // num_targets
+        attn_scale_opt, // attn_scale
         saved_data["max_attn_len"].toInt(), // max_attn_len
         saved_data["min_full_attn_seq_len"].toInt(), // min_full_attn_seq_len
         saved_data["contextual_seq_len"].toInt(), // contextual_seq_len
@@ -135,6 +142,7 @@ class HSTUFlashAttentionFunctionGPU
         torch::autograd::Variable(), // seq_offsets
         torch::autograd::Variable(), // causal
         torch::autograd::Variable(), // num_targets
+        torch::autograd::Variable(), // attn_scale
         torch::autograd::Variable(), // max_attn_len
         torch::autograd::Variable(), // min_full_attn_seq_len
         torch::autograd::Variable(), // contextual_seq_len
@@ -157,6 +165,7 @@ at::Tensor cuda_hstu_mha(
     const std::optional<at::Tensor>& seq_offsets,
     bool causal,
     const std::optional<at::Tensor>& num_targets,
+    const std::optional<at::Tensor>& attn_scale,
     int64_t max_attn_len,
     int64_t min_full_attn_seq_len,
     int64_t contextual_seq_len,
@@ -175,6 +184,7 @@ at::Tensor cuda_hstu_mha(
       seq_offsets,
       causal,
       num_targets,
+      attn_scale,
       max_attn_len,
       min_full_attn_seq_len,
       contextual_seq_len,
@@ -195,6 +205,7 @@ at::Tensor hstu_mha_cpu(
     const std::optional<at::Tensor>& seq_offsets,
     bool causal,
     const std::optional<at::Tensor>& num_targets,
+    const std::optional<at::Tensor>& attn_scale,
     int64_t max_attn_len,
     int64_t min_full_attn_seq_len,
     int64_t contextual_seq_len,
@@ -213,6 +224,7 @@ at::Tensor hstu_mha_cpu(
       seq_offsets,
       causal,
       num_targets,
+      attn_scale,
       max_attn_len,
       min_full_attn_seq_len,
       contextual_seq_len,
@@ -231,6 +243,7 @@ at::Tensor hstu_mha_meta(
     const std::optional<at::Tensor>& seq_offsets,
     bool causal,
     const std::optional<at::Tensor>& num_targets,
+    const std::optional<at::Tensor>& attn_scale,
     int64_t max_attn_len,
     int64_t min_full_attn_seq_len,
     int64_t contextual_seq_len,
@@ -249,6 +262,7 @@ at::Tensor hstu_mha_meta(
       seq_offsets,
       causal,
       num_targets,
+      attn_scale,
       max_attn_len,
       min_full_attn_seq_len,
       contextual_seq_len,
@@ -269,6 +283,7 @@ TORCH_LIBRARY_FRAGMENT(hstu, m) {
       "Tensor? seq_offsets, "
       "bool causal, "
       "Tensor? num_targets, "
+      "Tensor? attn_scale, "
       "int max_attn_len, "
       "int min_full_attn_seq_len, "
       "int contextual_seq_len, "
@@ -302,6 +317,7 @@ TORCH_LIBRARY_FRAGMENT(hstu, m) {
       "Tensor? seq_offsets, "
       "bool causal, "
       "Tensor? num_targets, "
+      "Tensor? attn_scale, "
       "int max_attn_len, "
       "int min_full_attn_seq_len, "
       "int contextual_seq_len, "
@@ -325,6 +341,7 @@ TORCH_LIBRARY_FRAGMENT(hstu, m) {
       "Tensor? seq_offsets, "
       "bool causal, "
       "Tensor? num_targets, "
+      "Tensor? attn_scale, "
       "int max_attn_len, "
       "int min_full_attn_seq_len, "
       "int contextual_seq_len, "

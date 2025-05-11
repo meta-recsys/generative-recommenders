@@ -357,6 +357,7 @@ struct CollectiveMainloopBwdSm80 {
     int* const dq_semaphore;
     int const* const seq_offsets = nullptr;
     int const* const num_targets = nullptr;
+    float const* const attn_scale = nullptr;
   };
 
   // Device side kernel params
@@ -383,6 +384,7 @@ struct CollectiveMainloopBwdSm80 {
     int* const dq_semaphore;
     int const* const seq_offsets;
     int const* const num_targets;
+    float const* const attn_scale;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
@@ -411,7 +413,8 @@ struct CollectiveMainloopBwdSm80 {
         args.num_batch,
         args.dq_semaphore,
         args.seq_offsets,
-        args.num_targets};
+        args.num_targets,
+        args.attn_scale};
   }
 
   CUTLASS_DEVICE
@@ -885,6 +888,10 @@ struct CollectiveMainloopBwdSm80 {
           tSrS_sigmoid.data(),
           flash::convert_layout_acc_rowcol</*Transposed=*/SdP_swapAB>(
               tSrS_sigmoid.layout()));
+
+      float scale = params.attn_scale == nullptr
+          ? params.max_seq_len_inv
+          : params.attn_scale[0]; // TODO: generalize
       mask_fn(tSrS, m_block);
 #pragma unroll
       for (int mi = 0; mi < size<0>(scores); ++mi) {
@@ -893,8 +900,7 @@ struct CollectiveMainloopBwdSm80 {
           scores(mi, ni) = scores(mi, ni) * params.alpha;
           sigmoid(mi, ni) =
               __fdividef(1., 1.0f + cutlass::fast_exp(-scores(mi, ni)));
-          scores(mi, ni) =
-              sigmoid(mi, ni) * scores(mi, ni) * params.max_seq_len_inv;
+          scores(mi, ni) = sigmoid(mi, ni) * scores(mi, ni) * scale;
         }
       }
       mask_fn(tSrS_sigmoid, m_block);
@@ -933,7 +939,7 @@ struct CollectiveMainloopBwdSm80 {
       for (int mi = 0; mi < size<0>(dS); ++mi) {
 #pragma unroll
         for (int ni = 0; ni < size<1>(dS); ++ni) {
-          dS(mi, ni) = dS(mi, ni) * sigmoid(mi, ni) * params.max_seq_len_inv +
+          dS(mi, ni) = dS(mi, ni) * sigmoid(mi, ni) * scale +
               dS(mi, ni) * scores(mi, ni) * (1.f - sigmoid(mi, ni));
           dS(mi, ni) = dS(mi, ni) * params.alpha;
         }

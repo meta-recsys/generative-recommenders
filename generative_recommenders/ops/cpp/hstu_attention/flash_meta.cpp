@@ -31,6 +31,7 @@ at::Tensor hstu_mha_fwd_meta(
     const std::optional<at::Tensor>& seq_offsets,
     bool causal,
     const std::optional<at::Tensor>& num_targets,
+    const std::optional<at::Tensor>& attn_scale,
     int64_t max_attn_len,
     int64_t min_full_attn_seq_len,
     int64_t contextual_seq_len,

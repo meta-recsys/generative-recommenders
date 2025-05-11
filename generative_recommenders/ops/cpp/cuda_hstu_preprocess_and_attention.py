@@ -54,6 +54,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         alpha: float,
         invalid_attn_mask_type: str,
         num_targets: Optional[torch.Tensor],
+        attn_scale: Optional[torch.Tensor] = None,
         recompute_uvqk_in_backward: bool = False,
         recompute_normed_x_in_backward: bool = False,
         contextual_seq_len: int = 0,
@@ -95,6 +96,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             seq_offsets,
             True,  # causal
             num_targets,
+            attn_scale,
             max_attn_len,
             full_attn_size,
             contextual_seq_len,
@@ -115,6 +117,8 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         ]
         if num_targets is not None:
             saved_tensors.append(num_targets)
+        if attn_scale is not None:
+            saved_tensors.append(attn_scale)
         if not recompute_normed_x_in_backward:
             saved_tensors.append(normed_x)
         if recompute_uvqk_in_backward:
@@ -125,6 +129,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         ctx.alpha = alpha
         ctx.invalid_attn_mask_type = invalid_attn_mask_type
         ctx.has_multiple_targets = num_targets is not None
+        ctx.has_attn_scale = attn_scale is not None
         ctx.max_seq_len = max_seq_len
         ctx.max_attn_len = max_attn_len
         ctx.full_attn_size = full_attn_size
@@ -170,6 +175,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         None,
         None,
         None,
+        None,
     ]:
         x, norm_weight, norm_bias, x_mean, x_rstd, uvqk_weight, seq_offsets = (
             ctx.saved_tensors[:7]
@@ -180,6 +186,11 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             idx += 1
         else:
             num_targets = None
+        if ctx.has_attn_scale:
+            attn_scale = ctx.saved_tensors[idx]
+            idx += 1
+        else:
+            attn_scale = None
         if ctx.recompute_normed_x_in_backward:
             normed_x, _, _, _, _ = triton_weighted_layer_norm_fwd(
                 x=x,
@@ -239,6 +250,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             seq_offsets,
             True,  # causal
             num_targets,
+            attn_scale,
             ctx.max_attn_len,
             ctx.full_attn_size,
             ctx.contextual_seq_len,
@@ -298,6 +310,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -316,6 +329,7 @@ def cuda_hstu_preprocess_and_attention(
     alpha: float,
     invalid_attn_mask_type: str,
     num_targets: Optional[torch.Tensor],
+    attn_scale: Optional[torch.Tensor] = None,
     recompute_uvqk_in_backward: bool = False,
     recompute_normed_x_in_backward: bool = False,
     contextual_seq_len: int = 0,
@@ -339,6 +353,7 @@ def cuda_hstu_preprocess_and_attention(
         alpha,
         invalid_attn_mask_type,
         num_targets,
+        attn_scale,
         recompute_uvqk_in_backward,
         recompute_normed_x_in_backward,
         contextual_seq_len,

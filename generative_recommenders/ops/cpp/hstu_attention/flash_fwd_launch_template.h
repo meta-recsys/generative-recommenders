@@ -220,6 +220,7 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
       params.contextual_seq_len,
       params.seq_offsets,
       params.num_targets,
+      params.attn_scale,
   };
   typename CollectiveEpilogue::Arguments epilogue_args{
       static_cast<ElementOut*>(params.o_ptr),

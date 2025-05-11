@@ -65,6 +65,7 @@ void set_params_fprop(
     const at::Tensor v,
     void* seq_offsets,
     void* num_targets,
+    void* attn_scale,
     bool causal,
     float alpha,
     const int max_attn_len,
@@ -98,6 +99,7 @@ void set_params_fprop(
 
   params.seq_offsets = static_cast<int*>(seq_offsets);
   params.num_targets = static_cast<int*>(num_targets);
+  params.attn_scale = static_cast<float*>(attn_scale);
 
   // Set the dimensions.
   params.b = b;
@@ -152,6 +154,7 @@ void set_params_dgrad(
     void* dq_accum_d,
     void* seq_offsets,
     void* num_targets,
+    void* attn_scale,
     void* sort_by_length_indices,
     const bool causal,
     const float alpha,
@@ -173,6 +176,7 @@ void set_params_dgrad(
       v,
       seq_offsets,
       num_targets,
+      attn_scale,
       causal,
       alpha,
       max_attn_len,
@@ -318,6 +322,7 @@ at::Tensor hstu_mha_fwd(
     const std::optional<at::Tensor>& seq_offsets,
     bool causal,
     const std::optional<at::Tensor>& num_targets,
+    const std::optional<at::Tensor>& attn_scale,
     int64_t max_attn_len,
     int64_t min_full_attn_seq_len,
     int64_t contextual_seq_len,
@@ -378,6 +383,15 @@ at::Tensor hstu_mha_fwd(
     TORCH_CHECK(
         num_targets_.dtype() == torch::kInt32,
         "num_targets_ must have dtype torch.int32");
+  }
+  at::Tensor attn_scale_;
+  bool const has_attn_scale = attn_scale.has_value();
+  if (has_attn_scale) {
+    attn_scale_ = attn_scale.value();
+    CHECK_DEVICE(attn_scale_);
+    TORCH_CHECK(
+        attn_scale_.dtype() == torch::kFloat32,
+        "attn_scale_ must have dtype torch.float32");
   }
 #ifdef HSTU_FLASH_ATTN_DEBUG_INFO
   if (is_jagged && has_multiple_targets) {
@@ -474,6 +488,7 @@ at::Tensor hstu_mha_fwd(
       v,
       !is_jagged ? nullptr : seq_offsets_.data_ptr(),
       !has_multiple_targets ? nullptr : num_targets_.data_ptr(),
+      !has_attn_scale ? nullptr : attn_scale_.data_ptr(),
       causal,
       alpha,
       max_attn_len,
@@ -626,6 +641,7 @@ std::vector<at::Tensor> hstu_mha_bwd(
     const std::optional<at::Tensor>& seq_offsets,
     bool causal,
     const std::optional<at::Tensor>& num_targets,
+    const std::optional<at::Tensor>& attn_scale,
     int64_t max_attn_len,
     int64_t min_full_attn_seq_len,
     int64_t contextual_seq_len,
@@ -701,7 +717,15 @@ std::vector<at::Tensor> hstu_mha_bwd(
         num_targets_.dtype() == torch::kInt32,
         "num_targets_ must have dtype torch.int32");
   }
-
+  at::Tensor attn_scale_;
+  bool const has_attn_scale = attn_scale.has_value();
+  if (has_attn_scale) {
+    attn_scale_ = attn_scale.value();
+    CHECK_DEVICE(attn_scale_);
+    TORCH_CHECK(
+        attn_scale_.dtype() == torch::kFloat32,
+        "attn_scale_ must have dtype torch.float32");
+  }
   auto const sizes = q.sizes();
   int const batch_size = !is_jagged ? sizes[0] : seq_offsets_.size(0) - 1;
   if (!is_jagged) {
@@ -826,6 +850,7 @@ std::vector<at::Tensor> hstu_mha_bwd(
       dq_accum.data_ptr(),
       !is_jagged ? nullptr : seq_offsets_.data_ptr(),
       !has_multiple_targets ? nullptr : num_targets_.data_ptr(),
+      !has_attn_scale ? nullptr : attn_scale_.data_ptr(),
       !(sort_by_length && is_jagged) ? nullptr
                                      : sort_by_length_indices_.data_ptr(),
       causal,

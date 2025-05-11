@@ -75,6 +75,7 @@ struct Flash_fwd_params : public Qkv_params {
 
   int* __restrict__ seq_offsets;
   int* __restrict__ num_targets;
+  float* __restrict__ attn_scale;
 
   // Local window size
   int max_attn_len, contextual_seq_len, min_full_attn_seq_len;

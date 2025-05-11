@@ -260,6 +260,7 @@ struct CollectiveMainloopFwdSm80 {
     int const contextual_seq_len;
     int const* const seq_offsets = nullptr;
     int const* const num_targets = nullptr;
+    float const* const attn_scale = nullptr;
   };
 
   // Device side kernel params
@@ -283,6 +284,7 @@ struct CollectiveMainloopFwdSm80 {
     int const contextual_seq_len;
     int const* const seq_offsets = nullptr;
     int const* const num_targets = nullptr;
+    float const* const attn_scale = nullptr;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
@@ -326,7 +328,8 @@ struct CollectiveMainloopFwdSm80 {
         args.min_full_attn_seq_len,
         args.contextual_seq_len,
         args.seq_offsets,
-        args.num_targets};
+        args.num_targets,
+        args.attn_scale};
   }
 
   CUTLASS_DEVICE
@@ -784,8 +787,10 @@ struct CollectiveMainloopFwdSm80 {
           smem_thr_copy_K,
           load_V_next);
       smem_pipe_write = smem_pipe_write < kStages - 1 ? smem_pipe_write + 1 : 0;
-      flash::inplace_silu_scale<float>(
-          tSrS, params.alpha, params.max_seq_len_inv);
+      float scale = params.attn_scale == nullptr
+          ? params.max_seq_len_inv
+          : params.attn_scale[0]; // TODO: generalize
+      flash::inplace_silu_scale<float>(tSrS, params.alpha, scale);
       // Faster to load_K before gemm if we only have 1 stage
       if constexpr (kStages == 1) {
         sync();

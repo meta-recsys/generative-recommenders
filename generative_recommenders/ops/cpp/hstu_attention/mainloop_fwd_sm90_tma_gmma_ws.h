@@ -486,6 +486,7 @@ struct CollectiveMainloopFwdSm90 {
     int const contextual_seq_len;
     int const* const seq_offsets = nullptr;
     int const* const num_targets = nullptr;
+    float const* const attn_scale = nullptr;
   };
 
   // Device side kernel params
@@ -512,6 +513,7 @@ struct CollectiveMainloopFwdSm90 {
     int const contextual_seq_len;
     int const* const seq_offsets = nullptr;
     int const* const num_targets = nullptr;
+    float const* const attn_scale = nullptr;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
@@ -581,7 +583,8 @@ struct CollectiveMainloopFwdSm90 {
         args.min_full_attn_seq_len,
         args.contextual_seq_len,
         args.seq_offsets,
-        args.num_targets};
+        args.num_targets,
+        args.attn_scale};
   }
 
   /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best
@@ -1251,8 +1254,10 @@ struct CollectiveMainloopFwdSm90 {
         tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
     warpgroup_wait<0>();
     pipeline_k.consumer_release(smem_pipe_read);
-    flash::inplace_silu_scale<float>(
-        tSrS, params.alpha, params.max_seq_len_inv);
+    float scale = params.attn_scale == nullptr
+        ? params.max_seq_len_inv
+        : params.attn_scale[0]; // TODO: generalize
+    flash::inplace_silu_scale<float>(tSrS, params.alpha, scale);
     int const m_idx_max = (m_block + 1) * kBlockM;
     if (m_idx_max <= seqlen_info.uihlen) {
       mask.template apply<
@@ -1324,8 +1329,7 @@ struct CollectiveMainloopFwdSm90 {
       warp_scheduler_barrier_arrive();
       warpgroup_wait<1>();
       pipeline_k.consumer_release(smem_pipe_read); // release K
-      flash::inplace_silu_scale<float>(
-          tSrS, params.alpha, params.max_seq_len_inv);
+      flash::inplace_silu_scale<float>(tSrS, params.alpha, scale);
       mask_fn(tSrS, n_block);
       warpgroup_wait<0>();
       pipeline_v.consumer_release(smem_pipe_read_v); // release V
