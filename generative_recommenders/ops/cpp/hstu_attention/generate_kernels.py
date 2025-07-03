@@ -179,7 +179,7 @@ def main(output_dir_name: Optional[str]) -> None:
         write_kernel(kernel, output_dir)
 
 
-if __name__ == "__main__":
+def invoke_main() -> None:
     parser = argparse.ArgumentParser(
         prog="generate_kernels",
         description="Generate the flash_attention kernels template instantiations",
@@ -194,3 +194,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     main(args.output_dir)
+
+
+if __name__ == "__main__":
+    # Do not add code here, it won't be run. Add them to the function called below.
+    invoke_main()  # pragma: no cover
