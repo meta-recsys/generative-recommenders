@@ -20,22 +20,25 @@
 
 #pragma once
 
+// clang-format off
 #include "cute/tensor.hpp"
 
+#include "cutlass/cutlass.h"
+#include "cutlass/device_kernel.h"  // For device_kernel
 #include <cutlass/kernel_hardware_info.h>
 #include "cutlass/cluster_launch.hpp"
-#include "cutlass/cutlass.h"
-#include "cutlass/device_kernel.h" // For device_kernel
+#include "cutlass/kernel_launch.h"
 
-#include "epilogue_fwd.h"
-#include "flash.h"
-#include "flash_fwd_kernel_sm80.h"
-#include "flash_fwd_kernel_sm90.h"
-#include "mainloop_fwd_sm80.h"
-#include "mainloop_fwd_sm90_tma_gmma_ws.h"
 #include "static_switch.h"
-#include "tile_scheduler.h"
+#include "flash.h"
 #include "tile_size.h"
+#include "tile_scheduler.h"
+#include "flash_fwd_kernel_sm90.h"
+#include "flash_fwd_kernel_sm80.h"
+#include "mainloop_fwd_sm90_tma_gmma_ws.h"
+#include "mainloop_fwd_sm80.h"
+#include "epilogue_fwd.h"
+// clang-format on
 
 using namespace cute;
 
