@@ -109,6 +109,7 @@ class ContextualPreprocessor(InputPreprocessor):
     def __init__(
         self,
         input_embedding_dim: int,
+        hidden_dim: int,
         output_embedding_dim: int,
         contextual_feature_to_max_length: Dict[str, int],
         contextual_feature_to_min_uih_length: Dict[str, int],
@@ -120,6 +121,7 @@ class ContextualPreprocessor(InputPreprocessor):
         super().__init__(is_inference=is_inference)
         self._output_embedding_dim: int = output_embedding_dim
         self._input_embedding_dim: int = input_embedding_dim
+        self._hidden_dim: int = hidden_dim
         self._contextual_feature_to_max_length: Dict[str, int] = (
             contextual_feature_to_max_length
         )
@@ -151,15 +153,14 @@ class ContextualPreprocessor(InputPreprocessor):
                     ).fill_(0.0)
                 )
             )
-        hidden_dim = 256
         self._content_embedding_mlp: torch.nn.Module = torch.nn.Sequential(
             torch.nn.Linear(
                 in_features=self._input_embedding_dim,
-                out_features=hidden_dim,
+                out_features=self._hidden_dim,
             ),
-            SwishLayerNorm(hidden_dim),
+            SwishLayerNorm(self._hidden_dim),
             torch.nn.Linear(
-                in_features=hidden_dim,
+                in_features=self._hidden_dim,
                 out_features=self._output_embedding_dim,
             ),
             LayerNorm(self._output_embedding_dim),
@@ -176,11 +177,11 @@ class ContextualPreprocessor(InputPreprocessor):
             self._action_embedding_mlp: torch.nn.Module = torch.nn.Sequential(
                 torch.nn.Linear(
                     in_features=self._action_encoder.output_embedding_dim,
-                    out_features=hidden_dim,
+                    out_features=self._hidden_dim,
                 ),
-                SwishLayerNorm(hidden_dim),
+                SwishLayerNorm(self._hidden_dim),
                 torch.nn.Linear(
-                    in_features=hidden_dim,
+                    in_features=self._hidden_dim,
                     out_features=self._output_embedding_dim,
                 ),
                 LayerNorm(self._output_embedding_dim),
