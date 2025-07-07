@@ -71,6 +71,7 @@ class DlrmHSTUConfig:
     hstu_attn_qk_dim: int = 128
     hstu_attn_num_layers: int = 12
     hstu_embedding_table_dim: int = 192
+    hstu_preprocessor_hidden_dim: int = 256
     hstu_transducer_embedding_dim: int = 0
     hstu_group_norm: bool = False
     hstu_input_dropout_ratio: float = 0.2
@@ -151,6 +152,7 @@ class DlrmHSTU(HammerModule):
         # preprocessor setup
         preprocessor = ContextualPreprocessor(
             input_embedding_dim=hstu_configs.hstu_embedding_table_dim,
+            hidden_dim=hstu_configs.hstu_preprocessor_hidden_dim,
             output_embedding_dim=hstu_configs.hstu_transducer_embedding_dim,
             contextual_feature_to_max_length=hstu_configs.contextual_feature_to_max_length,
             contextual_feature_to_min_uih_length=hstu_configs.contextual_feature_to_min_uih_length,
