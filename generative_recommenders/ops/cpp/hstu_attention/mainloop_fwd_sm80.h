@@ -261,6 +261,7 @@ struct CollectiveMainloopFwdSm80 {
     int const* const seq_offsets = nullptr;
     int const* const num_targets = nullptr;
     float const* const attn_scale = nullptr;
+    bool const scalar_scale = true;
   };
 
   // Device side kernel params
@@ -285,6 +286,7 @@ struct CollectiveMainloopFwdSm80 {
     int const* const seq_offsets = nullptr;
     int const* const num_targets = nullptr;
     float const* const attn_scale = nullptr;
+    bool const scalar_scale = true;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
@@ -329,7 +331,8 @@ struct CollectiveMainloopFwdSm80 {
         args.contextual_seq_len,
         args.seq_offsets,
         args.num_targets,
-        args.attn_scale};
+        args.attn_scale,
+        args.scalar_scale};
   }
 
   CUTLASS_DEVICE
@@ -715,8 +718,30 @@ struct CollectiveMainloopFwdSm80 {
         params.min_full_attn_seq_len,
         params.contextual_seq_len,
         seqlen_info.uihlen);
-
     int smem_pipe_read = 0, smem_pipe_write = kStages - 1;
+
+    // attention scale
+    float scalar_scale_val = params.scalar_scale
+        ? (params.attn_scale == nullptr ? params.max_seq_len_inv
+                                        : params.attn_scale[0])
+        : 0;
+    static constexpr int Qdim = 0;
+    auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
+    auto thread0_mma = tiled_mma.get_thread_slice(_0{});
+    Tensor cS = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+    Tensor tScS = thread_mma.partition_C(cS);
+    Tensor tScS_rowcol = make_tensor(
+        tScS.data(),
+        flash::convert_layout_acc_rowcol</*Transposed=*/false>(tScS.layout()));
+    Tensor t0ScS = thread0_mma.partition_C(cS);
+    Tensor t0ScS_rowcol = make_tensor(
+        t0ScS.data(),
+        flash::convert_layout_acc_rowcol</*Transposed=*/false>(t0ScS.layout()));
+    int const thread_qdim_offset = get<Qdim>(tScS_rowcol(_0{}, _0{}));
+    SiluScaleOp<float> silu_scale_op;
+    int qdim_offset = params.scalar_scale
+        ? 0
+        : m_block * kBlockM + thread_qdim_offset + seqlen_info.offset_q;
 
     auto load_K_next = [&] {
       int const prefetch_n_block = get_pipeline_n_block(
@@ -749,6 +774,10 @@ struct CollectiveMainloopFwdSm80 {
           decltype(is_boundary_iter_type)::value;
       Tensor tSrS =
           partition_fragment_C(tiled_mma, select<0, 1>(TileShape_MNK{}));
+      Tensor tSrS_rowcol = make_tensor(
+          tSrS.data(),
+          flash::convert_layout_acc_rowcol</*Transposed=*/false>(
+              tSrS.layout()));
       clear(tSrS);
       sync();
       auto load_V_next = [&] {
@@ -787,10 +816,21 @@ struct CollectiveMainloopFwdSm80 {
           smem_thr_copy_K,
           load_V_next);
       smem_pipe_write = smem_pipe_write < kStages - 1 ? smem_pipe_write + 1 : 0;
-      float scale = params.attn_scale == nullptr
-          ? params.max_seq_len_inv
-          : params.attn_scale[0]; // TODO: generalize
-      flash::inplace_silu_scale<float>(tSrS, params.alpha, scale);
+#pragma unroll
+      for (int mi = 0; mi < size<0>(tSrS_rowcol); ++mi) {
+        float scale = scalar_scale_val;
+        if (!params.scalar_scale) {
+          int q_index = qdim_offset + int(get<Qdim>(t0ScS_rowcol(mi, _0{})));
+          if (q_index < seqlen_info.seqlen) {
+            scale = params.attn_scale[q_index];
+          }
+        }
+#pragma unroll
+        for (int ni = 0; ni < size<1>(tSrS_rowcol); ++ni) {
+          tSrS_rowcol(mi, ni) =
+              silu_scale_op(tSrS_rowcol(mi, ni) * params.alpha, scale);
+        }
+      }
       // Faster to load_K before gemm if we only have 1 stage
       if constexpr (kStages == 1) {
         sync();

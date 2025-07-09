@@ -487,6 +487,7 @@ struct CollectiveMainloopFwdSm90 {
     int const* const seq_offsets = nullptr;
     int const* const num_targets = nullptr;
     float const* const attn_scale = nullptr;
+    bool const scalar_scale = true;
   };
 
   // Device side kernel params
@@ -514,6 +515,7 @@ struct CollectiveMainloopFwdSm90 {
     int const* const seq_offsets = nullptr;
     int const* const num_targets = nullptr;
     float const* const attn_scale = nullptr;
+    bool const scalar_scale = true;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
@@ -584,7 +586,8 @@ struct CollectiveMainloopFwdSm90 {
         args.contextual_seq_len,
         args.seq_offsets,
         args.num_targets,
-        args.attn_scale};
+        args.attn_scale,
+        args.scalar_scale};
   }
 
   /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best
@@ -1237,6 +1240,29 @@ struct CollectiveMainloopFwdSm90 {
     auto& barrier_Q = shared_storage.pipelines.barrier_Q;
     barrier_Q.wait(work_idx % 2);
 
+    // attention scale
+    float scalar_scale_val = params.scalar_scale
+        ? (params.attn_scale == nullptr ? params.max_seq_len_inv
+                                        : params.attn_scale[0])
+        : 0;
+    static constexpr int Qdim = 0;
+    auto thread_mma = tiled_mma0.get_thread_slice(thread_idx);
+    auto thread0_mma = tiled_mma0.get_thread_slice(_0{});
+    Tensor cS = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+    Tensor tScS = thread_mma.partition_C(cS);
+    Tensor tScS_rowcol = make_tensor(
+        tScS.data(),
+        flash::convert_layout_acc_rowcol</*Transposed=*/false>(tScS.layout()));
+    Tensor t0ScS = thread0_mma.partition_C(cS);
+    Tensor t0ScS_rowcol = make_tensor(
+        t0ScS.data(),
+        flash::convert_layout_acc_rowcol</*Transposed=*/false>(t0ScS.layout()));
+    int const thread_qdim_offset = get<Qdim>(tScS_rowcol(_0{}, _0{}));
+    SiluScaleOp<float> silu_scale_op;
+    int qdim_offset = params.scalar_scale
+        ? 0
+        : m_block * kBlockM + thread_qdim_offset + seqlen_info.offset_q;
+
     if constexpr (Mma0_is_RS) {
       using SmemCopyAtomQ = Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
       auto smem_tiled_copy_Q = make_tiled_copy_A(SmemCopyAtomQ{}, tiled_mma0);
@@ -1249,15 +1275,29 @@ struct CollectiveMainloopFwdSm90 {
 
     Tensor tSrS =
         partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
+    Tensor tSrS_rowcol = make_tensor(
+        tSrS.data(),
+        flash::convert_layout_acc_rowcol</*Transposed=*/false>(tSrS.layout()));
     consumer_wait(pipeline_k, smem_pipe_read);
     flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(
         tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
     warpgroup_wait<0>();
     pipeline_k.consumer_release(smem_pipe_read);
-    float scale = params.attn_scale == nullptr
-        ? params.max_seq_len_inv
-        : params.attn_scale[0]; // TODO: generalize
-    flash::inplace_silu_scale<float>(tSrS, params.alpha, scale);
+#pragma unroll
+    for (int mi = 0; mi < size<0>(tSrS_rowcol); ++mi) {
+      float scale = scalar_scale_val;
+      if (!params.scalar_scale) {
+        int q_index = qdim_offset + int(get<Qdim>(t0ScS_rowcol(mi, _0{})));
+        if (q_index < seqlen_info.seqlen) {
+          scale = params.attn_scale[q_index];
+        }
+      }
+#pragma unroll
+      for (int ni = 0; ni < size<1>(tSrS_rowcol); ++ni) {
+        tSrS_rowcol(mi, ni) =
+            silu_scale_op(tSrS_rowcol(mi, ni) * params.alpha, scale);
+      }
+    }
     int const m_idx_max = (m_block + 1) * kBlockM;
     if (m_idx_max <= seqlen_info.uihlen) {
       mask.template apply<
@@ -1312,6 +1352,10 @@ struct CollectiveMainloopFwdSm90 {
       ++smem_pipe_read;
       Tensor tSrS =
           partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
+      Tensor tSrS_rowcol = make_tensor(
+          tSrS.data(),
+          flash::convert_layout_acc_rowcol</*Transposed=*/false>(
+              tSrS.layout()));
       if (!UseSchedulerBarrier || warp_group_idx == 0) {
         consumer_wait(pipeline_k, smem_pipe_read);
       }
@@ -1329,7 +1373,21 @@ struct CollectiveMainloopFwdSm90 {
       warp_scheduler_barrier_arrive();
       warpgroup_wait<1>();
       pipeline_k.consumer_release(smem_pipe_read); // release K
-      flash::inplace_silu_scale<float>(tSrS, params.alpha, scale);
+#pragma unroll
+      for (int mi = 0; mi < size<0>(tSrS_rowcol); ++mi) {
+        float scale = scalar_scale_val;
+        if (!params.scalar_scale) {
+          int q_index = qdim_offset + int(get<Qdim>(t0ScS_rowcol(mi, _0{})));
+          if (q_index < seqlen_info.seqlen) {
+            scale = params.attn_scale[q_index];
+          }
+        }
+#pragma unroll
+        for (int ni = 0; ni < size<1>(tSrS_rowcol); ++ni) {
+          tSrS_rowcol(mi, ni) =
+              silu_scale_op(tSrS_rowcol(mi, ni) * params.alpha, scale);
+        }
+      }
       mask_fn(tSrS, n_block);
       warpgroup_wait<0>();
       pipeline_v.consumer_release(smem_pipe_read_v); // release V

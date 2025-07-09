@@ -60,14 +60,15 @@ void set_params_fprop(
     const size_t qk_d,
     const size_t v_d,
     // device pointers
-    const at::Tensor q,
-    const at::Tensor k,
-    const at::Tensor v,
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
     void* seq_offsets,
     void* num_targets,
     void* attn_scale,
     bool causal,
     float alpha,
+    const bool scalar_scale,
     const int max_attn_len,
     const int min_full_attn_seq_len,
     const int contextual_seq_len,
@@ -114,6 +115,7 @@ void set_params_fprop(
   params.is_local = max_attn_len > 0;
   params.is_causal = causal && (!params.is_local);
   params.has_contexual_mask = contextual_seq_len > 0;
+  params.scalar_scale = scalar_scale;
 
   params.max_attn_len = max_attn_len;
   params.min_full_attn_seq_len = min_full_attn_seq_len;
@@ -144,18 +146,19 @@ void set_params_dgrad(
     const size_t qk_d_rounded,
     const size_t v_d_rounded,
     // device pointers
-    const at::Tensor q,
-    const at::Tensor k,
-    const at::Tensor v,
-    const at::Tensor dout,
-    at::Tensor dq,
-    at::Tensor dk,
-    at::Tensor dv,
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& dout,
+    const at::Tensor& dq,
+    const at::Tensor& dk,
+    const at::Tensor& dv,
     void* dq_accum_d,
     void* seq_offsets,
     void* num_targets,
     void* attn_scale,
     void* sort_by_length_indices,
+    const bool scalar_scale,
     const bool causal,
     const float alpha,
     const int max_attn_len,
@@ -179,6 +182,7 @@ void set_params_dgrad(
       attn_scale,
       causal,
       alpha,
+      scalar_scale,
       max_attn_len,
       min_full_attn_seq_len,
       contextual_seq_len,
@@ -385,9 +389,11 @@ at::Tensor hstu_mha_fwd(
         "num_targets_ must have dtype torch.int32");
   }
   at::Tensor attn_scale_;
+  bool scalar_scale = true;
   bool const has_attn_scale = attn_scale.has_value();
   if (has_attn_scale) {
     attn_scale_ = attn_scale.value();
+    scalar_scale = attn_scale_.numel() == 1;
     CHECK_DEVICE(attn_scale_);
     TORCH_CHECK(
         attn_scale_.dtype() == torch::kFloat32,
@@ -484,6 +490,7 @@ at::Tensor hstu_mha_fwd(
       !has_attn_scale ? nullptr : attn_scale_.data_ptr(),
       causal,
       alpha,
+      scalar_scale,
       max_attn_len,
       min_full_attn_seq_len,
       contextual_seq_len,
@@ -711,9 +718,11 @@ std::vector<at::Tensor> hstu_mha_bwd(
         "num_targets_ must have dtype torch.int32");
   }
   at::Tensor attn_scale_;
+  bool scalar_scale = true;
   bool const has_attn_scale = attn_scale.has_value();
   if (has_attn_scale) {
     attn_scale_ = attn_scale.value();
+    scalar_scale = attn_scale_.numel() == 1;
     CHECK_DEVICE(attn_scale_);
     TORCH_CHECK(
         attn_scale_.dtype() == torch::kFloat32,
@@ -839,6 +848,7 @@ std::vector<at::Tensor> hstu_mha_bwd(
       !has_attn_scale ? nullptr : attn_scale_.data_ptr(),
       !(sort_by_length && is_jagged) ? nullptr
                                      : sort_by_length_indices_.data_ptr(),
+      scalar_scale,
       causal,
       alpha,
       max_attn_len,

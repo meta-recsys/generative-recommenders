@@ -469,6 +469,7 @@ struct CollectiveMainloopBwdSm90 {
     int const* const seq_offsets = nullptr;
     int const* const num_targets = nullptr;
     float const* const attn_scale = nullptr;
+    bool const scalar_scale = true;
   };
 
   // Device side kernel params
@@ -491,6 +492,7 @@ struct CollectiveMainloopBwdSm90 {
     int const* const seq_offsets = nullptr;
     int const* const num_targets;
     float const* const attn_scale;
+    bool const scalar_scale = true;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
@@ -548,7 +550,8 @@ struct CollectiveMainloopBwdSm90 {
         args.dq_semaphore,
         args.seq_offsets,
         args.num_targets,
-        args.attn_scale};
+        args.attn_scale,
+        args.scalar_scale};
   }
 
   /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best
@@ -1343,6 +1346,28 @@ struct CollectiveMainloopBwdSm90 {
           cute::as_position_independent_swizzle_tensor(sV));
       cute::copy(smem_tiled_copy_V, tdPsV_copy_view, tdPrV_copy_view);
     }
+    // attention scale
+    float scalar_scale_val = params.scalar_scale
+        ? (params.attn_scale == nullptr ? params.max_seq_len_inv
+                                        : params.attn_scale[0])
+        : 0;
+    static constexpr int Qdim = !SdP_swapAB ? 0 : 1;
+    auto thread0_mma_SdP = tiled_mma_SdP.get_thread_slice(_0{});
+    Tensor cS =
+        cute::make_identity_tensor(Shape<
+                                   Int<!SdP_swapAB ? kBlockM : kBlockN>,
+                                   Int<!SdP_swapAB ? kBlockN : kBlockM>>{});
+    Tensor tScS = thread_mma_SdP.partition_C(cS);
+    Tensor tScS_rowcol = make_tensor(
+        tScS.data(),
+        flash::convert_layout_acc_rowcol</*Transposed=*/SdP_swapAB>(
+            tScS.layout()));
+    Tensor t0ScS = thread0_mma_SdP.partition_C(cS);
+    Tensor t0ScS_rowcol = make_tensor(
+        t0ScS.data(),
+        flash::convert_layout_acc_rowcol</*Transposed=*/SdP_swapAB>(
+            t0ScS.layout()));
+    int const thread_qdim_offset = get<Qdim>(tScS_rowcol(_0{}, _0{}));
 
     auto bwd_step = [&](int m_block, auto mask_fn) {
       Tensor tSrS = partition_fragment_C(
@@ -1377,13 +1402,19 @@ struct CollectiveMainloopBwdSm90 {
           tSrS_sigmoid.data(),
           flash::convert_layout_acc_rowcol</*Transposed=*/SdP_swapAB>(
               tSrS_sigmoid.layout()));
-
-      float scale = params.attn_scale == nullptr
-          ? params.max_seq_len_inv
-          : params.attn_scale[0]; // TODO: generalize
+      int qdim_offset = params.scalar_scale
+          ? 0
+          : m_block * kBlockM + thread_qdim_offset + seqlen_info.offset_q;
       mask_fn(tSrS, m_block);
 #pragma unroll
       for (int mi = 0; mi < size<0>(scores); ++mi) {
+        float scale = scalar_scale_val;
+        if (!params.scalar_scale) {
+          int q_index = qdim_offset + int(get<Qdim>(t0ScS_rowcol(mi, _0{})));
+          if (q_index < seqlen) {
+            scale = params.attn_scale[q_index];
+          }
+        }
 #pragma unroll
         for (int ni = 0; ni < size<1>(scores); ++ni) {
           scores(mi, ni) = scores(mi, ni) * params.alpha;
@@ -1400,6 +1431,13 @@ struct CollectiveMainloopBwdSm90 {
       Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
 #pragma unroll
       for (int mi = 0; mi < size<0>(dS); ++mi) {
+        float scale = scalar_scale_val;
+        if (!params.scalar_scale) {
+          int q_index = qdim_offset + int(get<Qdim>(t0ScS_rowcol(mi, _0{})));
+          if (q_index < seqlen) {
+            scale = params.attn_scale[q_index];
+          }
+        }
 #pragma unroll
         for (int ni = 0; ni < size<1>(dS); ++ni) {
           dS(mi, ni) = dS(mi, ni) * sigmoid(mi, ni) * scale +

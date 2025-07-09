@@ -84,6 +84,7 @@ def _flops(
 @click.option("--contextual-seq-len", type=int, default=0)
 @click.option("--sampling-alpha", type=float, default=2.0)
 @click.option("--triton-enable-tma", type=bool, default=False)
+@click.option("--dynamic-attn-scale", type=bool, default=False)
 def main(  # noqa: C901
     batch_size: int,
     heads: int,
@@ -105,6 +106,7 @@ def main(  # noqa: C901
     contextual_seq_len: int,
     sampling_alpha: float,
     triton_enable_tma: bool,
+    dynamic_attn_scale: bool,
 ) -> Optional[Tuple[List[triton.testing.Benchmark], List[pd.DataFrame]]]:
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -142,7 +144,7 @@ def main(  # noqa: C901
             line_names=line_names,
             styles=styles,
             ylabel="ms",
-            plot_name=f"hstu-attn-b{batch_size}-h{heads}-d{attn_dim}-v{hidden_dim}--sparsity{seq_sparsity}-{mode}-{dtype}-target{target_size}-mattn{max_attn_len}-full{min_full_attn_seq_len}-c{contextual_seq_len}-sl_alpha{sampling_alpha}-triton_tma{triton_enable_tma}",
+            plot_name=f"hstu-attn-b{batch_size}-h{heads}-d{attn_dim}-v{hidden_dim}--sparsity{seq_sparsity}-{mode}-{dtype}-target{target_size}-mattn{max_attn_len}-full{min_full_attn_seq_len}-c{contextual_seq_len}-sl_alpha{sampling_alpha}-triton_tma{triton_enable_tma}-dynamic_scale{dynamic_attn_scale}",
             args={
                 "batch_size": batch_size,
                 "heads": heads,
@@ -161,6 +163,7 @@ def main(  # noqa: C901
                 "contextual_seq_len": contextual_seq_len,
                 "sampling_alpha": sampling_alpha,
                 "triton_enable_tma": triton_enable_tma,
+                "dynamic_attn_scale": dynamic_attn_scale,
             },
         )
         for mode in modes
@@ -187,6 +190,7 @@ def main(  # noqa: C901
         contextual_seq_len: int,
         sampling_alpha: float,
         triton_enable_tma: bool,
+        dynamic_attn_scale: bool,
     ) -> float:
         assert mode in ["fwd", "bwd"]
         warmup = 25
@@ -241,6 +245,11 @@ def main(  # noqa: C901
             batch_size, 1
         ) + delta_x_offsets.view(1, delta_size)
         delta_x_offsets = delta_x_offsets.view(-1)
+        attn_scale = torch.empty(
+            (L,),
+            dtype=torch.float32,
+            device=torch.device("cuda"),
+        ).uniform_(0.5, 1.0)
 
         if bench_backward:
             q = q.requires_grad_(True)
@@ -267,6 +276,7 @@ def main(  # noqa: C901
                     alpha=alpha,
                     causal=True,
                     seq_offsets=seq_offsets.to(torch.int32),
+                    attn_scale=attn_scale if dynamic_attn_scale else None,
                     max_seq_len=seq_len,
                     max_attn_len=max_attn_len,
                     min_full_attn_seq_len=min_full_attn_seq_len,
@@ -301,7 +311,7 @@ def main(  # noqa: C901
                     sort_by_length=False,
                 )
             else:
-                if min_full_attn_seq_len > 0:
+                if min_full_attn_seq_len > 0 or dynamic_attn_scale:
                     fn = lambda: ragged_hstu_mha(  # noqa E73
                         max_seq_len=seq_len,
                         alpha=alpha,
@@ -313,6 +323,7 @@ def main(  # noqa: C901
                         training=True,
                         invalid_attn_mask_type="lower_triangular",
                         num_targets=num_targets,
+                        attn_scale=attn_scale if dynamic_attn_scale else None,
                         max_attn_len=max_attn_len,
                         contextual_seq_len=contextual_seq_len,
                         full_attn_size=min_full_attn_seq_len,

@@ -89,6 +89,7 @@ struct Flash_fwd_params : public Qkv_params {
   bool is_causal;
   bool is_local;
   bool has_contexual_mask;
+  bool scalar_scale;
 
   int* __restrict__ tile_count_semaphore;
 
