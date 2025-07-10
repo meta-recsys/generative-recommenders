@@ -17,7 +17,6 @@
 
 #include <cutlass/numeric_types.h>
 #include <torch/nn/functional.h>
-#include <torch/torch.h> // @manual
 
 #include "flash_common.h"
 

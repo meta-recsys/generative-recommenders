@@ -44,14 +44,24 @@ DTYPE_MAP_BWD = {
 SM = [80, 90]  # Sm kernels support up to
 HEAD_DIMENSIONS = [64, 96, 128, 192, 256]
 
-KERNEL_IMPL_TEMPLATE_FWD_SM90 = """#include "flash_fwd_launch_template.h"
+KERNEL_IMPL_TEMPLATE_FWD_SM90 = """
+#ifdef OSS_ENV
+#include "hstu_attention/flash_fwd_launch_template.h"
+#else
+#include "flash_fwd_launch_template.h"
+#endif
 
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
 template void run_mha_fwd_<{ARCH}, {DTYPE}, {HEAD_DIM}>(Flash_fwd_params &params, cudaStream_t stream);
 #endif
 """
 
-KERNEL_IMPL_TEMPLATE_FWD_SM8x = """#include "flash_fwd_launch_template.h"
+KERNEL_IMPL_TEMPLATE_FWD_SM8x = """
+#ifdef OSS_ENV
+#include "hstu_attention/flash_fwd_launch_template.h"
+#else
+#include "flash_fwd_launch_template.h"
+#endif
 
 #ifndef FLASHATTENTION_DISABLE_SM8x
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
@@ -60,14 +70,24 @@ template void run_mha_fwd_<80, {DTYPE}, {HEAD_DIM}>(Flash_fwd_params &params, cu
 #endif
 """
 
-KERNEL_IMPL_TEMPLATE_BWD_SM90 = """#include "flash_bwd_launch_template.h"
+KERNEL_IMPL_TEMPLATE_BWD_SM90 = """
+#ifdef OSS_ENV
+#include "hstu_attention/flash_bwd_launch_template.h"
+#else
+#include "flash_bwd_launch_template.h"
+#endif
 
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
 template void run_mha_bwd_<{ARCH}, {DTYPE}, {HEAD_DIM}>(Flash_bwd_params &params, cudaStream_t stream);
 #endif
 """
 
-KERNEL_IMPL_TEMPLATE_BWD_SM8x = """#include "flash_bwd_launch_template.h"
+KERNEL_IMPL_TEMPLATE_BWD_SM8x = """
+#ifdef OSS_ENV
+#include "hstu_attention/flash_bwd_launch_template.h"
+#else
+#include "flash_bwd_launch_template.h"
+#endif
 
 #ifndef FLASHATTENTION_DISABLE_SM8x
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}

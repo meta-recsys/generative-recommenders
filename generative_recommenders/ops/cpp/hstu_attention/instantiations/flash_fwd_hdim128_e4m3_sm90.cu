@@ -18,7 +18,11 @@
 // different files to speed up compilation. This file is auto-generated. See
 // "generate_kernels.py"
 
+#ifdef OSS_ENV
+#include "hstu_attention/flash_fwd_launch_template.h"
+#else
 #include "flash_fwd_launch_template.h"
+#endif
 
 #ifndef FLASHATTENTION_DISABLE_HDIM128
 template void run_mha_fwd_<90, cutlass::float_e4m3_t, 128>(

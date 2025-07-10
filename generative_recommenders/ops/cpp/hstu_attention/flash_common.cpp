@@ -29,11 +29,9 @@
 #include <cutlass/numeric_types.h>
 
 #include "flash.h"
+#include "flash_common.h"
 #include "static_switch.h"
 #include "tile_size.h"
-
-#include <torch/torch.h> // @manual
-#include "flash_common.h"
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...)                           \

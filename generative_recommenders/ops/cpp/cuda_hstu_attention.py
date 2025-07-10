@@ -18,9 +18,17 @@ from typing import Optional
 
 import torch
 
-torch.ops.load_library(
-    "//generative_recommenders/ops/cpp/hstu_attention:hstu_flash_attention"
-)
+try:
+    # We need to import the CUDA kernels after importing torch
+    import hstu._C  # pyre-ignore [21]
+except:
+    pass
+try:
+    torch.ops.load_library(
+        "//generative_recommenders/ops/cpp/hstu_attention:hstu_flash_attention"
+    )
+except:
+    pass
 
 
 def cuda_hstu_mha(
