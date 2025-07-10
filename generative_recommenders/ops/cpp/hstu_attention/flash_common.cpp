@@ -31,8 +31,6 @@
 #include "flash.h"
 #include "static_switch.h"
 #include "tile_size.h"
-
-#include <torch/torch.h> // @manual
 #include "flash_common.h"
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")

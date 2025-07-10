@@ -18,7 +18,7 @@
 // different files to speed up compilation. This file is auto-generated. See
 // "generate_kernels.py"
 
-#include "flash_bwd_launch_template.h"
+#include "hstu_attention/flash_bwd_launch_template.h"
 
 #ifndef FLASHATTENTION_DISABLE_SM8x
 #ifndef FLASHATTENTION_DISABLE_HDIM128
