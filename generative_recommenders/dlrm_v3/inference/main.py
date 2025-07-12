@@ -50,6 +50,7 @@ from generative_recommenders.dlrm_v3.inference.inference_modules import set_is_i
 from generative_recommenders.dlrm_v3.inference.model_family import HSTUModelFamily
 from generative_recommenders.dlrm_v3.utils import (
     get_dataset,
+    MetricMode,
     MetricsLogger,
     profiler_or_nullcontext,
     SUPPORTED_DATASETS,
@@ -117,9 +118,9 @@ class Runner:
         self.metrics: Optional[MetricsLogger] = None
         if compute_eval:
             self.metrics = MetricsLogger(
-                multitask_configs=model.hstu_config.multitask_configs,  # pyre-ignore [6]
+                multitask_configs=model.hstu_config.multitask_configs,
                 batch_size=batchsize,
-                window_size=1000,
+                window_size=160,
                 device=torch.device("cpu"),
                 rank=0,
             )
@@ -137,6 +138,7 @@ class Runner:
                     predictions=mt_target_preds.t(),
                     labels=mt_target_labels.t(),
                     weights=mt_target_weights.t(),
+                    mode=MetricMode.EVAL,
                 )
             self.result_timing.append(time.time() - qitem.start)
             self.result_batches.append(len(qitem.query_ids))
@@ -184,7 +186,7 @@ def add_results(
     final_results["count"] = total_batches
 
     if metrics is not None:
-        for k, v in metrics.compute().items():
+        for k, v in metrics.compute(mode=MetricMode.EVAL).items():
             print(f"{k}: {v}")
 
     print(

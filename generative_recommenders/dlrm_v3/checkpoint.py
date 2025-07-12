@@ -69,6 +69,30 @@ def load_dense_state_dict(model: torch.nn.Module, state_dict: Dict[str, Any]) ->
 
 
 @gin.configurable
+def save_dmp_checkpoint_every_n_steps(
+    model: torch.nn.Module,
+    optimizer: Optimizer,
+    rank: int,
+    path: str,
+    batch_idx: int,
+    save_every_n_steps: Optional[int],
+) -> None:
+    if (
+        rank == 0
+        and save_every_n_steps is not None
+        and batch_idx != 0
+        and batch_idx % save_every_n_steps == 0
+    ):
+        return save_dmp_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            rank=rank,
+            path=path,
+        )
+    else:
+        return None
+
+
 def save_dmp_checkpoint(
     model: torch.nn.Module,
     optimizer: Optimizer,
