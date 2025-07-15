@@ -29,6 +29,7 @@ from generative_recommenders.common import (
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
+from torch.fx.experimental.symbolic_shapes import guard_or_false
 
 
 @triton.jit
@@ -342,7 +343,7 @@ def triton_weighted_layer_norm_fwd(
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
 
     num_warps: int = min(max(BLOCK_D // 256, 1), 8)
-    if N == 0:
+    if guard_or_false(N == 0):
         return y, mean, rstd, BLOCK_D, num_warps
     if learnable:
         # pyre-ignore[28]
