@@ -17,10 +17,7 @@
 #include <ATen/Dispatch.h>
 #include <ATen/core/op_registration/op_registration.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDAGuard.h>
-#include <torch/extension.h>
-#include <torch/library.h>
 
 #include "fbgemm_gpu/sparse_ops.h" // @manual
 
