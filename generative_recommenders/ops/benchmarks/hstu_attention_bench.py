@@ -119,8 +119,8 @@ def main(  # noqa: C901
     else:
         raise ValueError(f"Unsupported data type: {data_type}.")
 
-    line_vals = ["triton", "flash_cuda_jagged"]
-    line_names = ["triton", "flash_cuda_jagged"]
+    line_vals = ["triton"]
+    line_names = ["triton"]
     styles = [("blue", "-"), ("green", "-")]
     if bench_pytorch:
         line_vals.append("pytorch")
