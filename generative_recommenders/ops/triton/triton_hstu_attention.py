@@ -246,11 +246,8 @@ def _hstu_attn_fwd_one_block(  # noqa: C901
     k = None
     qk = None
     if ENABLE_TMA:
-        k = tl._experimental_descriptor_load(
-            device_desc_k,
+        k = device_desc_k.load(
             [(seq_start + start_n).to(tl.int32), offset_kh.to(tl.int32)],
-            [BLOCK_N, BLOCK_D_Q],
-            K.dtype.element_ty,
         )
         # tma can only be loaded in one order, use trans afterwards
         qk = tl.dot(q, tl.trans(k), allow_tf32=ALLOW_TF32) * alpha
@@ -297,11 +294,8 @@ def _hstu_attn_fwd_one_block(  # noqa: C901
     silu = tl.where(invalid_mask, silu, 0)
     v = None
     if ENABLE_TMA:
-        v = tl._experimental_descriptor_load(
-            device_desc_v,
+        v = device_desc_v.load(
             [(seq_start + start_n).to(tl.int32), offset_vh.to(tl.int32)],
-            [BLOCK_N, BLOCK_D_V],
-            V.dtype.element_ty,
         )
     else:
         v = tl.load(V_block_ptr, boundary_check=(0,), padding_option="zero")
@@ -355,46 +349,6 @@ def _hstu_attn_fwd_compute(  # noqa C901
     seq_end = tl.load(seq_offsets + off_z + 1)
     seq_len = (seq_end - seq_start).to(tl.int32)
 
-    device_desc_q = None
-    device_desc_k = None
-    device_desc_v = None
-    device_desc_o = None
-    if ENABLE_TMA:
-        workspace_base = workspace_ptr + TMA_DESC_SIZE * 4 * (
-            tl.program_id(1) + tl.program_id(0) * tl.num_programs(1)
-        )
-        device_desc_q = workspace_base
-        device_desc_k = workspace_base + 1 * TMA_DESC_SIZE
-        device_desc_v = workspace_base + 2 * TMA_DESC_SIZE
-        device_desc_o = workspace_base + 3 * TMA_DESC_SIZE
-
-        # pyre-ignore [20]
-        tl.extra.cuda.experimental_device_tensormap_create2d(
-            desc_ptr=device_desc_k,
-            global_address=K,
-            load_size=[
-                BLOCK_N,
-                BLOCK_D_Q,
-            ],
-            global_size=[seq_end.to(tl.int32), H * DimQ],
-            element_ty=K.dtype.element_ty,
-        )
-        # pyre-ignore [20]
-        tl.extra.cuda.experimental_device_tensormap_create2d(
-            desc_ptr=device_desc_v,
-            global_address=V,
-            load_size=[
-                BLOCK_N,
-                BLOCK_D_V,
-            ],
-            global_size=[seq_end.to(tl.int32), H * DimV],
-            element_ty=V.dtype.element_ty,
-        )
-        # pyre-ignore [20]
-        tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(device_desc_k)
-        # pyre-ignore [20]
-        tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(device_desc_v)
-
     if IS_DELTA_Q:
         start_m_delta = pid * BLOCK_M
         start_m = (start_m_delta + seq_len - DeltaSize).to(tl.int32)
@@ -413,6 +367,8 @@ def _hstu_attn_fwd_compute(  # noqa C901
         Q_block_ptr = None
         K_block_ptr = None
         V_block_ptr = None
+        device_desc_k = None
+        device_desc_v = None
         if not ENABLE_TMA:
             if IS_DELTA_Q:
                 Q_block_ptr = tl.make_block_ptr(
@@ -451,62 +407,46 @@ def _hstu_attn_fwd_compute(  # noqa C901
                 order=(1, 0),
             )
         else:
-            if IS_DELTA_Q:
-                # pyre-ignore [20]
-                tl.extra.cuda.experimental_device_tensormap_create2d(
-                    desc_ptr=device_desc_q,
-                    global_address=Q,
-                    load_size=[
-                        BLOCK_M,
-                        BLOCK_D_Q,
-                    ],
-                    global_size=[
-                        (off_z * DeltaSize + DeltaSize).to(tl.int32),
-                        H * DimQ,
-                    ],
-                    element_ty=Q.dtype.element_ty,
-                )
-                # pyre-ignore [20]
-                tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(device_desc_q)
+            device_desc_k = tl.make_tensor_descriptor(
+                K,
+                shape=[seq_end.to(tl.int32), H * DimQ],
+                strides=[H * DimQ, 1],
+                block_shape=[BLOCK_N, BLOCK_D_Q],
+            )
 
-                q = tl._experimental_descriptor_load(
-                    device_desc_q,
+            device_desc_v = tl.make_tensor_descriptor(
+                V,
+                shape=[seq_end.to(tl.int32), H * DimV],
+                strides=[H * DimV, 1],
+                block_shape=[BLOCK_N, BLOCK_D_V],
+            )
+
+            if IS_DELTA_Q:
+                device_desc_q = tl.make_tensor_descriptor(
+                    Q,
+                    shape=[(off_z * DeltaSize + DeltaSize).to(tl.int32), H * DimQ],
+                    strides=[H * DimQ, 1],
+                    block_shape=[BLOCK_M, BLOCK_D_Q],
+                )
+
+                q = device_desc_q.load(
                     [
                         (off_z * DeltaSize + start_m_delta).to(tl.int32),
                         (off_h * stride_qh).to(tl.int32),
-                    ],
-                    [
-                        BLOCK_M,
-                        BLOCK_D_Q,
-                    ],
-                    Q.dtype.element_ty,
+                    ]
                 )
             else:
-                # pyre-ignore [20]
-                tl.extra.cuda.experimental_device_tensormap_create2d(
-                    desc_ptr=device_desc_q,
-                    global_address=Q,
-                    load_size=[
-                        BLOCK_M,
-                        BLOCK_D_Q,
-                    ],
-                    global_size=[seq_end.to(tl.int32), H * DimQ],
-                    element_ty=Q.dtype.element_ty,
+                device_desc_q = tl.make_tensor_descriptor(
+                    Q,
+                    shape=[seq_end.to(tl.int32), H * DimQ],
+                    strides=[H * DimQ, 1],
+                    block_shape=[BLOCK_M, BLOCK_D_Q],
                 )
-                # pyre-ignore [20]
-                tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(device_desc_q)
-
-                q = tl._experimental_descriptor_load(
-                    device_desc_q,
+                q = device_desc_q.load(
                     [
                         (seq_start + start_m).to(tl.int32),
                         (off_h * stride_qh).to(tl.int32),
-                    ],
-                    [
-                        BLOCK_M,
-                        BLOCK_D_Q,
-                    ],
-                    Q.dtype.element_ty,
+                    ]
                 )
 
         acc = tl.zeros([BLOCK_M, BLOCK_D_V], dtype=tl.float32)
@@ -641,45 +581,32 @@ def _hstu_attn_fwd_compute(  # noqa C901
             # without crashes but produce wrong results.
             acc = acc.to(Out.dtype.element_ty)
             if IS_DELTA_Q:
-                # pyre-ignore [20]
-                tl.extra.cuda.experimental_device_tensormap_create2d(
-                    desc_ptr=device_desc_o,
-                    global_address=Out,
-                    load_size=[BLOCK_M, BLOCK_D_V],
-                    global_size=[
-                        (off_z * DeltaSize + DeltaSize).to(tl.int32),
-                        H * DimV,
-                    ],
-                    element_ty=Out.dtype.element_ty,
+                device_desc_o = tl.make_tensor_descriptor(
+                    Out,
+                    shape=[(off_z * DeltaSize + DeltaSize).to(tl.int32), H * DimV],
+                    strides=[H * DimV, 1],
+                    block_shape=[BLOCK_M, BLOCK_D_V],
                 )
-                # pyre-ignore [20]
-                tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(device_desc_o)
-                tl._experimental_descriptor_store(
-                    device_desc_o,
-                    acc,
+                device_desc_o.store(
                     [
                         (off_z * DeltaSize + pid * BLOCK_M).to(tl.int32),
                         (off_h * stride_oh).to(tl.int32),
                     ],
+                    acc,
                 )
             else:
-                # pyre-ignore [20]
-                tl.extra.cuda.experimental_device_tensormap_create2d(
-                    desc_ptr=device_desc_o,
-                    global_address=Out,
-                    load_size=[BLOCK_M, BLOCK_D_V],
-                    global_size=[seq_end.to(tl.int32), H * DimV],
-                    element_ty=Out.dtype.element_ty,
+                device_desc_o = tl.make_tensor_descriptor(
+                    Out,
+                    shape=[seq_end.to(tl.int32), H * DimV],
+                    strides=[H * DimV, 1],
+                    block_shape=[BLOCK_M, BLOCK_D_V],
                 )
-                # pyre-ignore [20]
-                tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(device_desc_o)
-                tl._experimental_descriptor_store(
-                    device_desc_o,
-                    acc,
+                device_desc_o.store(
                     [
                         (seq_start + pid * BLOCK_M).to(tl.int32),
                         (off_h * stride_oh).to(tl.int32),
                     ],
+                    acc,
                 )
 
 
@@ -952,11 +879,8 @@ def _hstu_attn_bwd_one_block(  # noqa C901
             max_ids,
         )
     if ENABLE_TMA:
-        q = tl._experimental_descriptor_load(
-            device_desc_q,
+        q = device_desc_q.load(
             [start_m, (off_h * stride_qh).to(tl.int32)],
-            [BLOCK_M, BLOCK_D_Q],
-            k.dtype,
         )
         q_trans = tl.trans(q)
     else:
@@ -980,11 +904,8 @@ def _hstu_attn_bwd_one_block(  # noqa C901
     silu_trans = silu_trans.to(k.dtype)
     # compute dv
     if ENABLE_TMA:
-        do = tl._experimental_descriptor_load(
-            device_desc_do,
+        do = device_desc_do.load(
             [start_m, (off_h * stride_doh).to(tl.int32)],
-            [BLOCK_M, BLOCK_D_V],
-            k.dtype,
         )
     else:
         do = tl.load(
@@ -1100,17 +1021,11 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
     if ENABLE_TMA:
         q_ptrs_trans = None
         do_ptrs = None
-        k = tl._experimental_descriptor_load(
-            device_desc_k,
+        k = device_desc_k.load(
             [start_n, (off_h * stride_kh).to(tl.int32)],
-            [BLOCK_N, BLOCK_D_Q],
-            K.dtype.element_ty,
         )
-        v = tl._experimental_descriptor_load(
-            device_desc_v,
+        v = device_desc_v.load(
             [start_n, (off_h * stride_vh).to(tl.int32)],
-            [BLOCK_N, BLOCK_D_V],
-            V.dtype.element_ty,
         )
     else:
         mask_n = offs_n < seq_len
@@ -1221,15 +1136,13 @@ def _hstu_attn_bwd_one_col_block(  # noqa C901
     # write-back
     dk = dk * alpha
     if ENABLE_TMA:
-        tl._experimental_descriptor_store(
-            device_desc_dv,
-            dv.to(k.dtype),
+        device_desc_dv.store(
             [start_n, (off_h * stride_dvh).to(tl.int32)],
+            dv.to(k.dtype),
         )
-        tl._experimental_descriptor_store(
-            device_desc_dk,
-            dk.to(k.dtype),
+        device_desc_dk.store(
             [start_n, (off_h * stride_dkh).to(tl.int32)],
+            dk.to(k.dtype),
         )
     else:
         dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_v_d[None, :])
@@ -1565,94 +1478,42 @@ def _hstu_attn_bwd(  # noqa C901
     device_desc_dk = None
     device_desc_dv = None
     if ENABLE_TMA:
-        workspace_base = tma_workspace_ptr + TMA_DESC_SIZE * 6 * (
-            tl.program_id(1) + tl.program_id(0) * tl.num_programs(1)
+        device_desc_q = tl.make_tensor_descriptor(
+            Q,
+            shape=[seq_len, H * DimQ],
+            strides=[H * DimQ, 1],
+            block_shape=[BLOCK_M, BLOCK_D_Q],
         )
-        device_desc_q = workspace_base
-        device_desc_k = workspace_base + 1 * TMA_DESC_SIZE
-        device_desc_v = workspace_base + 2 * TMA_DESC_SIZE
-        device_desc_do = workspace_base + 3 * TMA_DESC_SIZE
-        device_desc_dk = workspace_base + 4 * TMA_DESC_SIZE
-        device_desc_dv = workspace_base + 5 * TMA_DESC_SIZE
-
-        # pyre-ignore [20]
-        tl.extra.cuda.experimental_device_tensormap_create2d(
-            desc_ptr=device_desc_q,
-            global_address=Q,
-            load_size=[
-                BLOCK_M,
-                BLOCK_D_Q,
-            ],
-            global_size=[seq_len, H * DimQ],
-            element_ty=Q.dtype.element_ty,
+        device_desc_do = tl.make_tensor_descriptor(
+            DOut,
+            shape=[seq_len, H * DimV],
+            strides=[H * DimV, 1],
+            block_shape=[BLOCK_M, BLOCK_D_V],
         )
-        # pyre-ignore [20]
-        tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(device_desc_q)
-        # pyre-ignore [20]
-        tl.extra.cuda.experimental_device_tensormap_create2d(
-            desc_ptr=device_desc_do,
-            global_address=DOut,
-            load_size=[
-                BLOCK_M,
-                BLOCK_D_V,
-            ],
-            global_size=[seq_len, H * DimV],
-            element_ty=DOut.dtype.element_ty,
+        device_desc_k = tl.make_tensor_descriptor(
+            K,
+            shape=[seq_len, H * DimQ],
+            strides=[H * DimQ, 1],
+            block_shape=[BLOCK_N, BLOCK_D_Q],
         )
-        # pyre-ignore [20]
-        tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(device_desc_do)
-        # pyre-ignore [20]
-        tl.extra.cuda.experimental_device_tensormap_create2d(
-            desc_ptr=device_desc_k,
-            global_address=K,
-            load_size=[
-                BLOCK_N,
-                BLOCK_D_Q,
-            ],
-            global_size=[seq_len, H * DimQ],
-            element_ty=K.dtype.element_ty,
+        device_desc_dk = tl.make_tensor_descriptor(
+            DK,
+            shape=[seq_len, H * DimQ],
+            strides=[H * DimQ, 1],
+            block_shape=[BLOCK_N, BLOCK_D_Q],
         )
-        # pyre-ignore [20]
-        tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(device_desc_k)
-        # pyre-ignore [20]
-        tl.extra.cuda.experimental_device_tensormap_create2d(
-            desc_ptr=device_desc_dk,
-            global_address=DK,
-            load_size=[
-                BLOCK_N,
-                BLOCK_D_Q,
-            ],
-            global_size=[seq_len, H * DimQ],
-            element_ty=DK.dtype.element_ty,
+        device_desc_v = tl.make_tensor_descriptor(
+            V,
+            shape=[seq_len, H * DimV],
+            strides=[H * DimV, 1],
+            block_shape=[BLOCK_N, BLOCK_D_V],
         )
-        # pyre-ignore [20]
-        tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(device_desc_dk)
-        # pyre-ignore [20]
-        tl.extra.cuda.experimental_device_tensormap_create2d(
-            desc_ptr=device_desc_v,
-            global_address=V,
-            load_size=[
-                BLOCK_N,
-                BLOCK_D_V,
-            ],
-            global_size=[seq_len, H * DimV],
-            element_ty=V.dtype.element_ty,
+        device_desc_dv = tl.make_tensor_descriptor(
+            DV,
+            shape=[seq_len, H * DimV],
+            strides=[H * DimV, 1],
+            block_shape=[BLOCK_N, BLOCK_D_V],
         )
-        # pyre-ignore [20]
-        tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(device_desc_v)
-        # pyre-ignore [20]
-        tl.extra.cuda.experimental_device_tensormap_create2d(
-            desc_ptr=device_desc_dv,
-            global_address=DV,
-            load_size=[
-                BLOCK_N,
-                BLOCK_D_V,
-            ],
-            global_size=[seq_len, H * DimV],
-            element_ty=DV.dtype.element_ty,
-        )
-        # pyre-ignore [20]
-        tl.extra.cuda.experimental_tensormap_fenceproxy_acquire(device_desc_dv)
     else:
         Q += off_h * stride_qh
         K += off_h * stride_kh
@@ -1791,14 +1652,13 @@ def triton_hstu_attention_fwd(
 
     TMA_DESC_SIZE = 128
     workspace = None
-    if enable_tma:
-        MIN_BLOCK_M = 16
-        workspace = torch.empty(
-            4 * TMA_DESC_SIZE * (triton.cdiv(N, MIN_BLOCK_M) * Z * H),
-            dtype=torch.uint8,
-            device="cuda",
-        )
 
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == TMA_DESC_SIZE
+        return torch.empty(size, dtype=torch.int8, device="cuda")
+
+    # pyre-ignore [6]
+    triton.set_allocator(alloc_fn)
     grid = lambda meta: (  # noqa E731
         triton.cdiv(N, meta["BLOCK_M"]),
         Z * H,
@@ -1887,13 +1747,14 @@ def triton_hstu_attention_bwd(
     AUTOTUNE_Z = prev_power_of_2(Z)
     TMA_DESC_SIZE = 128
     tma_workspace = None
-    if enable_tma:
-        MIN_BLOCK_N = 16
-        tma_workspace = torch.empty(
-            6 * TMA_DESC_SIZE * (triton.cdiv(N, MIN_BLOCK_N) * Z * H),
-            dtype=torch.uint8,
-            device="cuda",
-        )
+
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == TMA_DESC_SIZE
+        return torch.empty(size, dtype=torch.int8, device="cuda")
+
+    # pyre-ignore [6]
+    triton.set_allocator(alloc_fn)
+
     # Enable BufferOps on AMD
     ENABLE_BUFFER_OPS_ASSUMES = torch.version.hip is not None
     _hstu_attn_bwd[grid](
@@ -2113,26 +1974,25 @@ def triton_cached_hstu_mha(
     out = torch.empty((L, H, DimV), dtype=delta_q.dtype, device=delta_q.device)
 
     TMA_DESC_SIZE = 128
-    workspace = None
-    if enable_tma:
-        MIN_BLOCK_M = 16
-        workspace = torch.empty(
-            4 * TMA_DESC_SIZE * (triton.cdiv(N, MIN_BLOCK_M) * Z * H),
-            dtype=torch.uint8,
-            device="cuda",
-        )
 
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        assert align == TMA_DESC_SIZE
+        return torch.empty(size, dtype=torch.int8, device="cuda")
+
+    # pyre-ignore [6]
+    triton.set_allocator(alloc_fn)
     grid = lambda meta: (  # noqa E731
         triton.cdiv(DeltaSize, meta["BLOCK_M"]),
         Z * H,
     )
+
     has_contextual_seq_len = contextual_seq_len > 0
     has_max_attn_len = max_attn_len > 0
     _hstu_attn_fwd[grid](
         Q=delta_q,
         K=k,
         V=v,
-        workspace_ptr=workspace,
+        workspace_ptr=None,
         sort_by_length_indices=None,
         seq_offsets=seq_offsets,
         num_targets=num_targets,
