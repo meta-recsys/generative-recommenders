@@ -46,6 +46,15 @@ except ImportError:
 
 
 @triton.jit
+def rand3x(seed, offsets, n_rounds: tl.constexpr = 10):  # pyre-ignore [9]
+    i1, i2, i3, _ = tl.randint4x(seed, offsets, n_rounds)
+    u1 = tl.uint_to_uniform_float(i1)
+    u2 = tl.uint_to_uniform_float(i2)
+    u3 = tl.uint_to_uniform_float(i3)
+    return u1, u2, u3
+
+
+@triton.jit
 def _ln_mul_dropout_fwd(
     X,
     U,
@@ -102,15 +111,13 @@ def _ln_mul_dropout_fwd(
         random_offsets = row * BLOCK_D + cols
         if CONCAT_UX:
             # apply dropout on u
-            random_u = tl.rand(seed, random_offsets)
+            random_u, random_x, random_y = rand3x(seed, random_offsets)
             u_keep = random_u > dropout_ratio
             u = tl.where(u_keep, u / (1.0 - dropout_ratio), 0.0)
             # apply dropout on x
-            random_x = tl.rand(seed, random_offsets + D)
             x_keep = random_x > dropout_ratio
             x = tl.where(x_keep, x / (1.0 - dropout_ratio), 0.0)
             # apply dropout on y
-            random_y = tl.rand(seed, random_offsets + 2 * D)
             y_keep = random_y > dropout_ratio
             y = tl.where(y_keep, y / (1.0 - dropout_ratio), 0.0)
         else:
@@ -182,6 +189,10 @@ def _ln_mul_dropout_bwd_dx_du(
     DW = DW + pid * D + cols
     DB = DB + pid * D + cols
 
+    partial_dw = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    partial_db = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    w = tl.load(W + cols, mask=mask).to(tl.float32)
+    b = tl.load(B + cols, mask=mask).to(tl.float32)
     for idx in range(0, rows_per_tile):
         # Load data to SRAM
         x = tl.load(X + cols, mask=mask, other=0).to(tl.float32)
@@ -197,15 +208,13 @@ def _ln_mul_dropout_bwd_dx_du(
             random_offsets = row * BLOCK_D + cols
             if CONCAT_UX:
                 # apply dropout on du
-                random_du = tl.rand(seed, random_offsets)
+                random_du, random_dx, random_dy = rand3x(seed, random_offsets)
                 du_keep = random_du > dropout_ratio
                 du = tl.where(du_keep, du / (1.0 - dropout_ratio), 0.0)
                 # apply dropout on dx
-                random_dx = tl.rand(seed, random_offsets + D)
                 dx_keep = random_dx > dropout_ratio
                 dx = tl.where(dx_keep, dx / (1.0 - dropout_ratio), 0.0)
                 # apply dropout on dy
-                random_dy = tl.rand(seed, random_offsets + 2 * D)
                 dy_keep = random_dy > dropout_ratio
                 dy = tl.where(dy_keep, dy / (1.0 - dropout_ratio), 0.0)
             else:
@@ -219,8 +228,6 @@ def _ln_mul_dropout_bwd_dx_du(
 
         # Compute dx
         xhat = (x - mean) * rstd
-        w = tl.load(W + cols, mask=mask).to(tl.float32)
-        b = tl.load(B + cols, mask=mask).to(tl.float32)
         u = tl.load(U + cols, mask=mask, other=0).to(tl.float32)
         ln = xhat * w + b
         du += dy * ln
@@ -274,20 +281,16 @@ def _ln_mul_dropout_bwd_dx_du(
         tl.store(DX + cols, dx, mask=mask)
 
         # Accumulate partial sums for dw/db
-        partial_dw = dy * xhat
-        partial_db = dy
-        # First store doesn't accumulate
-        if idx > 0:
-            partial_dw += tl.load(DW, mask=mask)
-            partial_db += tl.load(DB, mask=mask)
-        tl.store(DW, partial_dw, mask=mask)
-        tl.store(DB, partial_db, mask=mask)
+        partial_dw += dy * xhat
+        partial_db += dy
         X += tile_num.to(tl.int64) * stride_x
         U += tile_num.to(tl.int64) * stride_u
         DY += tile_num.to(tl.int64) * stride_dy
         DX += tile_num.to(tl.int64) * stride_dx
         DU += tile_num.to(tl.int64) * stride_du
         row += tile_num
+    tl.store(DW, partial_dw, mask=mask)
+    tl.store(DB, partial_db, mask=mask)
 
 
 def _get_bwd_dwdb_configs() -> List[triton.Config]:
