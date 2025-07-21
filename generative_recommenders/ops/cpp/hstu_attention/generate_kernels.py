@@ -41,7 +41,7 @@ DTYPE_MAP_BWD = {
     "bf16": "cutlass::bfloat16_t",
 }
 
-SM = [80, 90]  # Sm kernels support up to
+SM = [90]  # Sm kernels support up to
 HEAD_DIMENSIONS = [64, 96, 128, 192, 256]
 
 KERNEL_IMPL_TEMPLATE_FWD_SM90 = """

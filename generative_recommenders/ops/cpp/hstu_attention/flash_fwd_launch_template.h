@@ -34,9 +34,7 @@
 #include "tile_size.h"
 #include "tile_scheduler.h"
 #include "flash_fwd_kernel_sm90.h"
-#include "flash_fwd_kernel_sm80.h"
 #include "mainloop_fwd_sm90_tma_gmma_ws.h"
-#include "mainloop_fwd_sm80.h"
 #include "epilogue_fwd.h"
 // clang-format on
 
@@ -101,35 +99,20 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
 
   using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
   using ClusterShape = cute::Shape<Int<ClusterM>, _1, _1>;
-  using CollectiveMainloop = std::conditional_t<
-      Arch >= 90,
-      flash::CollectiveMainloopFwdSm90<
-          kStages,
-          ClusterShape,
-          TileShape_MNK,
-          Element,
-          float,
-          cutlass::arch::Sm90,
-          Causal,
-          Local,
-          Contexual_mask,
-          Jagged,
-          Has_targets,
-          Mma1_is_RS,
-          V_colmajor>,
-      flash::CollectiveMainloopFwdSm80<
-          kNWarps,
-          kStages,
-          Q_in_regs,
-          TileShape_MNK,
-          Element,
-          float,
-          cutlass::arch::Sm80,
-          Causal,
-          Local,
-          Contexual_mask,
-          Jagged,
-          Has_targets>>;
+  using CollectiveMainloop = flash::CollectiveMainloopFwdSm90<
+      kStages,
+      ClusterShape,
+      TileShape_MNK,
+      Element,
+      float,
+      cutlass::arch::Sm90,
+      Causal,
+      Local,
+      Contexual_mask,
+      Jagged,
+      Has_targets,
+      Mma1_is_RS,
+      V_colmajor>;
   using CollectiveEpilogue = flash::CollectiveEpilogueFwd<
       TileShape_MNK,
       ClusterShape,
@@ -167,16 +150,9 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
       Arch >= 90 ? false : !(Causal && !Jagged),
       SchedulerSingleTile,
       SchedulerPersistent>;
-  using AttnKernel = std::conditional_t<
-      Arch >= 90,
-      flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<
-          CollectiveMainloop,
-          CollectiveEpilogue,
-          Scheduler>>,
-      flash::enable_sm80_to_sm89<flash::FlashAttnFwdSm80<
-          CollectiveMainloop,
-          CollectiveEpilogue,
-          Scheduler>>>;
+  using AttnKernel = flash::enable_sm90_or_later<
+      flash::
+          FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
 
   int seqlen = !Jagged ? params.max_seq_len : params.total_seq_len;
   int batch = !Jagged ? params.b : 1;

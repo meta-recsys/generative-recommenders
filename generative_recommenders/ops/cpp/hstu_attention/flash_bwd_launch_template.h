@@ -28,11 +28,9 @@
 
 #include "epilogue_bwd.h"
 #include "flash.h"
-#include "flash_bwd_kernel_sm80.h"
 #include "flash_bwd_kernel_sm90.h"
 #include "flash_bwd_postprocess_kernel.h"
 #include "flash_bwd_preprocess_kernel.h"
-#include "mainloop_bwd_sm80.h"
 #include "mainloop_bwd_sm90_tma_gmma_ws.h"
 #include "static_switch.h"
 #include "tile_scheduler.h"
@@ -129,52 +127,29 @@ void run_flash_bwd(Flash_bwd_params& params, cudaStream_t stream) {
   // Stages_dS_or_QSm80 is Stages_dS if Sm90 and Stages if Sm80
   static constexpr int Stages = Arch >= 90 ? 2 : Stages_dS_or_QSm80;
   static constexpr int Stages_dS = Arch >= 90 ? Stages_dS_or_QSm80 : 1;
-  using CollectiveMainloop = std::conditional_t<
-      Arch >= 90,
-      flash::CollectiveMainloopBwdSm90<
-          Stages,
-          Stages_dO,
-          Stages_dS,
-          ClusterShape,
-          TileShape_MNK,
-          Element,
-          ElementAccum,
-          cutlass::arch::Sm90,
-          Causal,
-          Local,
-          Contexual_mask,
-          Jagged,
-          Has_targets,
-          Deterministic,
-          SdP_swapAB,
-          dKV_swapAB,
-          dQ_swapAB,
-          NumMmaWarpGroups,
-          AtomLayoutMSdP,
-          AtomLayoutNdKV,
-          AtomLayoutMdQ,
-          V_in_regs>,
-      flash::CollectiveMainloopBwdSm80<
-          Stages,
-          Stages_dO,
-          TileShape_MNK,
-          Element,
-          ElementAccum,
-          cutlass::arch::Sm80,
-          Causal,
-          Local,
-          Contexual_mask,
-          Jagged,
-          Has_targets,
-          Deterministic,
-          SdP_swapAB,
-          dKV_swapAB,
-          dQ_swapAB,
-          NumMmaWarpGroups,
-          AtomLayoutMSdP,
-          AtomLayoutNdKV,
-          AtomLayoutMdQ,
-          V_in_regs>>;
+  using CollectiveMainloop = flash::CollectiveMainloopBwdSm90<
+      Stages,
+      Stages_dO,
+      Stages_dS,
+      ClusterShape,
+      TileShape_MNK,
+      Element,
+      ElementAccum,
+      cutlass::arch::Sm90,
+      Causal,
+      Local,
+      Contexual_mask,
+      Jagged,
+      Has_targets,
+      Deterministic,
+      SdP_swapAB,
+      dKV_swapAB,
+      dQ_swapAB,
+      NumMmaWarpGroups,
+      AtomLayoutMSdP,
+      AtomLayoutNdKV,
+      AtomLayoutMdQ,
+      V_in_regs>;
   using CollectiveEpilogue = flash::CollectiveEpilogueBwd<
       TileShape_MNK,
       Element,
@@ -186,16 +161,9 @@ void run_flash_bwd(Flash_bwd_params& params, cudaStream_t stream) {
           AtomLayoutNdKV>;
   using Scheduler =
       flash::SingleTileScheduler<Jagged, kBlockN, false /*Sort_by_length*/>;
-  using AttnKernel = std::conditional_t<
-      Arch >= 90,
-      flash::enable_sm90_or_later<flash::FlashAttnBwdSm90<
-          CollectiveMainloop,
-          CollectiveEpilogue,
-          Scheduler>>,
-      flash::enable_sm80_to_sm89<flash::FlashAttnBwdSm80<
-          CollectiveMainloop,
-          CollectiveEpilogue,
-          Scheduler>>>;
+  using AttnKernel = flash::enable_sm90_or_later<
+      flash::
+          FlashAttnBwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
 
   typename CollectiveMainloop::Arguments mainloop_args{
       static_cast<Element const*>(params.q_ptr),
