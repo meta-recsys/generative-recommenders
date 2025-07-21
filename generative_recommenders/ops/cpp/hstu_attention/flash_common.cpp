@@ -333,8 +333,8 @@ at::Tensor hstu_mha_fwd(
     const std::optional<at::Tensor>& v_descale, // (b, h_k)
     int64_t const sm_margin = 0) {
   auto dprops = at::cuda::getCurrentDeviceProperties();
-  bool is_sm8x = dprops->major >= 8;
-  TORCH_CHECK(is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
+  bool is_sm9x = dprops->major >= 9;
+  TORCH_CHECK(is_sm9x, "HSTU Attention only supports Hopper GPUs or newer.");
 
   q = switch_to_contiguous_if_needed(q);
   k = switch_to_contiguous_if_needed(k);
@@ -651,8 +651,8 @@ std::vector<at::Tensor> hstu_mha_bwd(
 #endif
 
   auto dprops = at::cuda::getCurrentDeviceProperties();
-  bool is_sm8x = dprops->major >= 8;
-  TORCH_CHECK(is_sm8x, "FlashAttention only supports Ampere GPUs or newer.");
+  bool is_sm9x = dprops->major >= 9;
+  TORCH_CHECK(is_sm9x, "HSTU Attention only supports Hopper GPUs or newer.");
 
   q = switch_to_contiguous_if_needed(q);
   k = switch_to_contiguous_if_needed(k);
