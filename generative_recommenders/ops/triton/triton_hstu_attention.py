@@ -32,11 +32,24 @@ from generative_recommenders.common import (
 )
 
 from triton.language.extra.libdevice import fast_dividef  # @manual=//triton:triton
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 try:
     from generative_recommenders.ops.triton.fb.triton_attention_utils import acc_dq
 except ImportError:
     from generative_recommenders.ops.triton.triton_attention_utils import acc_dq
+
+
+def _host_descriptor_pre_hook(nargs):
+    if not isinstance(nargs["Q"], TensorDescriptor):
+        return
+    BLOCK_M = nargs["BLOCK_M"]
+    BLOCK_N = nargs["BLOCK_N"]
+    BLOCK_D_Q = nargs["BLOCK_D_Q"]
+    BLOCK_D_V = nargs["BLOCK_D_V"]
+    nargs["Q"].block_shape = [BLOCK_M, BLOCK_D_Q]
+    nargs["V"].block_shape = [BLOCK_N, BLOCK_D_V]
+    nargs["K"].block_shape = [BLOCK_N, BLOCK_D_Q]
 
 
 def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
@@ -66,146 +79,175 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
                 {"BLOCK_M": 16, "BLOCK_N": 32},
                 num_stages=2,
                 num_warps=2,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 32, "BLOCK_N": 32},
                 num_stages=2,
                 num_warps=2,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 32, "BLOCK_N": 32},
                 num_stages=4,
                 num_warps=2,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 32, "BLOCK_N": 32},
                 num_stages=2,
                 num_warps=4,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 32, "BLOCK_N": 32},
                 num_stages=4,
                 num_warps=4,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 32, "BLOCK_N": 64},
                 num_stages=2,
                 num_warps=4,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 32, "BLOCK_N": 64},
                 num_stages=4,
                 num_warps=4,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 32, "BLOCK_N": 64},
                 num_stages=4,
                 num_warps=8,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 32, "BLOCK_N": 128},
                 num_stages=2,
                 num_warps=4,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 32, "BLOCK_N": 128},
                 num_stages=2,
                 num_warps=8,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 64, "BLOCK_N": 32},
                 num_stages=4,
                 num_warps=2,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 64, "BLOCK_N": 32},
                 num_stages=2,
                 num_warps=4,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 64, "BLOCK_N": 32},
                 num_stages=4,
                 num_warps=4,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 64, "BLOCK_N": 32},
                 num_stages=2,
                 num_warps=8,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 64, "BLOCK_N": 64},
                 num_stages=2,
                 num_warps=2,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 64, "BLOCK_N": 64},
                 num_stages=2,
                 num_warps=4,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 64, "BLOCK_N": 64},
                 num_stages=4,
                 num_warps=4,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 64, "BLOCK_N": 64},
                 num_stages=4,
                 num_warps=8,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 128, "BLOCK_N": 32},
                 num_stages=2,
                 num_warps=2,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 128, "BLOCK_N": 32},
                 num_stages=4,
                 num_warps=2,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 128, "BLOCK_N": 32},
                 num_stages=2,
                 num_warps=4,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 128, "BLOCK_N": 32},
                 num_stages=4,
                 num_warps=4,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 128, "BLOCK_N": 32},
                 num_stages=2,
                 num_warps=8,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 128, "BLOCK_N": 32},
                 num_stages=4,
                 num_warps=8,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 128, "BLOCK_N": 64},
                 num_stages=2,
                 num_warps=4,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 128, "BLOCK_N": 64},
                 num_stages=2,
                 num_warps=8,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 128, "BLOCK_N": 64},
                 num_stages=4,
                 num_warps=8,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 128, "BLOCK_N": 128},
                 num_stages=4,
                 num_warps=4,
+                pre_hook=_host_descriptor_pre_hook,
             ),
             triton.Config(
                 {"BLOCK_M": 128, "BLOCK_N": 128},
                 num_stages=2,
                 num_warps=8,
+                pre_hook=_host_descriptor_pre_hook,
             ),
         ]
     return configs
@@ -222,8 +264,6 @@ def _hstu_attn_fwd_one_block(  # noqa: C901
     V,
     K_block_ptr,
     V_block_ptr,
-    device_desc_k,
-    device_desc_v,
     offset_kh,
     offset_vh,
     seq_start,
@@ -246,7 +286,7 @@ def _hstu_attn_fwd_one_block(  # noqa: C901
     k = None
     qk = None
     if ENABLE_TMA:
-        k = device_desc_k.load(
+        k = K.load(
             [(seq_start + start_n).to(tl.int32), offset_kh.to(tl.int32)],
         )
         # tma can only be loaded in one order, use trans afterwards
@@ -294,7 +334,7 @@ def _hstu_attn_fwd_one_block(  # noqa: C901
     silu = tl.where(invalid_mask, silu, 0)
     v = None
     if ENABLE_TMA:
-        v = device_desc_v.load(
+        v = V.load(
             [(seq_start + start_n).to(tl.int32), offset_vh.to(tl.int32)],
         )
     else:
@@ -367,8 +407,6 @@ def _hstu_attn_fwd_compute(  # noqa C901
         Q_block_ptr = None
         K_block_ptr = None
         V_block_ptr = None
-        device_desc_k = None
-        device_desc_v = None
         if not ENABLE_TMA:
             if IS_DELTA_Q:
                 Q_block_ptr = tl.make_block_ptr(
@@ -407,42 +445,15 @@ def _hstu_attn_fwd_compute(  # noqa C901
                 order=(1, 0),
             )
         else:
-            device_desc_k = tl.make_tensor_descriptor(
-                K,
-                shape=[seq_end.to(tl.int32), H * DimQ],
-                strides=[H * DimQ, 1],
-                block_shape=[BLOCK_N, BLOCK_D_Q],
-            )
-
-            device_desc_v = tl.make_tensor_descriptor(
-                V,
-                shape=[seq_end.to(tl.int32), H * DimV],
-                strides=[H * DimV, 1],
-                block_shape=[BLOCK_N, BLOCK_D_V],
-            )
-
             if IS_DELTA_Q:
-                device_desc_q = tl.make_tensor_descriptor(
-                    Q,
-                    shape=[(off_z * DeltaSize + DeltaSize).to(tl.int32), H * DimQ],
-                    strides=[H * DimQ, 1],
-                    block_shape=[BLOCK_M, BLOCK_D_Q],
-                )
-
-                q = device_desc_q.load(
+                q = Q.load(
                     [
                         (off_z * DeltaSize + start_m_delta).to(tl.int32),
                         (off_h * stride_qh).to(tl.int32),
                     ]
                 )
             else:
-                device_desc_q = tl.make_tensor_descriptor(
-                    Q,
-                    shape=[seq_end.to(tl.int32), H * DimQ],
-                    strides=[H * DimQ, 1],
-                    block_shape=[BLOCK_M, BLOCK_D_Q],
-                )
-                q = device_desc_q.load(
+                q = Q.load(
                     [
                         (seq_start + start_m).to(tl.int32),
                         (off_h * stride_qh).to(tl.int32),
@@ -491,8 +502,6 @@ def _hstu_attn_fwd_compute(  # noqa C901
                 V=V,
                 K_block_ptr=K_block_ptr,
                 V_block_ptr=V_block_ptr,
-                device_desc_k=device_desc_k,
-                device_desc_v=device_desc_v,
                 offset_kh=off_h * stride_kh,
                 offset_vh=off_h * stride_vh,
                 seq_start=seq_start,
@@ -537,8 +546,6 @@ def _hstu_attn_fwd_compute(  # noqa C901
                         V=V,
                         K_block_ptr=K_block_ptr,
                         V_block_ptr=V_block_ptr,
-                        device_desc_k=device_desc_k,
-                        device_desc_v=device_desc_v,
                         offset_kh=off_h * stride_kh,
                         offset_vh=off_h * stride_vh,
                         seq_start=seq_start,
@@ -559,55 +566,23 @@ def _hstu_attn_fwd_compute(  # noqa C901
                     if not ENABLE_TMA:
                         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
                         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
-        if not ENABLE_TMA:
-            if IS_DELTA_Q:
-                start_m_delta = pid * BLOCK_M
-                offs_m_delta = start_m_delta + tl.arange(0, BLOCK_M)
-                offs_v_d = tl.arange(0, BLOCK_D_V)
-                off_o = Out + off_z * DeltaSize * stride_om + off_h * stride_oh
-                out_ptrs = off_o + offs_m_delta[:, None] * stride_om + offs_v_d[None, :]
-                tl.store(out_ptrs, acc, mask=(offs_m_delta < DeltaSize)[:, None])
-            else:
-                # rematerialize offsets to save registers
-                start_m = pid * BLOCK_M
-                offs_m = start_m + tl.arange(0, BLOCK_M)
-                offs_v_d = tl.arange(0, BLOCK_D_V)
-                off_o = Out + seq_start * stride_om + off_h * stride_oh
-                out_ptrs = off_o + offs_m[:, None] * stride_om + offs_v_d[None, :]
-                tl.store(out_ptrs, acc, mask=(offs_m < seq_len)[:, None])
+        # Don't use TMA in Jagged case since we don't want to overwrite
+        # the output of another sequence
+        if IS_DELTA_Q:
+            start_m_delta = pid * BLOCK_M
+            offs_m_delta = start_m_delta + tl.arange(0, BLOCK_M)
+            offs_v_d = tl.arange(0, BLOCK_D_V)
+            off_o = Out + off_z * DeltaSize * stride_om + off_h * stride_oh
+            out_ptrs = off_o + offs_m_delta[:, None] * stride_om + offs_v_d[None, :]
+            tl.store(out_ptrs, acc, mask=(offs_m_delta < DeltaSize)[:, None])
         else:
-            # Important: must cast to proper dtype. If acc is float32, but
-            # TMA descriptor specifies float16, the program will run
-            # without crashes but produce wrong results.
-            acc = acc.to(Out.dtype.element_ty)
-            if IS_DELTA_Q:
-                device_desc_o = tl.make_tensor_descriptor(
-                    Out,
-                    shape=[(off_z * DeltaSize + DeltaSize).to(tl.int32), H * DimV],
-                    strides=[H * DimV, 1],
-                    block_shape=[BLOCK_M, BLOCK_D_V],
-                )
-                device_desc_o.store(
-                    [
-                        (off_z * DeltaSize + pid * BLOCK_M).to(tl.int32),
-                        (off_h * stride_oh).to(tl.int32),
-                    ],
-                    acc,
-                )
-            else:
-                device_desc_o = tl.make_tensor_descriptor(
-                    Out,
-                    shape=[seq_end.to(tl.int32), H * DimV],
-                    strides=[H * DimV, 1],
-                    block_shape=[BLOCK_M, BLOCK_D_V],
-                )
-                device_desc_o.store(
-                    [
-                        (seq_start + pid * BLOCK_M).to(tl.int32),
-                        (off_h * stride_oh).to(tl.int32),
-                    ],
-                    acc,
-                )
+            # rematerialize offsets to save registers
+            start_m = pid * BLOCK_M
+            offs_m = start_m + tl.arange(0, BLOCK_M)
+            offs_v_d = tl.arange(0, BLOCK_D_V)
+            off_o = Out + seq_start * stride_om + off_h * stride_oh
+            out_ptrs = off_o + offs_m[:, None] * stride_om + offs_v_d[None, :]
+            tl.store(out_ptrs, acc, mask=(offs_m < seq_len)[:, None])
 
 
 @triton_autotune(
@@ -1652,6 +1627,30 @@ def triton_hstu_attention_fwd(
 
     TMA_DESC_SIZE = 128
     workspace = None
+    desc_q = q
+    desc_k = k
+    desc_v = v
+
+    if enable_tma:
+        dummy_block = [1, 1]
+        desc_q = TensorDescriptor(
+            q,
+            shape=[L, H * DimQ],
+            strides=[H * DimQ, 1],
+            block_shape=dummy_block,
+        )
+        desc_v = TensorDescriptor(
+            v,
+            shape=[L, H * DimV],
+            strides=[H * DimV, 1],
+            block_shape=dummy_block,
+        )
+        desc_k = TensorDescriptor(
+            k,
+            shape=[L, H * DimQ],
+            strides=[H * DimQ, 1],
+            block_shape=dummy_block,
+        )
 
     def alloc_fn(size: int, align: int, stream: Optional[int]):
         assert align == TMA_DESC_SIZE
@@ -1665,9 +1664,9 @@ def triton_hstu_attention_fwd(
     )
 
     _hstu_attn_fwd[grid](
-        Q=q,
-        K=k,
-        V=v,
+        Q=desc_q,
+        K=desc_k,
+        V=desc_v,
         workspace_ptr=workspace,
         sort_by_length_indices=sort_by_length_indices,
         seq_offsets=seq_offsets,
@@ -1968,12 +1967,36 @@ def triton_cached_hstu_mha(
 ) -> torch.Tensor:
     Z = seq_offsets.size(0) - 1
     AUTOTUNE_Z = prev_power_of_2(Z)
-    L, H, DimQ = delta_q.shape
-    DeltaSize = L // Z
-    _, _, DimV = v.shape
-    out = torch.empty((L, H, DimV), dtype=delta_q.dtype, device=delta_q.device)
+    DELTA_L, H, DimQ = delta_q.shape
+    DeltaSize = DELTA_L // Z
+    L, _, DimV = v.shape
+    out = torch.empty((DELTA_L, H, DimV), dtype=delta_q.dtype, device=delta_q.device)
 
     TMA_DESC_SIZE = 128
+    desc_q = delta_q
+    desc_k = k
+    desc_v = v
+
+    if enable_tma:
+        dummy_block = [1, 1]
+        desc_q = TensorDescriptor(
+            delta_q,
+            shape=[DELTA_L, H * DimQ],
+            strides=[H * DimQ, 1],
+            block_shape=dummy_block,
+        )
+        desc_v = TensorDescriptor(
+            v,
+            shape=[L, H * DimV],
+            strides=[H * DimV, 1],
+            block_shape=dummy_block,
+        )
+        desc_k = TensorDescriptor(
+            k,
+            shape=[L, H * DimQ],
+            strides=[H * DimQ, 1],
+            block_shape=dummy_block,
+        )
 
     def alloc_fn(size: int, align: int, stream: Optional[int]):
         assert align == TMA_DESC_SIZE
@@ -1989,9 +2012,9 @@ def triton_cached_hstu_mha(
     has_contextual_seq_len = contextual_seq_len > 0
     has_max_attn_len = max_attn_len > 0
     _hstu_attn_fwd[grid](
-        Q=delta_q,
-        K=k,
-        V=v,
+        Q=desc_q,
+        K=desc_k,
+        V=desc_v,
         workspace_ptr=None,
         sort_by_length_indices=None,
         seq_offsets=seq_offsets,
