@@ -44,12 +44,33 @@ def _layer_norm_fwd(
     TRAINING: tl.constexpr,
     BLOCK_D: tl.constexpr,
     COMPUTE_MEAN_AND_RSTD: tl.constexpr,
+    ENABLE_TMA: tl.constexpr,
 ):
     row = tl.program_id(0)
     X += row.to(tl.int64) * stride_x
     Y += row.to(tl.int64) * stride_y
     cols = tl.arange(0, BLOCK_D)
-    x = tl.load(X + cols, mask=cols < D, other=0.0).to(tl.float32)
+    if ENABLE_TMA:
+        x_desc = tl.make_tensor_descriptor(
+            X,
+            shape=[D],
+            # pyre-ignore[6]: Triton tensor definition doesn't allow constants
+            strides=[1],
+            block_shape=[BLOCK_D],
+        )
+        y_desc = tl.make_tensor_descriptor(
+            Y,
+            shape=[D],
+            # pyre-ignore[6]: Triton tensor definition doesn't allow constants
+            strides=[1],
+            block_shape=[BLOCK_D],
+        )
+        # pyre-ignore[6]: Triton tensor definition doesn't allow constants
+        x = x_desc.load([0])
+    else:
+        x = tl.load(X + cols, mask=cols < D, other=0.0)
+
+    x = x.to(tl.float32)
 
     if COMPUTE_MEAN_AND_RSTD:
         mean = tl.sum(x, axis=0) / D
@@ -68,10 +89,14 @@ def _layer_norm_fwd(
         rstd = tl.load(Rstd + row)
 
     # Normalize and apply linear transformation
-    mask = cols < D
     y = x_mean * rstd
-    # Write output
-    tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
+    if ENABLE_TMA:
+        # pyre-ignore[6]: Triton tensor definition doesn't allow constants
+        y_desc.store([0], y)
+    else:
+        mask = cols < D
+        # Write output
+        tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
 
 
 @triton.jit
@@ -90,12 +115,47 @@ def _weighted_layer_norm_fwd(
     TRAINING: tl.constexpr,
     BLOCK_D: tl.constexpr,
     COMPUTE_MEAN_AND_RSTD: tl.constexpr,
+    ENABLE_TMA: tl.constexpr,
 ):
     row = tl.program_id(0)
     X += row.to(tl.int64) * stride_x
     Y += row.to(tl.int64) * stride_y
     cols = tl.arange(0, BLOCK_D)
-    x = tl.load(X + cols, mask=cols < D, other=0.0).to(tl.float32)
+    if ENABLE_TMA:
+        x_desc = tl.make_tensor_descriptor(
+            X,
+            shape=[D],
+            # pyre-ignore[6]: Triton tensor definition doesn't allow constants
+            strides=[1],
+            block_shape=[BLOCK_D],
+        )
+        y_desc = tl.make_tensor_descriptor(
+            Y,
+            shape=[D],
+            # pyre-ignore[6]: Triton tensor definition doesn't allow constants
+            strides=[1],
+            block_shape=[BLOCK_D],
+        )
+        w_desc = tl.make_tensor_descriptor(
+            W,
+            shape=[D],
+            # pyre-ignore[6]: Triton tensor definition doesn't allow constants
+            strides=[1],
+            block_shape=[BLOCK_D],
+        )
+        b_desc = tl.make_tensor_descriptor(
+            B,
+            shape=[D],
+            # pyre-ignore[6]: Triton tensor definition doesn't allow constants
+            strides=[1],
+            block_shape=[BLOCK_D],
+        )
+        # pyre-ignore[6]: Triton tensor definition doesn't allow constants
+        x = x_desc.load([0])
+    else:
+        x = tl.load(X + cols, mask=cols < D, other=0.0)
+
+    x = x.to(tl.float32)
 
     if COMPUTE_MEAN_AND_RSTD:
         mean = tl.sum(x, axis=0) / D
@@ -115,15 +175,29 @@ def _weighted_layer_norm_fwd(
         rstd = tl.load(Rstd + row)
 
     # Normalize and apply linear transformation
-    mask = cols < D
     y = x_mean * rstd
-    w = tl.load(W + cols, mask=mask).to(tl.float32)
-    b = tl.load(B + cols, mask=mask).to(tl.float32)
-    y = y * w + b
-    if IS_SWISH:
-        y = tl.sigmoid(y) * x
-    # Write output
-    tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
+    if ENABLE_TMA:
+        # pyre-ignore[6]: Triton tensor definition doesn't allow constants
+        w = w_desc.load([0]).to(tl.float32)
+        # pyre-ignore[6]: Triton tensor definition doesn't allow constants
+        b = b_desc.load([0]).to(tl.float32)
+
+        y = y * w + b
+        if IS_SWISH:
+            y = tl.sigmoid(y) * x
+        # Write output
+        # pyre-ignore[6]: Triton tensor definition doesn't allow constants
+        y_desc.store([0], y)
+    else:
+        mask = cols < D
+        w = tl.load(W + cols, mask=mask).to(tl.float32)
+        b = tl.load(B + cols, mask=mask).to(tl.float32)
+
+        y = y * w + b
+        if IS_SWISH:
+            y = tl.sigmoid(y) * x
+        # Write output
+        tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
 
 
 @triton.jit
@@ -316,6 +390,7 @@ def triton_weighted_layer_norm_fwd(
     eps: float,
     mean: Optional[torch.Tensor] = None,
     rstd: Optional[torch.Tensor] = None,
+    enable_tma: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
     assert x.dim() == 2, f"x.dim() == {x.dim()}, expected 2"
     x = switch_to_contiguous_if_needed(x)
@@ -344,6 +419,14 @@ def triton_weighted_layer_norm_fwd(
     num_warps: int = min(max(BLOCK_D // 256, 1), 8)
     if N == 0:
         return y, mean, rstd, BLOCK_D, num_warps
+
+    if enable_tma:
+        # TMA descriptors require a global memory allocation
+        def alloc_fn(size: int, alignment: int, stream: int | None):
+            return torch.empty(size, device="cuda", dtype=torch.int8)
+
+        triton.set_allocator(alloc_fn)
+
     if learnable:
         # pyre-ignore[28]
         _weighted_layer_norm_fwd[(N,)](
@@ -362,6 +445,7 @@ def triton_weighted_layer_norm_fwd(
             BLOCK_D=BLOCK_D,
             COMPUTE_MEAN_AND_RSTD=compute_mean_and_rstd,
             num_warps=num_warps,
+            ENABLE_TMA=enable_tma,
         )
     else:
         # pyre-ignore[28]
@@ -378,6 +462,7 @@ def triton_weighted_layer_norm_fwd(
             BLOCK_D=BLOCK_D,
             COMPUTE_MEAN_AND_RSTD=compute_mean_and_rstd,
             num_warps=num_warps,
+            ENABLE_TMA=enable_tma,
         )
     return y, mean, rstd, BLOCK_D, num_warps
 
@@ -479,12 +564,14 @@ class LayerNormFunction(torch.autograd.Function):
         weight: Optional[torch.Tensor],
         bias: Optional[torch.Tensor],
         eps: float,
+        enable_tma: bool = False,
     ) -> torch.Tensor:
         y, mean, rstd, BLOCK_D, num_warps = triton_weighted_layer_norm_fwd(
             x=x,
             weight=weight,
             bias=bias,
             eps=eps,
+            enable_tma=enable_tma,
         )
         learnable = weight is not None
         if learnable:
@@ -758,6 +845,7 @@ class SwishLayerNormFunction(torch.autograd.Function):
         weight: torch.Tensor,
         bias: torch.Tensor,
         eps: float,
+        enable_tma: bool = False,
     ) -> torch.Tensor:
         assert x.dim() == 2, f"x.dim() == {x.dim()}, expected 2"
         x = switch_to_contiguous_if_needed(x)
@@ -783,6 +871,13 @@ class SwishLayerNormFunction(torch.autograd.Function):
         if N == 0:
             return y
 
+        if enable_tma:
+            # TMA descriptors require a global memory allocation
+            def alloc_fn(size: int, alignment: int, stream: int | None):
+                return torch.empty(size, device="cuda", dtype=torch.int8)
+
+            triton.set_allocator(alloc_fn)
+
         # pyre-ignore[28]
         _weighted_layer_norm_fwd[(N,)](
             x,
@@ -800,6 +895,7 @@ class SwishLayerNormFunction(torch.autograd.Function):
             BLOCK_D=BLOCK_D,
             COMPUTE_MEAN_AND_RSTD=True,
             num_warps=num_warps,
+            ENABLE_TMA=enable_tma,
         )
 
         return y
