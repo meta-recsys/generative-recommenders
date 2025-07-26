@@ -230,6 +230,7 @@ def _addmm_fwd(
     GROUP_M: tl.constexpr,
     ALLOW_TF32: tl.constexpr,
     BROADCAST_Y: tl.constexpr,
+    ENABLE_TMA: tl.constexpr,
 ):
     pid_0, pid_1 = tl.program_id(axis=0), tl.program_id(axis=1)
     pid = pid_0 * tl.num_programs(axis=1) + pid_1
@@ -242,41 +243,90 @@ def _addmm_fwd(
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    offs_m = tl.arange(0, BLOCK_M)
-    offs_k = tl.arange(0, BLOCK_K)
-    offs_n = tl.arange(0, BLOCK_N)
-    mask_m = (pid_m * BLOCK_M + offs_m)[:, None] < M
-    mask_n = (pid_n * BLOCK_N + offs_n)[None, :] < N
-    x_ptr += pid_m.to(tl.int64) * BLOCK_M * stride_xm
-    x_ptrs = x_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-    w_ptr += pid_n.to(tl.int64) * BLOCK_N * stride_wn
-    w_ptrs = w_ptr + (offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn)
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        mask_k = offs_k[None, :] < K - k * BLOCK_K
-        x = tl.load(x_ptrs, mask=mask_k & mask_m, other=0.0)
-        mask_k = offs_k[:, None] < K - k * BLOCK_K
-        w = tl.load(w_ptrs, mask=mask_k & mask_n, other=0.0)
-        accumulator += tl.dot(x, w, allow_tf32=ALLOW_TF32)
-        x_ptrs += BLOCK_K * stride_xk
-        w_ptrs += BLOCK_K * stride_wk
-
-    z_mask = mask_m & mask_n
-    if BROADCAST_Y:
-        # y is a vector, broadcast to add to z
-        y_ptr += pid_n.to(tl.int64) * BLOCK_N * stride_yn
-        y_ptrs = y_ptr + stride_yn * offs_n[None, :]
-        y = tl.load(y_ptrs, mask=mask_n)
+    # Note: This is split into two complete kernels to avoid
+    # type issues and enable simpler readability.
+    if ENABLE_TMA:
+        base_m = pid_m * BLOCK_M
+        base_n = pid_n * BLOCK_N
+        x_desc = tl.make_tensor_descriptor(
+            x_ptr,
+            shape=[M, K],
+            strides=[stride_xm, stride_xk],
+            block_shape=[BLOCK_M, BLOCK_K],
+        )
+        w_desc = tl.make_tensor_descriptor(
+            w_ptr,
+            shape=[K, N],
+            strides=[stride_wk, stride_wn],
+            block_shape=[BLOCK_K, BLOCK_N],
+        )
+        if BROADCAST_Y:
+            y_desc = tl.make_tensor_descriptor(
+                y_ptr,
+                shape=[N],
+                strides=[stride_yn],
+                block_shape=[BLOCK_N],
+            )
+        else:
+            y_desc = tl.make_tensor_descriptor(
+                y_ptr,
+                shape=[M, N],
+                strides=[stride_ym, stride_yn],
+                block_shape=[BLOCK_M, BLOCK_N],
+            )
+        z_desc = tl.make_tensor_descriptor(
+            z_ptr,
+            shape=[M, N],
+            strides=[stride_zm, stride_zn],
+            block_shape=[BLOCK_M, BLOCK_N],
+        )
+        for k in range(0, tl.cdiv(K, BLOCK_K)):
+            x = x_desc.load([base_m, k * BLOCK_K])
+            w = w_desc.load([k * BLOCK_K, base_n])
+            accumulator += tl.dot(x, w, allow_tf32=ALLOW_TF32)
+        if BROADCAST_Y:
+            y = y_desc.load([base_n])
+        else:
+            y = y_desc.load([base_m, base_n])
+        z = (accumulator + y.to(tl.float32)).to(z_ptr.dtype.element_ty)
+        z_desc.store([base_m, base_n], z)
     else:
-        y_ptr += pid_m.to(tl.int64) * BLOCK_M * stride_ym
-        y_ptr += pid_n.to(tl.int64) * BLOCK_N * stride_yn
-        y_ptrs = y_ptr + stride_ym * offs_m[:, None] + stride_yn * offs_n[None, :]
-        y = tl.load(y_ptrs, mask=z_mask)
-    z = (accumulator + y.to(tl.float32)).to(z_ptr.dtype.element_ty)
-    z_ptr += pid_m.to(tl.int64) * BLOCK_M * stride_zm
-    z_ptr += pid_n.to(tl.int64) * BLOCK_N * stride_zn
-    z_ptrs = z_ptr + stride_zm * offs_m[:, None] + stride_zn * offs_n[None, :]
-    tl.store(z_ptrs, z, mask=z_mask)
+        offs_m = tl.arange(0, BLOCK_M)
+        offs_k = tl.arange(0, BLOCK_K)
+        offs_n = tl.arange(0, BLOCK_N)
+        mask_m = (pid_m * BLOCK_M + offs_m)[:, None] < M
+        mask_n = (pid_n * BLOCK_N + offs_n)[None, :] < N
+        x_ptr += pid_m.to(tl.int64) * BLOCK_M * stride_xm
+        x_ptrs = x_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+        w_ptr += pid_n.to(tl.int64) * BLOCK_N * stride_wn
+        w_ptrs = w_ptr + (offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn)
+
+        for k in range(0, tl.cdiv(K, BLOCK_K)):
+            mask_k = offs_k[None, :] < K - k * BLOCK_K
+            x = tl.load(x_ptrs, mask=mask_k & mask_m, other=0.0)
+            mask_k = offs_k[:, None] < K - k * BLOCK_K
+            w = tl.load(w_ptrs, mask=mask_k & mask_n, other=0.0)
+            accumulator += tl.dot(x, w, allow_tf32=ALLOW_TF32)
+            x_ptrs += BLOCK_K * stride_xk
+            w_ptrs += BLOCK_K * stride_wk
+
+        z_mask = mask_m & mask_n
+        if BROADCAST_Y:
+            # y is a vector, broadcast to add to z
+            y_ptr += pid_n.to(tl.int64) * BLOCK_N * stride_yn
+            y_ptrs = y_ptr + stride_yn * offs_n[None, :]
+            y = tl.load(y_ptrs, mask=mask_n)
+        else:
+            y_ptr += pid_m.to(tl.int64) * BLOCK_M * stride_ym
+            y_ptr += pid_n.to(tl.int64) * BLOCK_N * stride_yn
+            y_ptrs = y_ptr + stride_ym * offs_m[:, None] + stride_yn * offs_n[None, :]
+            y = tl.load(y_ptrs, mask=z_mask)
+        z = (accumulator + y.to(tl.float32)).to(z_ptr.dtype.element_ty)
+        z_ptr += pid_m.to(tl.int64) * BLOCK_M * stride_zm
+        z_ptr += pid_n.to(tl.int64) * BLOCK_N * stride_zn
+        z_ptrs = z_ptr + stride_zm * offs_m[:, None] + stride_zn * offs_n[None, :]
+        tl.store(z_ptrs, z, mask=z_mask)
 
 
 @torch.fx.wrap
@@ -284,6 +334,7 @@ def triton_addmm_fwd(
     x: torch.Tensor,
     w: torch.Tensor,
     y: torch.Tensor,
+    enable_tma: bool = False,
 ) -> torch.Tensor:
     M, K = x.shape
     KB, N = w.shape
@@ -302,6 +353,12 @@ def triton_addmm_fwd(
         triton.cdiv(M, meta["BLOCK_M"]),
         triton.cdiv(N, meta["BLOCK_N"]),
     )
+    if enable_tma:
+        # TMA descriptors require a global memory allocation
+        def alloc_fn(size: int, alignment: int, stream: int | None):
+            return torch.empty(size, device="cuda", dtype=torch.int8)
+
+        triton.set_allocator(alloc_fn)
 
     _addmm_fwd[grid](
         x,
@@ -321,6 +378,7 @@ def triton_addmm_fwd(
         z.stride(1),
         ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
         BROADCAST_Y=is_y_1d,
+        ENABLE_TMA=enable_tma,
     )
     return z
 
@@ -349,10 +407,11 @@ class _AddMmFunction(torch.autograd.Function):
         x: torch.Tensor,
         w: torch.Tensor,
         y: torch.Tensor,
+        enable_tma: bool = False,
     ) -> torch.Tensor:
         ctx.save_for_backward(x, w)
         ctx.is_y_1d = y.dim() == 1
-        return triton_addmm_fwd(x, w, y)
+        return triton_addmm_fwd(x, w, y, enable_tma)
 
     @staticmethod
     # pyre-ignore[14]
@@ -367,5 +426,6 @@ def triton_addmm(
     input: torch.Tensor,
     mat1: torch.Tensor,
     mat2: torch.Tensor,
+    enable_tma: bool = False,
 ) -> torch.Tensor:
-    return _AddMmFunction.apply(mat1, mat2, input)
+    return _AddMmFunction.apply(mat1, mat2, input, enable_tma)
