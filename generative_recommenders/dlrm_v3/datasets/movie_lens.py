@@ -131,7 +131,6 @@ class DLRMv3MovieLensDataset(DLRMv3RandomDataset):
                 for _ in range(
                     len(self._uih_keys)
                     - len(self._contextual_feature_to_max_length)
-                    - 1
                 )
             ]
         )
@@ -140,7 +139,7 @@ class DLRMv3MovieLensDataset(DLRMv3RandomDataset):
         uih_kjt_values.append(dummy_query_time)
         uih_kjt_lengths.append(1)
         uih_features_kjt = KeyedJaggedTensor(
-            keys=self._uih_keys,
+            keys=self._uih_keys + ["dummy_query_time"],
             lengths=torch.tensor(uih_kjt_lengths).long(),
             values=torch.tensor(uih_kjt_values).long(),
         )
