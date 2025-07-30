@@ -228,6 +228,7 @@ class ModelFamilyDenseDist:
             hstu_config=self.hstu_config,
             table_device="cpu",
             max_hash_size=100,
+            is_dense=True
         )
         load_nonsparse_checkpoint(model=model, optimizer=None, path=model_path)
 
@@ -380,6 +381,7 @@ class ModelFamilyDenseSingleWorker:
             table_config=self.table_config,
             hstu_config=self.hstu_config,
             table_device="cpu",
+            is_dense=True
         ).to(self.device)
         load_nonsparse_checkpoint(model=self.model, optimizer=None, path=model_path)
         assert self.model is not None

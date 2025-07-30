@@ -41,6 +41,7 @@ def get_hstu_model(
     hstu_config: DlrmHSTUConfig,
     table_device: str = "meta",
     max_hash_size: Optional[int] = None,
+    is_dense: bool = False,
 ) -> DlrmHSTU:
     if max_hash_size is not None:
         for t in table_config.values():
@@ -51,6 +52,7 @@ def get_hstu_model(
         hstu_configs=hstu_config,
         embedding_tables=table_config,
         is_inference=IS_INFERENCE,
+        is_dense=is_dense
     )
     model.eval()
     model.recursive_setattr("_use_triton_cc", False)

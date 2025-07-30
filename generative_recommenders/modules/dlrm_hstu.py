@@ -123,17 +123,19 @@ class DlrmHSTU(HammerModule):
         hstu_configs: DlrmHSTUConfig,
         embedding_tables: Dict[str, EmbeddingConfig],
         is_inference: bool,
+        is_dense: bool
     ) -> None:
         super().__init__(is_inference=is_inference)
         logger.info(f"Initialize HSTU module with configs {hstu_configs}")
         self._hstu_configs = hstu_configs
         set_static_max_seq_lens([self._hstu_configs.max_seq_len])
 
-        self._embedding_collection = EmbeddingCollection(
-            tables=list(embedding_tables.values()),
-            need_indices=False,
-            device=torch.device("meta"),
-        )
+        if not is_dense:
+            self._embedding_collection = EmbeddingCollection(
+                tables=list(embedding_tables.values()),
+                need_indices=False,
+                device=torch.device("meta"),
+            )
 
         # multitask configs must be sorted by task types
         self._multitask_configs: List[TaskConfig] = hstu_configs.multitask_configs
