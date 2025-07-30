@@ -22,7 +22,7 @@
 
 #include <cute/tensor.hpp>
 
-namespace flash {
+namespace hstu {
 
 // We consolidate all the info related to sequence length here. This is so that
 // we can do all the gmem reads once at the beginning of each tile, rather than
@@ -48,18 +48,21 @@ struct SeqlenInfo {
                     : (seq_offsets[bidb + 1] - seq_offsets[bidb])) {}
 };
 
-template <bool Jagged, bool Has_targets, int kBlockM>
+template <bool Jagged, bool Cross, bool Has_targets, int kBlockM>
 struct SeqlenInfoQKBwd {
   int const offset_q, offset_k, offset_q_padded;
-  int const seqlen, uihlen;
+  int const seqlen_q, seqlen_kv, uihlen_q;
 
   CUTLASS_DEVICE
   SeqlenInfoQKBwd(
       int const bidb,
-      int const max_seq_len,
+      int const max_q_len,
+      int const max_kv_len,
       int const* const seq_offsets,
+      int const* const seq_offsets_q,
       int const* const num_targets)
-      : offset_q(!Jagged ? 0 : seq_offsets[bidb]),
+      : offset_q(
+            !Jagged ? 0 : (Cross ? seq_offsets_q[bidb] : seq_offsets[bidb])),
         offset_k(!Jagged ? 0 : seq_offsets[bidb])
         // If jagged, the layout for dQaccum is that we pad
         // each sequence in the batch by an extra kBlockM, so that the write for
@@ -69,40 +72,63 @@ struct SeqlenInfoQKBwd {
         ,
         offset_q_padded(
             !Jagged ? 0
-                    : (seq_offsets[bidb] + bidb * kBlockM) / kBlockM * kBlockM),
-        seqlen(
-            !Jagged ? max_seq_len
-                    : (seq_offsets[bidb + 1] - seq_offsets[bidb])),
-        uihlen(
+                : Cross
+                ? ((seq_offsets_q[bidb] + bidb * kBlockM) / kBlockM * kBlockM)
+                : ((seq_offsets[bidb] + bidb * kBlockM) / kBlockM * kBlockM)),
+        seqlen_q(
+            !Jagged ? max_q_len
+                    : (Cross ? (seq_offsets_q[bidb + 1] - seq_offsets_q[bidb])
+                             : (seq_offsets[bidb + 1] - seq_offsets[bidb]))),
+        seqlen_kv(
+            !Jagged ? max_kv_len : (seq_offsets[bidb + 1] - seq_offsets[bidb])),
+        uihlen_q(
             !Jagged
-                ? (Has_targets ? max_seq_len - num_targets[bidb] : max_seq_len)
-                : (Has_targets ? seq_offsets[bidb + 1] - seq_offsets[bidb] -
-                           num_targets[bidb]
-                               : seq_offsets[bidb + 1] - seq_offsets[bidb])) {}
+                ? (Has_targets ? max_q_len - num_targets[bidb] : max_q_len)
+                : (Has_targets
+                       ? (Cross ? (seq_offsets_q[bidb + 1] -
+                                   seq_offsets_q[bidb] - num_targets[bidb])
+                                : (seq_offsets[bidb + 1] - seq_offsets[bidb] -
+                                   num_targets[bidb]))
+                       : (Cross
+                              ? (seq_offsets_q[bidb + 1] - seq_offsets_q[bidb])
+                              : (seq_offsets[bidb + 1] - seq_offsets[bidb])))) {
+  }
 };
 
-template <bool Jagged, bool Has_targets>
+template <bool Jagged, bool Cross, bool Has_targets>
 struct SeqlenInfoQKFwd {
   int const offset_q, offset_k;
-  int const seqlen, uihlen;
+  int const seqlen_q, seqlen_kv, uihlen_q;
 
   CUTLASS_DEVICE
   SeqlenInfoQKFwd(
       int const bidb,
-      int const max_seq_len,
+      int const max_q_len,
+      int const max_kv_len,
       int const* const seq_offsets,
+      int const* const seq_offsets_q,
       int const* const num_targets)
-      : offset_q(!Jagged ? 0 : seq_offsets[bidb]),
+      : offset_q(
+            !Jagged ? 0 : (Cross ? seq_offsets_q[bidb] : seq_offsets[bidb])),
         offset_k(!Jagged ? 0 : seq_offsets[bidb]),
-        seqlen(
-            !Jagged ? max_seq_len
-                    : (seq_offsets[bidb + 1] - seq_offsets[bidb])),
-        uihlen(
+        seqlen_q(
+            !Jagged ? max_q_len
+                    : (Cross ? (seq_offsets_q[bidb + 1] - seq_offsets_q[bidb])
+                             : (seq_offsets[bidb + 1] - seq_offsets[bidb]))),
+        seqlen_kv(
+            !Jagged ? max_kv_len : (seq_offsets[bidb + 1] - seq_offsets[bidb])),
+        uihlen_q(
             !Jagged
-                ? (Has_targets ? max_seq_len - num_targets[bidb] : max_seq_len)
-                : (Has_targets ? seq_offsets[bidb + 1] - seq_offsets[bidb] -
-                           num_targets[bidb]
-                               : seq_offsets[bidb + 1] - seq_offsets[bidb])) {}
+                ? (Has_targets ? max_q_len - num_targets[bidb] : max_q_len)
+                : (Has_targets
+                       ? (Cross ? (seq_offsets_q[bidb + 1] -
+                                   seq_offsets_q[bidb] - num_targets[bidb])
+                                : (seq_offsets[bidb + 1] - seq_offsets[bidb] -
+                                   num_targets[bidb]))
+                       : (Cross
+                              ? (seq_offsets_q[bidb + 1] - seq_offsets_q[bidb])
+                              : (seq_offsets[bidb + 1] - seq_offsets[bidb])))) {
+  }
 };
 
-} // namespace flash
+} // namespace hstu

@@ -53,7 +53,11 @@
 
 #define CHECK_CUDA_KERNEL_LAUNCH() CHECK_CUDA(cudaGetLastError())
 
-namespace flash {
+#ifndef M_LOG2E
+#define M_LOG2E 1.44269504088896340735992468100 /* log_2 (e) */
+#endif
+
+namespace hstu {
 
 using namespace cute;
 
@@ -631,7 +635,7 @@ CUTLASS_DEVICE void permute_Aregs_fp8(Fragment& frag) {
   static_assert(decltype(stride<0, 1>(frag))::value == 4);
   static_assert(sizeof(typename Fragment::value_type) == 1);
 
-  int quad_idx = threadIdx.x % 4;
+  auto quad_idx = threadIdx.x % 4;
   bool lane_03 = quad_idx == 0 || quad_idx == 3;
   int selector_upper = lane_03 ? 0x5410 : 0x1054;
   int selector_lower = lane_03 ? 0x7632 : 0x3276;
@@ -714,7 +718,7 @@ CUTLASS_DEVICE void permute_output_fp8_Vcolmajor(Fragment& frag) {
       sizeof(typename Fragment::value_type) == 2 ||
       sizeof(typename Fragment::value_type) == 4);
 
-  int quad_idx = threadIdx.x % 4;
+  auto quad_idx = threadIdx.x % 4;
   bool lane_03 = quad_idx == 0 || quad_idx == 3;
 
   static constexpr int upper_map[4] = {0, 2, 3, 1};
@@ -781,4 +785,4 @@ int canonical_warp_group_idx_nosync() {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-} // namespace flash
+} // namespace hstu

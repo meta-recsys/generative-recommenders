@@ -31,7 +31,7 @@
 #include "seqlen.h"
 #include "utils.h"
 
-namespace flash {
+namespace hstu {
 
 using namespace cute;
 
@@ -135,7 +135,11 @@ struct CollectiveEpilogueFwd {
   using ShapeOPacked = ShapeO;
   using StrideOPacked = StrideO;
   // ((qhead_per_khead, seqlen_q), nheads, batch, num_splits)
-
+  using StrideLSE =
+      cute::Stride<_1, int64_t, int64_t, int64_t>; // (seqlen_q, head, batch,
+  // num_splits)
+  using ShapeLSEPacked = cute::Shape<int32_t, int32_t, int32_t, int32_t>;
+  using StrideLSEPacked = StrideLSE;
   using EpilogueTile_MN = decltype(select<0, 1>(TileShape_MNK{}));
   using CopyOpR2S = std::conditional_t<
       ArchTag::kMinComputeCapability >= 90,
@@ -179,6 +183,9 @@ struct CollectiveEpilogueFwd {
     ShapeO const shape_O;
     StrideO const stride_O;
     int32_t const nheads;
+    int32_t const num_softmax_heads;
+    StrideLSE const stride_lse;
+    float* ptr_lse = nullptr;
     int const* seq_offsets = nullptr;
   };
 
@@ -189,6 +196,10 @@ struct CollectiveEpilogueFwd {
     StrideO const stride_O;
     ShapeOPacked const shape_O_packed;
     StrideOPacked const stride_O_packed;
+    float* ptr_lse;
+    StrideLSE const stride_lse;
+    ShapeLSEPacked const shape_lse_packed;
+    StrideLSEPacked const stride_lse_packed;
     TMA_O tma_store_O;
     int const* seq_offsets = nullptr;
   };
@@ -227,12 +238,18 @@ struct CollectiveEpilogueFwd {
             get<2>(args.stride_O) * qhead_per_khead,
             get<3>(args.stride_O),
             get<4>(args.stride_O)));
+    auto const shape_lse_packed = select<0, 2, 3, 4>(args.shape_O);
+    auto const stride_lse_packed = args.stride_lse;
     return {
         args.ptr_O,
         args.shape_O,
         args.stride_O,
         shape_O_packed,
         stride_O_packed,
+        args.ptr_lse,
+        args.stride_lse,
+        shape_lse_packed,
+        stride_lse_packed,
         tma_store_O,
         args.seq_offsets};
   }
@@ -261,17 +278,17 @@ struct CollectiveEpilogueFwd {
     // Tensor sO_pi = cute::as_position_independent_swizzle_tensor(sO);
 
     Tensor tOrO_out = make_tensor_like<Element>(tOrO);
-    flash::convert_type_out(tOrO, tOrO_out);
+    hstu::convert_type_out(tOrO, tOrO_out);
     if constexpr (
         FP8PermuteCol && (sizeof(Element) == 2 || sizeof(Element) == 4)) {
-      flash::permute_output_fp8_Vcolmajor(tOrO_out);
+      hstu::permute_output_fp8_Vcolmajor(tOrO_out);
     }
 
     // Make sure all WGs have finished reading V
     // Technically we don't need this if we're not using smem, but the mainloop
     // makes the assumption that all epilogue threads sync at least once during
     // the epilogue (so that we can start loading Q with cp.async if we need).
-    flash::named_barrier_sync(
+    hstu::named_barrier_sync(
         NumEpilogueThreads,
         cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
 
@@ -293,7 +310,7 @@ struct CollectiveEpilogueFwd {
             NumEpilogueThreads + cutlass::NumThreadsPerWarp,
             cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
       } else {
-        flash::named_barrier_sync(
+        hstu::named_barrier_sync(
             NumEpilogueThreads,
             cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
       }
@@ -306,7 +323,7 @@ struct CollectiveEpilogueFwd {
       }
     }
 
-    flash::SeqlenInfo<Jagged, kBlockM> seqlen_info{
+    hstu::SeqlenInfo<Jagged, kBlockM> seqlen_info{
         bidb, size<0>(params.shape_O), params.seq_offsets};
     int offset_o = seqlen_info.offset;
     int seqlen_o = seqlen_info.seqlen;
@@ -319,9 +336,8 @@ struct CollectiveEpilogueFwd {
     static_assert(decltype(size<0, 0>(taccOcO))::value == 2);
     static_assert(decltype(size<0, 1>(taccOcO))::value == 2);
     Tensor taccOcO_rowcol = make_tensor(
-        taccOcO.data(), flash::convert_layout_acc_rowcol(taccOcO.layout()));
+        taccOcO.data(), hstu::convert_layout_acc_rowcol(taccOcO.layout()));
     Tensor taccOcO_row = taccOcO_rowcol(_, _0{});
-
     // Step 3: Write O from smem -> gmem
     if constexpr (Use_TMA_O) {
       Tensor mO = params.tma_store_O.get_tma_tensor(params.shape_O)(
@@ -394,7 +410,7 @@ struct CollectiveEpilogueFwd {
         Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
         // Clear_OOB_K must be false since we don't want to write zeros to
         // gmem
-        flash::copy<
+        hstu::copy<
             /*Is_even_MN=*/false,
             /*Is_even_K=*/false,
             /*Clear_OOB_MN=*/false,
@@ -413,12 +429,12 @@ struct CollectiveEpilogueFwd {
         // Reshape acc from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M),
         // ncol=(2, V, MMA_N))
         Tensor tOrO_rowcol = make_tensor(
-            tOrO_out.data(), flash::convert_layout_acc_rowcol(tOrO.layout()));
+            tOrO_out.data(), hstu::convert_layout_acc_rowcol(tOrO.layout()));
         Tensor tOrO_copy = cute::tiled_divide(
             tOrO_rowcol, Shape<_1, Int<kGmemElemsPerStoreDirect>>{});
         Tensor tOgO = thread_mma.partition_C(gO);
         Tensor tOgO_rowcol = make_tensor(
-            tOgO.data(), flash::convert_layout_acc_rowcol(tOgO.layout()));
+            tOgO.data(), hstu::convert_layout_acc_rowcol(tOgO.layout()));
         Tensor tOgO_copy = cute::tiled_divide(
             tOgO_rowcol, Shape<_1, Int<kGmemElemsPerStoreDirect>>{});
         Tensor taccOcO_col = taccOcO_rowcol(_0{}, _);
@@ -440,6 +456,42 @@ struct CollectiveEpilogueFwd {
     }
   }
 
+  template <typename FrgTensorLSE, typename TiledMma>
+  CUTLASS_DEVICE void store_softmax(
+      Params const& params,
+      FrgTensorLSE const& lse,
+      TiledMma tiled_mma,
+      int thread_idx,
+      cute::tuple<int32_t, int32_t, int32_t, int32_t> const& block_coord) {
+    auto [m_block, bidh, bidb, split_idx] = block_coord;
+    hstu::SeqlenInfo<Jagged, kBlockM> seqlen_info{
+        bidb, size<0>(params.shape_O), params.seq_offsets};
+    int offset_o = seqlen_info.offset;
+    int seqlen_o = seqlen_info.seqlen;
+    // Step 2: Write LSE from rmem -> gmem
+    auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
+    // (MMA,MMA_M,MMA_K)
+    Tensor taccOcO = thread_mma.partition_C(
+        cute::make_identity_tensor(select<0, 2>(TileShape_MNK{})));
+    static_assert(decltype(size<0, 0>(taccOcO))::value == 2);
+    static_assert(decltype(size<0, 1>(taccOcO))::value == 2);
+    Tensor taccOcO_rowcol = make_tensor(
+        taccOcO.data(), hstu::convert_layout_acc_rowcol(taccOcO.layout()));
+    Tensor taccOcO_row = taccOcO_rowcol(_, _0{});
+    CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row)); // MMA_M
+    Tensor mLSE = make_tensor(
+        make_gmem_ptr(params.ptr_lse + offset_o * get<0>(params.stride_lse)),
+        params.shape_lse_packed,
+        params.stride_lse_packed)(_, bidh, !Jagged ? bidb : 0, 0);
+#pragma unroll
+    for (int mi = 0; mi < size(lse); ++mi) {
+      int const row = m_block * kBlockM + get<0>(taccOcO_row(mi));
+      if (get<1>(taccOcO_row(_0{})) == 0 && row < seqlen_o) {
+        mLSE(row) = lse(mi);
+      }
+    }
+  }
+
   CUTLASS_DEVICE void store_tail() {
     // Don't need to do tma_store_wait<0>() here since we already did in @store
   }
@@ -452,7 +504,7 @@ struct CollectiveEpilogueFwd {
       cute::tuple<int32_t, int32_t, int32_t, int32_t> const& block_coord) {
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     auto [m_block, bidh, bidb, split_idx] = block_coord;
-    flash::SeqlenInfo<Jagged, kBlockM> seqlen_info{
+    hstu::SeqlenInfo<Jagged, kBlockM> seqlen_info{
         bidb, size<0>(params.shape_O), params.seq_offsets};
     int offset_o = seqlen_info.offset;
     int seqlen_o = seqlen_info.seqlen;
@@ -481,7 +533,7 @@ struct CollectiveEpilogueFwd {
     Tensor tOrO = make_fragment_like(tOgO);
     cute::clear(tOrO);
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
-    flash::copy<
+    hstu::copy<
         /*Is_even_MN=*/false,
         /*Is_even_K=*/false,
         /*Clear_OOB_MN=*/false,
@@ -495,4 +547,4 @@ struct CollectiveEpilogueFwd {
   }
 };
 
-} // namespace flash
+} // namespace hstu

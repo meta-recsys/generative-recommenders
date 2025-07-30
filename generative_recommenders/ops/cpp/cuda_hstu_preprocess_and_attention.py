@@ -111,7 +111,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             u = F.silu(u)
         elif recompute_uvqk_in_backward:
             u = u.clone()  # otherwise the whole uvqk will be saved
-        out = torch.ops.hstu.hstu_mha_fwd(
+        out, _ = torch.ops.hstu.hstu_mha_fwd(
             max_seq_len,
             alpha,
             q,
@@ -138,6 +138,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             x_rstd,
             uvqk_weight,
             seq_offsets,
+            out,
         ]
         if num_targets is not None:
             saved_tensors.append(num_targets)
@@ -206,10 +207,10 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         None,
         None,
     ]:
-        x, norm_weight, norm_bias, x_mean, x_rstd, uvqk_weight, seq_offsets = (
-            ctx.saved_tensors[:7]
+        x, norm_weight, norm_bias, x_mean, x_rstd, uvqk_weight, seq_offsets, out = (
+            ctx.saved_tensors[:8]
         )
-        idx = 7
+        idx = 8
         if ctx.has_multiple_targets:
             num_targets = ctx.saved_tensors[idx]
             idx += 1
@@ -287,6 +288,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             dq,
             dk,
             dv,
+            out,
             seq_offsets,
             True,  # causal
             num_targets,

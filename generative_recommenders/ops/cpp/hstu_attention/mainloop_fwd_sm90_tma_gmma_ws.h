@@ -36,7 +36,7 @@
 #include "sm90_pipeline_no_cluster.h"
 #include "utils.h"
 
-namespace flash {
+namespace hstu {
 
 using namespace cute;
 
@@ -53,7 +53,8 @@ template <
     bool Jagged,
     bool Has_targets,
     bool Mma1_is_RS,
-    bool V_colmajor_>
+    bool V_colmajor_,
+    bool Cross>
 struct CollectiveMainloopFwdSm90 {
   static constexpr int kStages = Stages;
   using ClusterShape = ClusterShape_;
@@ -67,7 +68,7 @@ struct CollectiveMainloopFwdSm90 {
   ;
   static constexpr bool V_colmajor = V_colmajor_;
   static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
-  using SeqlenInfo_t = flash::SeqlenInfoQKFwd<Jagged, Has_targets>;
+  using SeqlenInfo_t = hstu::SeqlenInfoQKFwd<Jagged, Cross, Has_targets>;
 
   static_assert(ArchTag::kMinComputeCapability >= 90);
 
@@ -484,7 +485,9 @@ struct CollectiveMainloopFwdSm90 {
     int const max_attn_len;
     int const min_full_attn_seq_len;
     int const contextual_seq_len;
+    int const num_softmax_heads;
     int const* const seq_offsets = nullptr;
+    int const* const seq_offsets_q = nullptr;
     int const* const num_targets = nullptr;
     float const* const attn_scale = nullptr;
     bool const scalar_scale = true;
@@ -509,10 +512,13 @@ struct CollectiveMainloopFwdSm90 {
     StrideDescale const stride_q_descale, stride_k_descale, stride_v_descale;
     float const max_seq_len_inv;
     float const alpha;
+    float const alpha_log2;
     int const max_attn_len;
     int const min_full_attn_seq_len;
     int const contextual_seq_len;
+    int const num_softmax_heads;
     int const* const seq_offsets = nullptr;
+    int const* const seq_offsets_q = nullptr;
     int const* const num_targets = nullptr;
     float const* const attn_scale = nullptr;
     bool const scalar_scale = true;
@@ -581,10 +587,13 @@ struct CollectiveMainloopFwdSm90 {
         args.stride_v_descale,
         args.max_seq_len_inv,
         args.alpha,
+        float(args.alpha * M_LOG2E),
         args.max_attn_len,
         args.min_full_attn_seq_len,
         args.contextual_seq_len,
+        args.num_softmax_heads,
         args.seq_offsets,
+        args.seq_offsets_q,
         args.num_targets,
         args.attn_scale,
         args.scalar_scale};
@@ -700,6 +709,22 @@ struct CollectiveMainloopFwdSm90 {
     return 0;
   }
 
+  CUTLASS_DEVICE
+  cute::tuple<int, int> get_cross_n_block_min_max(
+      int const uihlen_q,
+      int const seqlen_q,
+      int const seqlen_kv,
+      int const m_block) {
+    static constexpr int kBlockM = get<0>(TileShape_MNK{});
+    static constexpr int kBlockN = get<1>(TileShape_MNK{});
+    if constexpr (!Causal) {
+      return {0, cute::ceil_div(seqlen_kv, kBlockN)};
+    }
+    int n_block_max =
+        std::min(seqlen_kv, (m_block + 1) * kBlockM + seqlen_kv - uihlen_q);
+    return {0, cute::ceil_div(n_block_max, kBlockN)};
+  }
+
   template <typename SchedulerPrefetch, typename SharedStorage>
   CUTLASS_DEVICE void load(
       Params const& params,
@@ -715,17 +740,30 @@ struct CollectiveMainloopFwdSm90 {
     auto [m_block, bidh, bidb, split_idx] = block_coord;
     if constexpr (Jagged) {
       static constexpr int kBlockM = get<0>(TileShape_MNK{});
-      if (m_block * kBlockM >= seqlen_info.seqlen) {
+      if (m_block * kBlockM >= seqlen_info.seqlen_q) {
         scheduler_prefetch();
         return;
       }
     }
-    auto [n_block_min, n_block_max] = get_n_block_min_max(
-        params.max_attn_len,
-        params.min_full_attn_seq_len,
-        params.contextual_seq_len,
-        seqlen_info.uihlen,
-        m_block);
+    int n_block_min, n_block_max;
+    if constexpr (Cross) {
+      auto n_block_min_max = get_cross_n_block_min_max(
+          seqlen_info.uihlen_q,
+          seqlen_info.seqlen_q,
+          seqlen_info.seqlen_kv,
+          m_block);
+      n_block_min = get<0>(n_block_min_max);
+      n_block_max = get<1>(n_block_min_max);
+    } else {
+      auto n_block_min_max = get_n_block_min_max(
+          params.max_attn_len,
+          params.min_full_attn_seq_len,
+          params.contextual_seq_len,
+          seqlen_info.uihlen_q,
+          m_block);
+      n_block_min = get<0>(n_block_min_max);
+      n_block_max = get<1>(n_block_min_max);
+    }
 #ifdef HSTU_FLASH_ATTN_DEBUG_INFO
     if (n_block_max <= n_block_min) {
       std::printf(
@@ -1007,40 +1045,45 @@ struct CollectiveMainloopFwdSm90 {
       copy_Vt_to_V(smem_pipe_write);
     }
     ++smem_pipe_write;
-    if constexpr (Has_targets) {
-      auto [target_n_block_min, target_n_block_max] =
-          get_target_n_block_min_max(
-              n_block_max, seqlen_info.uihlen, seqlen_info.seqlen, m_block);
+    if constexpr (!Cross) {
+      if constexpr (Has_targets) {
+        auto [target_n_block_min, target_n_block_max] =
+            get_target_n_block_min_max(
+                n_block_max,
+                seqlen_info.uihlen_q,
+                seqlen_info.seqlen_kv,
+                m_block);
 #pragma unroll 1
-      for (n_block = target_n_block_max - 1; n_block >= target_n_block_min;
-           --n_block) {
-        if (should_load_KV) {
-          load_V(n_block, smem_pipe_write);
-          load_K(n_block, smem_pipe_write);
+        for (n_block = target_n_block_max - 1; n_block >= target_n_block_min;
+             --n_block) {
+          if (should_load_KV) {
+            load_V(n_block, smem_pipe_write);
+            load_K(n_block, smem_pipe_write);
+          }
+          if constexpr (Transpose_V) {
+            copy_Vt_to_V(smem_pipe_write);
+          }
+          ++smem_pipe_write;
         }
-        if constexpr (Transpose_V) {
-          copy_Vt_to_V(smem_pipe_write);
-        }
-        ++smem_pipe_write;
       }
-    }
-    if constexpr (Contexual_mask) {
-      int contexual_n_block_max = get_contexual_n_block_max(
-          n_block_min,
-          params.min_full_attn_seq_len,
-          params.contextual_seq_len,
-          seqlen_info.uihlen,
-          m_block);
+      if constexpr (Contexual_mask) {
+        int contexual_n_block_max = get_contexual_n_block_max(
+            n_block_min,
+            params.min_full_attn_seq_len,
+            params.contextual_seq_len,
+            seqlen_info.uihlen_q,
+            m_block);
 #pragma unroll 1
-      for (n_block = contexual_n_block_max - 1; n_block >= 0; --n_block) {
-        if (should_load_KV) {
-          load_V(n_block, smem_pipe_write);
-          load_K(n_block, smem_pipe_write);
+        for (n_block = contexual_n_block_max - 1; n_block >= 0; --n_block) {
+          if (should_load_KV) {
+            load_V(n_block, smem_pipe_write);
+            load_K(n_block, smem_pipe_write);
+          }
+          if constexpr (Transpose_V) {
+            copy_Vt_to_V(smem_pipe_write);
+          }
+          ++smem_pipe_write;
         }
-        if constexpr (Transpose_V) {
-          copy_Vt_to_V(smem_pipe_write);
-        }
-        ++smem_pipe_write;
       }
     }
     // At the end, all threads have the correct smem_pipe_write.
@@ -1082,14 +1125,14 @@ struct CollectiveMainloopFwdSm90 {
       cutlass::arch::NamedBarrier::sync(
           2 * cutlass::NumThreadsPerWarpGroup,
           static_cast<uint32_t>(FwdNamedBarriers::WarpSchedulerWG1) - 1 +
-              flash::canonical_warp_group_idx_nosync() /*id*/);
+              hstu::canonical_warp_group_idx_nosync() /*id*/);
     }
   }
 
   CUTLASS_DEVICE void warp_scheduler_barrier_arrive() {
     if constexpr (UseSchedulerBarrier) {
       static_assert(NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
-      int const cur_WG = flash::canonical_warp_group_idx_nosync() - 1;
+      int const cur_WG = hstu::canonical_warp_group_idx_nosync() - 1;
       int const next_WG = NumMmaWarpGroups == 2
           ? 1 - cur_WG
           : (cur_WG < NumMmaWarpGroups - 1 ? cur_WG + 1 : 0);
@@ -1109,7 +1152,7 @@ struct CollectiveMainloopFwdSm90 {
       // We have NamedBarrier for up to 3 WGs
       static_assert(NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
       // WG1 needs the very first signal to start
-      if (flash::canonical_warp_group_idx_nosync() == 1) {
+      if (hstu::canonical_warp_group_idx_nosync() == 1) {
         cutlass::arch::NamedBarrier::arrive(
             2 * cutlass::NumThreadsPerWarpGroup,
             static_cast<uint32_t>(FwdNamedBarriers::WarpSchedulerWG1) /*id*/);
@@ -1142,16 +1185,29 @@ struct CollectiveMainloopFwdSm90 {
     int const split_idx = get<3>(block_coord);
     if constexpr (Jagged) {
       static constexpr int kBlockM = get<0>(TileShape_MNK{});
-      if (m_block * kBlockM >= seqlen_info.seqlen) {
+      if (m_block * kBlockM >= seqlen_info.seqlen_q) {
         return false;
       }
     }
-    auto [n_block_min, n_block_max] = get_n_block_min_max(
-        params.max_attn_len,
-        params.min_full_attn_seq_len,
-        params.contextual_seq_len,
-        seqlen_info.uihlen,
-        m_block);
+    int n_block_min, n_block_max;
+    if constexpr (Cross) {
+      auto n_block_min_max = get_cross_n_block_min_max(
+          seqlen_info.uihlen_q,
+          seqlen_info.seqlen_q,
+          seqlen_info.seqlen_kv,
+          m_block);
+      n_block_min = get<0>(n_block_min_max);
+      n_block_max = get<1>(n_block_min_max);
+    } else {
+      auto n_block_min_max = get_n_block_min_max(
+          params.max_attn_len,
+          params.min_full_attn_seq_len,
+          params.contextual_seq_len,
+          seqlen_info.uihlen_q,
+          m_block);
+      n_block_min = get<0>(n_block_min_max);
+      n_block_max = get<1>(n_block_min_max);
+    }
 
 #ifdef HSTU_FLASH_ATTN_DEBUG_INFO
     if (n_block_max <= n_block_min) {
@@ -1229,13 +1285,14 @@ struct CollectiveMainloopFwdSm90 {
 
     int n_block = n_block_max - 1;
 
-    flash::Mask<kBlockM, kBlockN, TiledMma0> mask(
+    hstu::Mask<kBlockM, kBlockN, TiledMma0> mask(
         thread_idx,
-        seqlen_info.seqlen,
+        seqlen_info.seqlen_q,
+        seqlen_info.seqlen_kv,
         params.max_attn_len,
         params.min_full_attn_seq_len,
         params.contextual_seq_len,
-        seqlen_info.uihlen);
+        seqlen_info.uihlen_q);
 
     auto& barrier_Q = shared_storage.pipelines.barrier_Q;
     barrier_Q.wait(work_idx % 2);
@@ -1252,11 +1309,11 @@ struct CollectiveMainloopFwdSm90 {
     Tensor tScS = thread_mma.partition_C(cS);
     Tensor tScS_rowcol = make_tensor(
         tScS.data(),
-        flash::convert_layout_acc_rowcol</*Transposed=*/false>(tScS.layout()));
+        hstu::convert_layout_acc_rowcol</*Transposed=*/false>(tScS.layout()));
     Tensor t0ScS = thread0_mma.partition_C(cS);
     Tensor t0ScS_rowcol = make_tensor(
         t0ScS.data(),
-        flash::convert_layout_acc_rowcol</*Transposed=*/false>(t0ScS.layout()));
+        hstu::convert_layout_acc_rowcol</*Transposed=*/false>(t0ScS.layout()));
     int const thread_qdim_offset = get<Qdim>(tScS_rowcol(_0{}, _0{}));
     SiluScaleOp<float> silu_scale_op;
     int qdim_offset = params.scalar_scale
@@ -1277,9 +1334,9 @@ struct CollectiveMainloopFwdSm90 {
         partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
     Tensor tSrS_rowcol = make_tensor(
         tSrS.data(),
-        flash::convert_layout_acc_rowcol</*Transposed=*/false>(tSrS.layout()));
+        hstu::convert_layout_acc_rowcol</*Transposed=*/false>(tSrS.layout()));
     consumer_wait(pipeline_k, smem_pipe_read);
-    flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(
+    hstu::gemm</*zero_init=*/true, /*wg_wait=*/-1>(
         tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
     warpgroup_wait<0>();
     pipeline_k.consumer_release(smem_pipe_read);
@@ -1288,7 +1345,7 @@ struct CollectiveMainloopFwdSm90 {
       float scale = scalar_scale_val;
       if (!params.scalar_scale) {
         int q_index = qdim_offset + int(get<Qdim>(t0ScS_rowcol(mi, _0{})));
-        if (q_index < seqlen_info.seqlen) {
+        if (q_index < seqlen_info.seqlen_q) {
           scale = params.attn_scale[q_index];
         }
       }
@@ -1299,41 +1356,60 @@ struct CollectiveMainloopFwdSm90 {
       }
     }
     int const m_idx_max = (m_block + 1) * kBlockM;
-    if (m_idx_max <= seqlen_info.uihlen) {
-      mask.template apply<
-          false /*Seqlenq_mask*/,
-          false /*Seqlenk_mask*/,
-          Causal,
-          Local,
-          Contexual_mask,
-          false /*Target_mask*/>(tSrS, m_block, n_block);
-    } else if (
-        m_idx_max <= cute::ceil_div(seqlen_info.uihlen, kBlockM) * kBlockM) {
+    if constexpr (Cross) {
       mask.template apply<
           false /*Seqlenq_mask*/,
           true /*Seqlenk_mask*/,
           Causal,
-          Local,
-          Contexual_mask,
-          Has_targets>(tSrS, m_block, n_block);
+          false /*Local*/,
+          false /*Contexual_mask*/,
+          false /*Target_mask*/,
+          Cross,
+          false /*Softmax*/>(tSrS, m_block, n_block);
     } else {
-      mask.template apply<
-          false /*Seqlenq_mask*/,
-          true /*Seqlenk_mask*/,
-          false /*Causal*/,
-          false,
-          Contexual_mask,
-          Has_targets>(tSrS, m_block, n_block);
+      if (m_idx_max <= seqlen_info.uihlen_q) {
+        mask.template apply<
+            false /*Seqlenq_mask*/,
+            false /*Seqlenk_mask*/,
+            Causal,
+            Local,
+            Contexual_mask,
+            false /*Target_mask*/,
+            Cross,
+            false /*Softmax*/>(tSrS, m_block, n_block);
+      } else if (
+          m_idx_max <=
+          cute::ceil_div(seqlen_info.uihlen_q, kBlockM) * kBlockM) {
+        mask.template apply<
+            false /*Seqlenq_mask*/,
+            true /*Seqlenk_mask*/,
+            Causal,
+            Local,
+            Contexual_mask,
+            Has_targets,
+            Cross,
+            false /*Softmax*/>(tSrS, m_block, n_block);
+      } else {
+        mask.template apply<
+            false /*Seqlenq_mask*/,
+            true /*Seqlenk_mask*/,
+            false /*Causal*/,
+            false,
+            Contexual_mask,
+            Has_targets,
+            Cross,
+            false /*Softmax*/>(tSrS, m_block, n_block);
+      }
     }
     if constexpr (Is_FP8 && !V_colmajor) {
-      flash::permute_Cregs_fp8(tSrS);
+      hstu::permute_Cregs_fp8(tSrS);
     }
     Tensor tOrP_acc = make_tensor(
-        tSrS.data(), flash::convert_layout_acc_Aregs<TiledMma1>(tSrS.layout()));
+        tSrS.data(), hstu::convert_layout_acc_Aregs<TiledMma1>(tSrS.layout()));
     Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
     convert_type_out(tOrP_acc, tOrP);
     if constexpr (Is_FP8 && V_colmajor) {
-      flash::permute_Aregs_fp8(tOrP);
+      hstu::permute_Aregs_fp8(tOrP);
     }
     if constexpr (!Mma1_is_RS) {
       cute::copy(smem_tiled_copy_P, smem_thr_copy_P.retile_S(tOrP), tPsP);
@@ -1354,18 +1430,17 @@ struct CollectiveMainloopFwdSm90 {
           partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
       Tensor tSrS_rowcol = make_tensor(
           tSrS.data(),
-          flash::convert_layout_acc_rowcol</*Transposed=*/false>(
-              tSrS.layout()));
+          hstu::convert_layout_acc_rowcol</*Transposed=*/false>(tSrS.layout()));
       if (!UseSchedulerBarrier || warp_group_idx == 0) {
         consumer_wait(pipeline_k, smem_pipe_read);
       }
       warp_scheduler_barrier_sync();
-      flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(
+      hstu::gemm</*zero_init=*/true, /*wg_wait=*/-1>(
           tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
       if (!UseSchedulerBarrier || warp_group_idx == 0) {
         consumer_wait(pipeline_v, smem_pipe_read_v);
       }
-      flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(
+      hstu::gemm</*zero_init=*/false, /*wg_wait=*/-1>(
           tiled_mma1,
           cute::conditional_return<Mma1_is_RS>(tOrP, tOsP),
           tOrV(_, _, _, smem_pipe_read_v.index()),
@@ -1378,7 +1453,7 @@ struct CollectiveMainloopFwdSm90 {
         float scale = scalar_scale_val;
         if (!params.scalar_scale) {
           int q_index = qdim_offset + int(get<Qdim>(t0ScS_rowcol(mi, _0{})));
-          if (q_index < seqlen_info.seqlen) {
+          if (q_index < seqlen_info.seqlen_q) {
             scale = params.attn_scale[q_index];
           }
         }
@@ -1392,11 +1467,11 @@ struct CollectiveMainloopFwdSm90 {
       warpgroup_wait<0>();
       pipeline_v.consumer_release(smem_pipe_read_v); // release V
       if constexpr (Is_FP8 && !V_colmajor) {
-        flash::permute_Cregs_fp8(tSrS);
+        hstu::permute_Cregs_fp8(tSrS);
       }
       convert_type_out(make_tensor(tSrS.data(), tOrP.layout()), tOrP);
       if constexpr (Is_FP8 && V_colmajor) {
-        flash::permute_Aregs_fp8(tOrP);
+        hstu::permute_Aregs_fp8(tOrP);
       }
       if constexpr (!Mma1_is_RS) {
         cute::copy(smem_tiled_copy_P, smem_thr_copy_P.retile_S(tOrP), tPsP);
@@ -1407,99 +1482,143 @@ struct CollectiveMainloopFwdSm90 {
       }
     };
 
-    if constexpr (Causal || Local) { // Separate iterations with causal
-                                     // or local masking
-      if (m_idx_max <= cute::ceil_div(seqlen_info.uihlen, kBlockM) * kBlockM) {
-        auto mask_fn = [&](auto& tSrS, int n_block) {
+    if constexpr (Cross) {
+      if constexpr (Causal) {
+        if (m_idx_max <=
+            cute::ceil_div(seqlen_info.uihlen_q, kBlockM) * kBlockM) {
+          auto mask_fn = [&](auto& tSrS, int n_block) {
+            mask.template apply<
+                false /*Seqlenq_mask*/,
+                false /*Seqlenk_mask*/,
+                Causal,
+                false /*Local*/,
+                false /*Contexual_mask*/,
+                false /*Target_mask*/,
+                Cross,
+                false /*Softmax*/>(tSrS, m_block, n_block);
+          };
+          int const m_idx_min = m_block * kBlockM;
+          int const n_block_min_causal_mask = std::max(
+              n_block_min,
+              (m_idx_min + seqlen_info.seqlen_kv - seqlen_info.uihlen_q) /
+                  kBlockN);
+#pragma unroll 1
+          for (; n_block >= n_block_min_causal_mask; --n_block) {
+            fwd_step_intra_warp_pipeline(n_block, mask_fn);
+          }
+        }
+      }
+      auto no_mask_fn = [](auto& tSrS, int n_block) {};
+#pragma unroll 1
+      for (; n_block >= n_block_min; --n_block) {
+        fwd_step_intra_warp_pipeline(n_block, no_mask_fn);
+      }
+    } else {
+      if constexpr (Causal || Local) { // Separate iterations with causal
+                                       // or local masking
+        if (m_idx_max <=
+            cute::ceil_div(seqlen_info.uihlen_q, kBlockM) * kBlockM) {
+          auto mask_fn = [&](auto& tSrS, int n_block) {
+            mask.template apply<
+                false /*Seqlenq_mask*/,
+                false /*Seqlenk_mask*/,
+                Causal,
+                Local,
+                Contexual_mask,
+                false /*Has_targets*/,
+                Cross,
+                false /*Softmax*/>(tSrS, m_block, n_block);
+          };
+          int const m_idx_min = m_block * kBlockM;
+          int const n_block_min_causal_local_mask =
+              std::max(n_block_min, m_idx_min / kBlockN);
+#pragma unroll 1
+          for (; n_block >= n_block_min_causal_local_mask; --n_block) {
+            fwd_step_intra_warp_pipeline(n_block, mask_fn);
+          }
+        }
+      }
+      int n_block_min_before_local_mask = n_block_min;
+      if constexpr (Local) {
+        if (m_idx_max <=
+            cute::ceil_div(
+                seqlen_info.uihlen_q - params.min_full_attn_seq_len, kBlockM) *
+                kBlockM) {
+          n_block_min_before_local_mask = std::max(
+              n_block_min,
+              cute::ceil_div(m_idx_max - params.max_attn_len, kBlockN));
+        }
+      }
+      auto no_mask_fn = [](auto& tSrS, int n_block) {};
+#pragma unroll 1
+      for (; n_block >= n_block_min_before_local_mask; --n_block) {
+        fwd_step_intra_warp_pipeline(n_block, no_mask_fn);
+      }
+      // Separate masking iterations on the left for local attention
+      if constexpr (Local) {
+        auto local_mask_fn = [&](auto& tSrS, int n_block) {
           mask.template apply<
               false /*Seqlenq_mask*/,
               false /*Seqlenk_mask*/,
-              Causal,
+              false /*Causal_mask*/,
               Local,
               Contexual_mask,
-              false /*Has_targets*/>(tSrS, m_block, n_block);
+              false /*Has_targets*/,
+              Cross,
+              false /*Softmax*/>(tSrS, m_block, n_block);
         };
-        int const m_idx_min = m_block * kBlockM;
-        int const n_block_min_causal_local_mask =
-            std::max(n_block_min, m_idx_min / kBlockN);
 #pragma unroll 1
-        for (; n_block >= n_block_min_causal_local_mask; --n_block) {
-          fwd_step_intra_warp_pipeline(n_block, mask_fn);
+        for (; n_block >= n_block_min; --n_block) {
+          fwd_step_intra_warp_pipeline(n_block, local_mask_fn);
         }
       }
-    }
-
-    int n_block_min_before_local_mask = n_block_min;
-    if constexpr (Local) {
-      if (m_idx_max <=
-          cute::ceil_div(
-              seqlen_info.uihlen - params.min_full_attn_seq_len, kBlockM) *
-              kBlockM) {
-        n_block_min_before_local_mask = std::max(
+      // Target part GEMM
+      if constexpr (Has_targets) {
+        auto [target_n_block_min, target_n_block_max] =
+            get_target_n_block_min_max(
+                n_block_max,
+                seqlen_info.uihlen_q,
+                seqlen_info.seqlen_kv,
+                m_block);
+        auto target_mask_fn = [&](auto& tSrS, int n_block) {
+          mask.template apply<
+              false /*Seqlenq_mask*/,
+              true /*Seqlenk_mask*/,
+              false /*Causal_mask*/,
+              false /*Local*/,
+              Contexual_mask,
+              Has_targets,
+              Cross,
+              false /*Softmax*/>(tSrS, m_block, n_block);
+        };
+#pragma unroll 1
+        for (n_block = target_n_block_max - 1; n_block >= target_n_block_min;
+             --n_block) {
+          fwd_step_intra_warp_pipeline(n_block, target_mask_fn);
+        }
+      }
+      if constexpr (Contexual_mask) {
+        int contexual_n_block_max = get_contexual_n_block_max(
             n_block_min,
-            cute::ceil_div(m_idx_max - params.max_attn_len, kBlockN));
-      }
-    }
-    auto no_mask_fn = [](auto& tSrS, int n_block) {};
+            params.min_full_attn_seq_len,
+            params.contextual_seq_len,
+            seqlen_info.uihlen_q,
+            m_block);
+        auto contexual_mask_fn = [&](auto& tSrS, int n_block) {
+          mask.template apply<
+              false /*Seqlenq_mask*/,
+              true /*Seqlenk_mask*/,
+              false /*Causal_mask*/,
+              Local,
+              Contexual_mask,
+              Has_targets,
+              Cross,
+              false /*Softmax*/>(tSrS, m_block, n_block);
+        };
 #pragma unroll 1
-    for (; n_block >= n_block_min_before_local_mask; --n_block) {
-      fwd_step_intra_warp_pipeline(n_block, no_mask_fn);
-    }
-    // Separate masking iterations on the left for local attention
-    if constexpr (Local) {
-      auto local_mask_fn = [&](auto& tSrS, int n_block) {
-        mask.template apply<
-            false /*Seqlenq_mask*/,
-            false /*Seqlenk_mask*/,
-            false /*Causal_mask*/,
-            Local,
-            Contexual_mask,
-            false /*Has_targets*/>(tSrS, m_block, n_block);
-      };
-#pragma unroll 1
-      for (; n_block >= n_block_min; --n_block) {
-        fwd_step_intra_warp_pipeline(n_block, local_mask_fn);
-      }
-    }
-    // Target part GEMM
-    if constexpr (Has_targets) {
-      auto [target_n_block_min, target_n_block_max] =
-          get_target_n_block_min_max(
-              n_block_max, seqlen_info.uihlen, seqlen_info.seqlen, m_block);
-      auto target_mask_fn = [&](auto& tSrS, int n_block) {
-        mask.template apply<
-            false /*Seqlenq_mask*/,
-            true /*Seqlenk_mask*/,
-            false /*Causal_mask*/,
-            false /*Local*/,
-            Contexual_mask,
-            Has_targets>(tSrS, m_block, n_block);
-      };
-#pragma unroll 1
-      for (n_block = target_n_block_max - 1; n_block >= target_n_block_min;
-           --n_block) {
-        fwd_step_intra_warp_pipeline(n_block, target_mask_fn);
-      }
-    }
-    if constexpr (Contexual_mask) {
-      int contexual_n_block_max = get_contexual_n_block_max(
-          n_block_min,
-          params.min_full_attn_seq_len,
-          params.contextual_seq_len,
-          seqlen_info.uihlen,
-          m_block);
-      auto contexual_mask_fn = [&](auto& tSrS, int n_block) {
-        mask.template apply<
-            false /*Seqlenq_mask*/,
-            true /*Seqlenk_mask*/,
-            false /*Causal_mask*/,
-            Local,
-            Contexual_mask,
-            Has_targets>(tSrS, m_block, n_block);
-      };
-#pragma unroll 1
-      for (n_block = contexual_n_block_max - 1; n_block >= 0; --n_block) {
-        fwd_step_intra_warp_pipeline(n_block, contexual_mask_fn);
+        for (n_block = contexual_n_block_max - 1; n_block >= 0; --n_block) {
+          fwd_step_intra_warp_pipeline(n_block, contexual_mask_fn);
+        }
       }
     }
     // Tell producers that smem_q is ready
@@ -1507,7 +1626,7 @@ struct CollectiveMainloopFwdSm90 {
         NumMmaThreads + cutlass::NumThreadsPerWarp,
         static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
     consumer_wait(pipeline_v, smem_pipe_read);
-    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(
+    hstu::gemm</*zero_init=*/false, /*wg_wait=*/-1>(
         tiled_mma1,
         cute::conditional_return<Mma1_is_RS>(tOrP, tOsP),
         tOrV(_, _, _, smem_pipe_read.index()),
@@ -1516,7 +1635,477 @@ struct CollectiveMainloopFwdSm90 {
     pipeline_v.consumer_release(
         smem_pipe_read); // release V, otherwise producers will hang
     if constexpr (Is_FP8 && !V_colmajor) {
-      flash::permute_output_fp8(tOrO);
+      hstu::permute_output_fp8(tOrO);
+    }
+    ++smem_pipe_read;
+    ++work_idx;
+    return true;
+  }
+
+  template <typename SharedStorage, typename FrgTensorO, typename Softmax>
+  CUTLASS_DEVICE bool mma_softmax(
+      Params const& params,
+      MainloopPipelineK pipeline_k,
+      MainloopPipelineV pipeline_v,
+      PipelineState& smem_pipe_read,
+      FrgTensorO& tOrO,
+      Softmax& softmax,
+      int const thread_idx,
+      int& work_idx,
+      SeqlenInfo_t const& seqlen_info,
+      cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord,
+      SharedStorage& shared_storage) {
+    static_assert(
+        is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
+    static constexpr int kBlockM = get<0>(TileShape_MNK{});
+    static constexpr int kBlockN = get<1>(TileShape_MNK{});
+
+    // can't use auto [m_block, ...] = block_coord since structured binding
+    // cannot be captured in lambda
+    int const m_block = get<0>(block_coord);
+    int const bidh = get<1>(block_coord);
+    int const bidb = get<2>(block_coord);
+    int const split_idx = get<3>(block_coord);
+    if constexpr (Jagged) {
+      static constexpr int kBlockM = get<0>(TileShape_MNK{});
+      if (m_block * kBlockM >= seqlen_info.seqlen_q) {
+        return false;
+      }
+    }
+    int n_block_min, n_block_max;
+    if constexpr (Cross) {
+      auto n_block_min_max = get_cross_n_block_min_max(
+          seqlen_info.uihlen_q,
+          seqlen_info.seqlen_q,
+          seqlen_info.seqlen_kv,
+          m_block);
+      n_block_min = get<0>(n_block_min_max);
+      n_block_max = get<1>(n_block_min_max);
+    } else {
+      auto n_block_min_max = get_n_block_min_max(
+          params.max_attn_len,
+          params.min_full_attn_seq_len,
+          params.contextual_seq_len,
+          seqlen_info.uihlen_q,
+          m_block);
+      n_block_min = get<0>(n_block_min_max);
+      n_block_max = get<1>(n_block_min_max);
+    }
+
+#ifdef HSTU_FLASH_ATTN_DEBUG_INFO
+    if (n_block_max <= n_block_min) {
+      std::printf(
+          "mainloop_fwd_sm90: n_block_max <= n_block_min not expected.");
+      return false;
+    }
+#endif
+
+    Tensor sQ = make_tensor(
+        make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()),
+        SmemLayoutQ{});
+    Tensor sK = make_tensor(
+        make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()),
+        SmemLayoutK{});
+    Tensor sV = make_tensor(
+        make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()),
+        SmemLayoutVtMma{});
+    Tensor sP = [&] {
+      if constexpr (Mma1_is_RS) {
+        // We might not have smem_p if !Mma1_is_RS1, just use smem_q as a
+        // placeholder since we don't use it
+        return make_tensor(
+            make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()),
+            SmemLayoutP{});
+      } else {
+        return make_tensor(
+            make_smem_ptr(shared_storage.tensors.mainloop.smem_p.data()),
+            SmemLayoutP{});
+      }
+    }();
+
+    if constexpr (!Mma0_is_RS) {
+      static_assert(
+          stride<0>(typename TiledMma0::ALayout{}) == 0 and
+              stride<0>(typename TiledMma0::BLayout{}) == 0 and
+              size<0>(typename TiledMma0::ALayout{}) ==
+                  cutlass::NumThreadsPerWarpGroup and
+              size<0>(typename TiledMma0::BLayout{}) ==
+                  cutlass::NumThreadsPerWarpGroup,
+          "Stride of the first mode must be 0 and the size of the mode must be NumThreadsPerWarpGroup");
+    }
+    constexpr int MmaWarpGroups =
+        size(TiledMma0{}) / cutlass::NumThreadsPerWarpGroup;
+    Layout warp_group_thread_layout = make_layout(
+        make_shape(Int<MmaWarpGroups>{}),
+        make_stride(Int<cutlass::NumThreadsPerWarpGroup>{}));
+
+    int warp_group_idx = __shfl_sync(
+        0xFFFFFFFF, thread_idx / cutlass::NumThreadsPerWarpGroup, 0);
+    TiledMma0 tiled_mma0;
+    TiledMma1 tiled_mma1;
+    auto wg_mma0 =
+        tiled_mma0.get_slice(warp_group_thread_layout(warp_group_idx));
+    auto wg_mma1 =
+        tiled_mma1.get_slice(warp_group_thread_layout(warp_group_idx));
+
+    auto smem_tiled_copy_P = make_tiled_copy_C(SmemCopyAtomP{}, tiled_mma0);
+    auto smem_thr_copy_P = smem_tiled_copy_P.get_thread_slice(thread_idx);
+
+    // Allocate "fragments/descriptors"
+    Tensor tSrQ = wg_mma0.partition_fragment_A(sQ);
+    Tensor tSrK = wg_mma0.partition_fragment_B(sK);
+    Tensor tOrV = wg_mma1.partition_fragment_B(sV);
+    Tensor tOsP = wg_mma1.partition_fragment_A(sP);
+    Tensor tPsP = smem_thr_copy_P.partition_D(
+        cute::as_position_independent_swizzle_tensor(sP));
+
+    auto consumer_wait = [](auto& pipeline, auto& smem_pipe_read) {
+      auto barrier_token = pipeline.consumer_try_wait(smem_pipe_read);
+      pipeline.consumer_wait(smem_pipe_read, barrier_token);
+    };
+
+    clear(tOrO);
+
+    int n_block = n_block_max - 1;
+
+    hstu::Mask<kBlockM, kBlockN, TiledMma0> mask(
+        thread_idx,
+        seqlen_info.seqlen_q,
+        seqlen_info.seqlen_kv,
+        params.max_attn_len,
+        params.min_full_attn_seq_len,
+        params.contextual_seq_len,
+        seqlen_info.uihlen_q);
+
+    auto& barrier_Q = shared_storage.pipelines.barrier_Q;
+    barrier_Q.wait(work_idx % 2);
+
+    // attention scale
+    float scalar_scale_val = params.scalar_scale
+        ? (params.attn_scale == nullptr ? params.max_seq_len_inv
+                                        : params.attn_scale[0])
+        : 0;
+    static constexpr int Qdim = 0;
+    auto thread_mma = tiled_mma0.get_thread_slice(thread_idx);
+    auto thread0_mma = tiled_mma0.get_thread_slice(_0{});
+    Tensor cS = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+    Tensor tScS = thread_mma.partition_C(cS);
+    Tensor tScS_rowcol = make_tensor(
+        tScS.data(),
+        hstu::convert_layout_acc_rowcol</*Transposed=*/false>(tScS.layout()));
+    Tensor t0ScS = thread0_mma.partition_C(cS);
+    Tensor t0ScS_rowcol = make_tensor(
+        t0ScS.data(),
+        hstu::convert_layout_acc_rowcol</*Transposed=*/false>(t0ScS.layout()));
+    int const thread_qdim_offset = get<Qdim>(tScS_rowcol(_0{}, _0{}));
+    int qdim_offset = params.scalar_scale
+        ? 0
+        : m_block * kBlockM + thread_qdim_offset + seqlen_info.offset_q;
+
+    if constexpr (Mma0_is_RS) {
+      using SmemCopyAtomQ = Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
+      auto smem_tiled_copy_Q = make_tiled_copy_A(SmemCopyAtomQ{}, tiled_mma0);
+      auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(thread_idx);
+      Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+      Tensor tSsQ_copy_view = smem_thr_copy_Q.partition_S(
+          cute::as_position_independent_swizzle_tensor(sQ));
+      cute::copy(smem_tiled_copy_Q, tSsQ_copy_view, tSrQ_copy_view);
+    }
+
+    Tensor tSrS =
+        partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
+    Tensor tSrS_rowcol = make_tensor(
+        tSrS.data(),
+        hstu::convert_layout_acc_rowcol</*Transposed=*/false>(tSrS.layout()));
+    consumer_wait(pipeline_k, smem_pipe_read);
+    hstu::gemm</*zero_init=*/true, /*wg_wait=*/-1>(
+        tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+    warpgroup_wait<0>();
+    pipeline_k.consumer_release(smem_pipe_read);
+    int const m_idx_max = (m_block + 1) * kBlockM;
+    if constexpr (Cross) {
+      mask.template apply<
+          false /*Seqlenq_mask*/,
+          true /*Seqlenk_mask*/,
+          Causal,
+          false /*Local*/,
+          false /*Contexual_mask*/,
+          false /*Target_mask*/,
+          Cross,
+          true /*Softmax*/>(tSrS, m_block, n_block);
+    } else {
+      if (m_idx_max <= seqlen_info.uihlen_q) {
+        mask.template apply<
+            false /*Seqlenq_mask*/,
+            false /*Seqlenk_mask*/,
+            Causal,
+            Local,
+            Contexual_mask,
+            false /*Target_mask*/,
+            Cross,
+            true /*Softmax*/>(tSrS, m_block, n_block);
+      } else if (
+          m_idx_max <=
+          cute::ceil_div(seqlen_info.uihlen_q, kBlockM) * kBlockM) {
+        mask.template apply<
+            false /*Seqlenq_mask*/,
+            true /*Seqlenk_mask*/,
+            Causal,
+            Local,
+            Contexual_mask,
+            Has_targets,
+            Cross,
+            true /*Softmax*/>(tSrS, m_block, n_block);
+      } else {
+        mask.template apply<
+            false /*Seqlenq_mask*/,
+            true /*Seqlenk_mask*/,
+            false /*Causal*/,
+            false,
+            Contexual_mask,
+            Has_targets,
+            Cross,
+            true /*Softmax*/>(tSrS, m_block, n_block);
+      }
+    }
+    Tensor scores_scale = softmax.template max_get_scale<
+        /*Is_first=*/true,
+        /*Check_inf=*/true>(tSrS);
+    softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(
+        tSrS);
+    if constexpr (Is_FP8 && !V_colmajor) {
+      hstu::permute_Cregs_fp8(tSrS);
+    }
+    Tensor tOrP_acc = make_tensor(
+        tSrS.data(), hstu::convert_layout_acc_Aregs<TiledMma1>(tSrS.layout()));
+    Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
+    convert_type_out(tOrP_acc, tOrP);
+    if constexpr (Is_FP8 && V_colmajor) {
+      hstu::permute_Aregs_fp8(tOrP);
+    }
+    if constexpr (!Mma1_is_RS) {
+      cute::copy(smem_tiled_copy_P, smem_thr_copy_P.retile_S(tOrP), tPsP);
+      cutlass::arch::fence_view_async_shared();
+      __syncwarp(); // Only need syncwarp since each warp is using its own P
+                    // values for Mma1
+    }
+    --n_block;
+
+    // Each step does gemm0 and softmax for iter n_block and gemm1 for prev
+    auto fwd_step_intra_warp_pipeline = [&](int const n_block,
+                                            auto mask_fn,
+                                            auto check_inf_type) {
+      static constexpr bool Check_inf = decltype(check_inf_type)::value;
+      PipelineState smem_pipe_read_v(
+          smem_pipe_read.index(),
+          smem_pipe_read.phase(),
+          smem_pipe_read.count());
+      ++smem_pipe_read;
+      Tensor tSrS =
+          partition_fragment_C(tiled_mma0, select<0, 1>(TileShape_MNK{}));
+      Tensor tSrS_rowcol = make_tensor(
+          tSrS.data(),
+          hstu::convert_layout_acc_rowcol</*Transposed=*/false>(tSrS.layout()));
+      if (!UseSchedulerBarrier || warp_group_idx == 0) {
+        consumer_wait(pipeline_k, smem_pipe_read);
+      }
+      warp_scheduler_barrier_sync();
+      hstu::gemm</*zero_init=*/true, /*wg_wait=*/-1>(
+          tiled_mma0, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+      if (!UseSchedulerBarrier || warp_group_idx == 0) {
+        consumer_wait(pipeline_v, smem_pipe_read_v);
+      }
+      hstu::gemm</*zero_init=*/false, /*wg_wait=*/-1>(
+          tiled_mma1,
+          cute::conditional_return<Mma1_is_RS>(tOrP, tOsP),
+          tOrV(_, _, _, smem_pipe_read_v.index()),
+          tOrO);
+      warp_scheduler_barrier_arrive();
+      warpgroup_wait<1>();
+      pipeline_k.consumer_release(smem_pipe_read); // release K
+      mask_fn(tSrS, n_block);
+      cute::copy(
+          softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS),
+          scores_scale);
+      softmax.template online_softmax</*Is_first=*/false, Check_inf>(tSrS);
+      softmax.rescale_o(tOrO, scores_scale);
+      warpgroup_wait<0>();
+      pipeline_v.consumer_release(smem_pipe_read_v); // release V
+      if constexpr (Is_FP8 && !V_colmajor) {
+        hstu::permute_Cregs_fp8(tSrS);
+      }
+      convert_type_out(make_tensor(tSrS.data(), tOrP.layout()), tOrP);
+      if constexpr (Is_FP8 && V_colmajor) {
+        hstu::permute_Aregs_fp8(tOrP);
+      }
+      if constexpr (!Mma1_is_RS) {
+        cute::copy(smem_tiled_copy_P, smem_thr_copy_P.retile_S(tOrP), tPsP);
+      }
+      if constexpr (!Mma1_is_RS) {
+        cutlass::arch::fence_view_async_shared();
+        __syncwarp();
+      }
+    };
+
+    if constexpr (Cross) {
+      if constexpr (Causal) {
+        if (m_idx_max <=
+            cute::ceil_div(seqlen_info.uihlen_q, kBlockM) * kBlockM) {
+          auto mask_fn = [&](auto& tSrS, int n_block) {
+            mask.template apply<
+                false /*Seqlenq_mask*/,
+                false /*Seqlenk_mask*/,
+                Causal,
+                false /*Local*/,
+                false /*Contexual_mask*/,
+                false /*Target_mask*/,
+                Cross,
+                true /*Softmax*/>(tSrS, m_block, n_block);
+          };
+          int const m_idx_min = m_block * kBlockM;
+          int const n_block_min_causal_mask = std::max(
+              n_block_min,
+              (m_idx_min + seqlen_info.seqlen_kv - seqlen_info.uihlen_q) /
+                  kBlockN);
+#pragma unroll 1
+          for (; n_block >= n_block_min_causal_mask; --n_block) {
+            fwd_step_intra_warp_pipeline(n_block, mask_fn, cute::true_type{});
+          }
+        }
+      }
+      auto no_mask_fn = [](auto& tSrS, int n_block) {};
+#pragma unroll 1
+      for (; n_block >= n_block_min; --n_block) {
+        fwd_step_intra_warp_pipeline(n_block, no_mask_fn, cute::false_type{});
+      }
+    } else {
+      if constexpr (Causal || Local) { // Separate iterations with causal
+                                       // or local masking
+        if (m_idx_max <=
+            cute::ceil_div(seqlen_info.uihlen_q, kBlockM) * kBlockM) {
+          auto mask_fn = [&](auto& tSrS, int n_block) {
+            mask.template apply<
+                false /*Seqlenq_mask*/,
+                false /*Seqlenk_mask*/,
+                Causal,
+                Local,
+                Contexual_mask,
+                false /*Has_targets*/,
+                Cross,
+                true /*Softmax*/>(tSrS, m_block, n_block);
+          };
+          int const m_idx_min = m_block * kBlockM;
+          int const n_block_min_causal_local_mask =
+              std::max(n_block_min, m_idx_min / kBlockN);
+#pragma unroll 1
+          for (; n_block >= n_block_min_causal_local_mask; --n_block) {
+            fwd_step_intra_warp_pipeline(n_block, mask_fn, cute::true_type{});
+          }
+        }
+      }
+      int n_block_min_before_local_mask = n_block_min;
+      if constexpr (Local) {
+        if (m_idx_max <=
+            cute::ceil_div(
+                seqlen_info.uihlen_q - params.min_full_attn_seq_len, kBlockM) *
+                kBlockM) {
+          n_block_min_before_local_mask = std::max(
+              n_block_min,
+              cute::ceil_div(m_idx_max - params.max_attn_len, kBlockN));
+        }
+      }
+      auto no_mask_fn = [](auto& tSrS, int n_block) {};
+#pragma unroll 1
+      for (; n_block >= n_block_min_before_local_mask; --n_block) {
+        fwd_step_intra_warp_pipeline(n_block, no_mask_fn, cute::false_type{});
+      }
+      // Separate masking iterations on the left for local attention
+      if constexpr (Local) {
+        auto local_mask_fn = [&](auto& tSrS, int n_block) {
+          mask.template apply<
+              false /*Seqlenq_mask*/,
+              false /*Seqlenk_mask*/,
+              false /*Causal_mask*/,
+              Local,
+              Contexual_mask,
+              false /*Has_targets*/,
+              Cross,
+              true /*Softmax*/>(tSrS, m_block, n_block);
+        };
+#pragma unroll 1
+        for (; n_block >= n_block_min; --n_block) {
+          fwd_step_intra_warp_pipeline(
+              n_block, local_mask_fn, cute::true_type{});
+        }
+      }
+      // Target part GEMM
+      if constexpr (Has_targets) {
+        auto [target_n_block_min, target_n_block_max] =
+            get_target_n_block_min_max(
+                n_block_max,
+                seqlen_info.uihlen_q,
+                seqlen_info.seqlen_kv,
+                m_block);
+        auto target_mask_fn = [&](auto& tSrS, int n_block) {
+          mask.template apply<
+              false /*Seqlenq_mask*/,
+              true /*Seqlenk_mask*/,
+              false /*Causal_mask*/,
+              false /*Local*/,
+              Contexual_mask,
+              Has_targets,
+              Cross,
+              true /*Softmax*/>(tSrS, m_block, n_block);
+        };
+#pragma unroll 1
+        for (n_block = target_n_block_max - 1; n_block >= target_n_block_min;
+             --n_block) {
+          fwd_step_intra_warp_pipeline(
+              n_block, target_mask_fn, cute::true_type{});
+        }
+      }
+      if constexpr (Contexual_mask) {
+        int contexual_n_block_max = get_contexual_n_block_max(
+            n_block_min,
+            params.min_full_attn_seq_len,
+            params.contextual_seq_len,
+            seqlen_info.uihlen_q,
+            m_block);
+        auto contexual_mask_fn = [&](auto& tSrS, int n_block) {
+          mask.template apply<
+              false /*Seqlenq_mask*/,
+              true /*Seqlenk_mask*/,
+              false /*Causal_mask*/,
+              Local,
+              Contexual_mask,
+              Has_targets,
+              Cross,
+              true /*Softmax*/>(tSrS, m_block, n_block);
+        };
+#pragma unroll 1
+        for (n_block = contexual_n_block_max - 1; n_block >= 0; --n_block) {
+          fwd_step_intra_warp_pipeline(
+              n_block, contexual_mask_fn, cute::true_type{});
+        }
+      }
+    }
+    // Tell producers that smem_q is ready
+    cutlass::arch::NamedBarrier::arrive(
+        NumMmaThreads + cutlass::NumThreadsPerWarp,
+        static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
+    consumer_wait(pipeline_v, smem_pipe_read);
+    hstu::gemm</*zero_init=*/false, /*wg_wait=*/-1>(
+        tiled_mma1,
+        cute::conditional_return<Mma1_is_RS>(tOrP, tOsP),
+        tOrV(_, _, _, smem_pipe_read.index()),
+        tOrO);
+    cute::copy(softmax.finalize(1.0f), scores_scale);
+    softmax.rescale_o(tOrO, scores_scale);
+    warpgroup_wait<0>();
+    pipeline_v.consumer_release(
+        smem_pipe_read); // release V, otherwise producers will hang
+    if constexpr (Is_FP8 && !V_colmajor) {
+      hstu::permute_output_fp8(tOrO);
     }
     ++smem_pipe_read;
     ++work_idx;
@@ -1524,4 +2113,4 @@ struct CollectiveMainloopFwdSm90 {
   }
 };
 
-} // namespace flash
+} // namespace hstu

@@ -33,11 +33,12 @@
 #include "tile_scheduler.h"
 #include "utils.h"
 
-namespace flash {
+namespace hstu {
 
 using namespace cute;
 
 template <
+    bool Softmax,
     class CollectiveMainloop_,
     class CollectiveEpilogue_,
     class TileScheduler_>
@@ -62,7 +63,7 @@ class FlashAttnBwdSm90 {
   static_assert(ArchTag::kMinComputeCapability >= 90);
 
   using TileScheduler = TileScheduler_;
-  using TileSchedulerArguments = typename flash::TileSchedulerArguments;
+  using TileSchedulerArguments = typename hstu::TileSchedulerArguments;
   using TileSchedulerParams = typename TileScheduler::Params;
 
   static constexpr uint32_t NumLoadWarpGroups = 1;
@@ -196,8 +197,14 @@ class FlashAttnBwdSm90 {
         threadIdx.x % cutlass::NumThreadsPerWarpGroup;
 
     PipelineParams pipeline_params;
-    pipeline_params.transaction_bytes =
-        CollectiveMainloop::TmaTransactionBytesQ;
+    if constexpr (Softmax) {
+      pipeline_params.transaction_bytes =
+          CollectiveMainloop::TmaTransactionBytesQ +
+          CollectiveMainloop::TmaTransactionBytesLSE;
+    } else {
+      pipeline_params.transaction_bytes =
+          CollectiveMainloop::TmaTransactionBytesQ;
+    }
     int warp_group_idx = cutlass::canonical_warp_group_idx();
     pipeline_params.role = warp_group_idx == 0
         ? MainloopPipeline::ThreadCategory::Producer
@@ -346,18 +353,35 @@ class FlashAttnBwdSm90 {
             tiled_mma_dKV,
             select < !dKV_swapAB ? 1 : 2,
             !dKV_swapAB ? 2 : 1 > (TileShape_MNK{}));
-        bool tile_valid = collective_mainloop.mma(
-            params.mainloop,
-            pipeline_q,
-            pipeline_do,
-            smem_pipe_read,
-            smem_pipe_read_do,
-            tdKrdK,
-            tdVrdV,
-            threadIdx.x - NumCopyThreads,
-            work_idx,
-            block_coord,
-            shared_storage);
+
+        bool tile_valid;
+        if constexpr (Softmax) {
+          tile_valid = collective_mainloop.mma_softmax(
+              params.mainloop,
+              pipeline_q,
+              pipeline_do,
+              smem_pipe_read,
+              smem_pipe_read_do,
+              tdKrdK,
+              tdVrdV,
+              threadIdx.x - NumCopyThreads,
+              work_idx,
+              block_coord,
+              shared_storage);
+        } else {
+          tile_valid = collective_mainloop.mma(
+              params.mainloop,
+              pipeline_q,
+              pipeline_do,
+              smem_pipe_read,
+              smem_pipe_read_do,
+              tdKrdK,
+              tdVrdV,
+              threadIdx.x - NumCopyThreads,
+              work_idx,
+              block_coord,
+              shared_storage);
+        }
         if (tile_valid) {
           collective_epilogue.store(
               params.epilogue,
@@ -377,4 +401,4 @@ class FlashAttnBwdSm90 {
   }
 };
 
-} // namespace flash
+} // namespace hstu

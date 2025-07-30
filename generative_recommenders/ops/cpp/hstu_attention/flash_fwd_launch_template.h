@@ -38,6 +38,8 @@
 #include "epilogue_fwd.h"
 // clang-format on
 
+namespace hstu {
+
 using namespace cute;
 
 template <
@@ -51,8 +53,11 @@ template <
     bool Contexual_mask,
     bool Jagged,
     bool Has_targets,
-    bool V_colmajor>
-void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
+    bool V_colmajor,
+    bool Cross,
+    bool Softmax,
+    bool Training>
+void run_flash_fwd(hstu::Flash_fwd_params& params, cudaStream_t stream) {
   static_assert(
       !(Causal && Local),
       "Causal and Local cannot be enabled at the same time");
@@ -64,10 +69,17 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
       std::conditional_t<Arch >= 90, cutlass::arch::Sm90, cutlass::arch::Sm80>;
 
   // Can't use structured binding since it's not compatible with constexpr
-  static constexpr std::tuple<int, int, bool> kBlockMN_RS = tile_size_fwd_sm90(
-      kHeadDim, Causal, Local, sizeof(Element) /*element_size*/, V_colmajor);
+  static constexpr std::tuple<int, int, bool> kBlockMN_RS =
+      hstu::tile_size_fwd_sm90(
+          kHeadDim,
+          Causal,
+          Local,
+          sizeof(Element) /*element_size*/,
+          V_colmajor,
+          Cross,
+          Training);
   static constexpr std::tuple<int, int, int, int, bool>
-      kBlockMN_kNWarps_Stages_RS = tile_size_fwd_sm8x(
+      kBlockMN_kNWarps_Stages_RS = hstu::tile_size_fwd_sm8x(
           Arch == 86 || Arch == 89,
           kHeadDim,
           Causal,
@@ -99,7 +111,7 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
 
   using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
   using ClusterShape = cute::Shape<Int<ClusterM>, _1, _1>;
-  using CollectiveMainloop = flash::CollectiveMainloopFwdSm90<
+  using CollectiveMainloop = hstu::CollectiveMainloopFwdSm90<
       kStages,
       ClusterShape,
       TileShape_MNK,
@@ -112,8 +124,9 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
       Jagged,
       Has_targets,
       Mma1_is_RS,
-      V_colmajor>;
-  using CollectiveEpilogue = flash::CollectiveEpilogueFwd<
+      V_colmajor,
+      Cross>;
+  using CollectiveEpilogue = hstu::CollectiveEpilogueFwd<
       TileShape_MNK,
       ClusterShape,
       ElementOut,
@@ -127,19 +140,19 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
       : CollectiveMainloop::NumMmaThreads;
   using SchedulerPersistent = std::conditional_t<
       Jagged,
-      flash::VarlenDynamicPersistentTileScheduler<
+      hstu::VarlenDynamicPersistentTileScheduler<
           kBlockM,
           CollectiveMainloop::NumMmaThreads,
           NumProducerThreads,
           Arch >= 90 /*WarpSpecialized*/>,
       std::conditional_t<
           !Causal && !Local,
-          flash::StaticPersistentTileScheduler,
-          flash::DynamicPersistentTileScheduler<
+          hstu::StaticPersistentTileScheduler,
+          hstu::DynamicPersistentTileScheduler<
               CollectiveMainloop::NumMmaThreads,
               NumProducerThreads,
               Arch >= 90 /*WarpSpecialized*/>>>;
-  using SchedulerSingleTile = flash::
+  using SchedulerSingleTile = hstu::
       SingleTileScheduler<Jagged, kBlockM, false /*Sort_by_length_indices*/>;
   // If Split then we probably don't have enough work for PersistentScheduler to
   // be useful. However, if Jagged (e.g., during decode where we have
@@ -150,11 +163,14 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
       Arch >= 90 ? false : !(Causal && !Jagged),
       SchedulerSingleTile,
       SchedulerPersistent>;
-  using AttnKernel = flash::enable_sm90_or_later<
-      flash::
-          FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
+  using AttnKernel = hstu::enable_sm90_or_later<hstu::FlashAttnFwdSm90<
+      Softmax,
+      CollectiveMainloop,
+      CollectiveEpilogue,
+      Scheduler>>;
 
-  int seqlen = !Jagged ? params.max_seq_len : params.total_seq_len;
+  int seqlen_q = !Jagged ? params.max_q_len : params.total_seq_len_q;
+  int seqlen_kv = !Jagged ? params.max_kv_len : params.total_seq_len_kv;
   int batch = !Jagged ? params.b : 1;
 #ifdef HSTU_FLASH_ATTN_DEBUG_INFO
   std::printf("max/total seqlen: (%d), batch: (%d)\n", seqlen, batch);
@@ -173,13 +189,13 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
               !Jagged ? params.v_batch_stride : 0));
   typename CollectiveMainloop::Arguments mainloop_args{
       static_cast<Element const*>(params.q_ptr),
-      {seqlen, params.qk_d, params.h, batch}, // shape_Q
+      {seqlen_q, params.qk_d, params.h, batch}, // shape_Q
       {params.q_row_stride,
        _1{},
        params.q_head_stride,
        !Jagged ? params.q_batch_stride : 0}, // stride_Q
       static_cast<Element*>(params.k_ptr),
-      {seqlen, params.qk_d, params.h, batch}, // shape_K
+      {seqlen_kv, params.qk_d, params.h, batch}, // shape_K
       {params.k_row_stride,
        _1{},
        params.k_head_stride,
@@ -192,39 +208,44 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
       {params.q_descale_batch_stride, params.q_descale_head_stride},
       {params.k_descale_batch_stride, params.k_descale_head_stride},
       {params.v_descale_batch_stride, params.v_descale_head_stride},
-      1.0f / params.max_seq_len,
+      1.0f / params.max_kv_len,
       params.alpha,
       params.max_attn_len,
       params.min_full_attn_seq_len,
       params.contextual_seq_len,
+      params.num_softmax_heads,
       params.seq_offsets,
+      params.seq_offsets_q,
       params.num_targets,
       params.attn_scale,
       params.scalar_scale,
   };
   typename CollectiveEpilogue::Arguments epilogue_args{
       static_cast<ElementOut*>(params.o_ptr),
-      {seqlen, params.v_d, params.h, batch, 1}, // shape_O
+      {seqlen_q, params.v_d, params.h, batch, 1}, // shape_O
       {params.o_row_stride,
        _1{},
        params.o_head_stride,
        !Jagged ? params.o_batch_stride : 0,
        0}, // stride_O
       params.h,
-      params.seq_offsets};
+      params.num_softmax_heads,
+      {_1{}, seqlen_q, !Jagged ? params.h * seqlen_q : 0, 0}, // stride_LSE}
+      static_cast<float*>(params.softmax_lse),
+      Cross ? params.seq_offsets_q : params.seq_offsets};
 
   int num_blocks_m =
-      cutlass::ceil_div(params.max_seq_len, get<0>(TileShape_MNK{}));
+      cutlass::ceil_div(params.max_q_len, get<0>(TileShape_MNK{}));
   num_blocks_m = cutlass::round_up(num_blocks_m, size<0>(ClusterShape{}));
-  typename flash::TileSchedulerArguments scheduler_args{
+  typename hstu::TileSchedulerArguments scheduler_args{
       num_blocks_m,
       params.h,
       params.b,
-      params.max_seq_len,
+      params.max_q_len,
       params.qk_d,
       sizeof(Element),
       params.tile_count_semaphore,
-      params.seq_offsets,
+      Cross ? params.seq_offsets_q : params.seq_offsets,
       nullptr /*sort_by_length_indices*/};
 
   int device;
@@ -276,63 +297,74 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
   CHECK_CUDA_KERNEL_LAUNCH();
 }
 
-template <int Arch, typename T, int kHeadDim>
-void run_mha_fwd_(Flash_fwd_params& params, cudaStream_t stream) {
-  static_assert(
-      sizeof(T) == 2 || sizeof(T) == 1, "Only 16bit and 8bit are supported");
-  static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> ||
-      cute::is_same_v<T, cutlass::float_e5m2_t>;
-  using T_out = std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>;
-  CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Causal, Local, [&] {
-    VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor_, [&] {
-      static constexpr bool V_colmajor = V_colmajor_ && sizeof(T) == 1;
-      BOOL_SWITCH(params.num_targets, Has_targets, [&] {
-        BOOL_SWITCH(params.seq_offsets, Jagged, [&] {
-          BOOL_SWITCH(params.has_contexual_mask, Contexual_mask, [&] {
-            // Only needed here to decide if we should use cluster
-            static constexpr int kBlockM = Arch >= 90
-                ? std::get<0>(tile_size_fwd_sm90(
-                      kHeadDim,
-                      Causal,
-                      Local,
-                      sizeof(T) /*element_size*/,
-                      V_colmajor))
-                : 128;
+template <
+    int Arch,
+    int kHeadDim,
+    bool Causal,
+    bool Local,
+    bool Softmax,
+    typename T,
+    typename T_out>
+void run_mha_fwd_dispatch(hstu::Flash_fwd_params& params, cudaStream_t stream) {
+  static constexpr bool V_colmajor = false; // V_colmajor_ && sizeof(T) == 1;
+  BOOL_SWITCH(params.num_targets, Has_targets, [&] {
+    BOOL_SWITCH(params.seq_offsets, Jagged, [&] {
+      BOOL_SWITCH(params.seq_offsets_q, Cross, [&] {
+        BOOL_SWITCH(params.has_contexual_mask, Contexual_mask, [&] {
+          BOOL_SWITCH(params.training, Training, [&] {
 #ifdef HSTU_FLASH_ATTN_DEBUG_INFO
             std::printf(
-                "[flash_fwd_launch_template] Local: (%d), Jagged: (%d), Has_targets: (%d), Causal: (%d), max_seq_len: (%d), kHeadDim: (%d)\n",
+                "[flash_fwd_launch_template] Local: (%d), Jagged: (%d), Has_targets: (%d), Causal: (%d), max_kv_len: (%d), kHeadDim: (%d)\n",
                 Local,
                 Jagged,
                 Has_targets,
                 Causal,
-                params.max_seq_len,
+                params.max_kv_len,
                 kHeadDim);
 #endif
-            static constexpr bool Enable_cluster = Arch >= 90 &&
-                (sizeof(T) == 2 ? (kHeadDim >= 128) : (kHeadDim == 192)) &&
-                !Causal && !Local && !Jagged;
-            CLUSTER_SWITCH(
-                cutlass::ceil_div(params.max_seq_len, kBlockM) % 2 == 0,
-                Use_cluster,
-                [&] {
-                  static constexpr int ClusterM =
-                      Enable_cluster && Use_cluster ? 2 : 1;
-                  run_flash_fwd<
-                      Arch,
-                      kHeadDim,
-                      ClusterM,
-                      T,
-                      T_out,
-                      Causal,
-                      Local,
-                      Contexual_mask,
-                      Jagged,
-                      Has_targets,
-                      V_colmajor>(params, stream);
-                });
+            // static constexpr bool Enable_cluster = Arch >= 90 &&
+            //     (sizeof(T) == 2 ? (kHeadDim >= 128) : (kHeadDim == 192)) &&
+            //     !Causal && !Local && !Jagged;
+            // static constexpr bool Enable_cluster = false;
+            // CLUSTER_SWITCH(
+            //     cutlass::ceil_div(params.max_q_len, kBlockM) % 2 == 0,
+            //     Use_cluster,
+            //     [&] {
+            // static constexpr int ClusterM =
+            //     Enable_cluster && Use_cluster ? 2 : 1;
+            run_flash_fwd<
+                Arch,
+                kHeadDim,
+                1, // ClusterM,
+                T,
+                T_out,
+                Causal,
+                Local,
+                Contexual_mask,
+                Jagged,
+                Has_targets,
+                V_colmajor,
+                Cross,
+                Softmax,
+                Training>(params, stream);
           });
         });
       });
     });
   });
 }
+
+template <int Arch, typename T, int kHeadDim, bool Softmax>
+void run_mha_fwd_(hstu::Flash_fwd_params& params, cudaStream_t stream) {
+  static_assert(
+      sizeof(T) == 2 || sizeof(T) == 1, "Only 16bit and 8bit are supported");
+  static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> ||
+      cute::is_same_v<T, cutlass::float_e5m2_t>;
+  using T_out = std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>;
+  CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Causal, Local, [&] {
+    // VCOLMAJOR_SWITCH(params.v_dim_stride != 1, V_colmajor_, [&] {
+    run_mha_fwd_dispatch<Arch, kHeadDim, Causal, Local, Softmax, T, T_out>(
+        params, stream);
+  });
+}
+} // namespace hstu

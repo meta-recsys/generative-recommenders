@@ -42,6 +42,7 @@ DTYPE_MAP_BWD = {
 }
 
 SM = [90]  # Sm kernels support up to
+SOFTMAX = ["true", "false"]
 HEAD_DIMENSIONS = [64, 96, 128, 192, 256]
 
 KERNEL_IMPL_TEMPLATE_FWD_SM90 = """
@@ -51,9 +52,11 @@ KERNEL_IMPL_TEMPLATE_FWD_SM90 = """
 #include "flash_fwd_launch_template.h"
 #endif
 
+namespace hstu {{
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
-template void run_mha_fwd_<{ARCH}, {DTYPE}, {HEAD_DIM}>(Flash_fwd_params &params, cudaStream_t stream);
+template void run_mha_fwd_<{ARCH}, {DTYPE}, {HEAD_DIM}, {SOFTMAX}>(Flash_fwd_params &params, cudaStream_t stream);
 #endif
+}} // namespace hstu
 """
 
 KERNEL_IMPL_TEMPLATE_FWD_SM8x = """
@@ -63,11 +66,13 @@ KERNEL_IMPL_TEMPLATE_FWD_SM8x = """
 #include "flash_fwd_launch_template.h"
 #endif
 
+namespace hstu {{
 #ifndef FLASHATTENTION_DISABLE_SM8x
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
-template void run_mha_fwd_<80, {DTYPE}, {HEAD_DIM}>(Flash_fwd_params &params, cudaStream_t stream);
+template void run_mha_fwd_<80, {DTYPE}, {HEAD_DIM}, {SOFTMAX}>(Flash_fwd_params &params, cudaStream_t stream);
 #endif
 #endif
+}} // namespace hstu
 """
 
 KERNEL_IMPL_TEMPLATE_BWD_SM90 = """
@@ -77,9 +82,11 @@ KERNEL_IMPL_TEMPLATE_BWD_SM90 = """
 #include "flash_bwd_launch_template.h"
 #endif
 
+namespace hstu {{
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
-template void run_mha_bwd_<{ARCH}, {DTYPE}, {HEAD_DIM}>(Flash_bwd_params &params, cudaStream_t stream);
+template void run_mha_bwd_<{ARCH}, {DTYPE}, {HEAD_DIM}, {SOFTMAX}>(Flash_bwd_params &params, cudaStream_t stream);
 #endif
+}} // namespace hstu
 """
 
 KERNEL_IMPL_TEMPLATE_BWD_SM8x = """
@@ -89,11 +96,13 @@ KERNEL_IMPL_TEMPLATE_BWD_SM8x = """
 #include "flash_bwd_launch_template.h"
 #endif
 
+namespace hstu {{
 #ifndef FLASHATTENTION_DISABLE_SM8x
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
-template void run_mha_bwd_<80, {DTYPE}, {HEAD_DIM}>(Flash_bwd_params &params, cudaStream_t stream);
+template void run_mha_bwd_<80, {DTYPE}, {HEAD_DIM}, {SOFTMAX}>(Flash_bwd_params &params, cudaStream_t stream);
 #endif
 #endif
+}} // namespace hstu
 """
 
 
@@ -102,6 +111,7 @@ class Kernel:
     sm: int
     dtype: str
     head_dim: int
+    softmax: str
     direction: str
 
     @property
@@ -112,12 +122,14 @@ class Kernel:
                     ARCH=str(self.sm),
                     DTYPE=DTYPE_MAP[self.dtype],
                     HEAD_DIM=self.head_dim,
+                    SOFTMAX=self.softmax,
                 )
             else:
                 # Always enable PackGQA for Sm8x to reduce compilation
                 return KERNEL_IMPL_TEMPLATE_FWD_SM8x.format(
                     DTYPE=DTYPE_MAP[self.dtype],
                     HEAD_DIM=self.head_dim,
+                    SOFTMAX=self.softmax,
                 )
         else:
             assert self.direction == "bwd"
@@ -126,21 +138,25 @@ class Kernel:
                     ARCH=str(self.sm),
                     DTYPE=DTYPE_MAP[self.dtype],
                     HEAD_DIM=self.head_dim,
+                    SOFTMAX=self.softmax,
                 )
             else:
                 return KERNEL_IMPL_TEMPLATE_BWD_SM8x.format(
                     DTYPE=DTYPE_MAP[self.dtype],
                     HEAD_DIM=self.head_dim,
+                    SOFTMAX=self.softmax,
                 )
 
     @property
     def filename(self) -> str:
-        return f"flash_{self.direction}_hdim{self.head_dim}_{self.dtype}_sm{self.sm}.cu"
+        return f"flash_{self.direction}_hdim{self.head_dim}_{self.dtype}_softmax{self.softmax}_sm{self.sm}.cu"
 
 
 def get_all_kernels() -> List[Kernel]:
     kernels: List[Kernel] = []
-    for dtype, head_dim, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, SM):
+    for dtype, head_dim, sm, softmax in itertools.product(
+        DTYPE_MAP.keys(), HEAD_DIMENSIONS, SM, SOFTMAX
+    ):
         # We always enable PackGQA for Sm8x or Split
         # so we should just pass in packgqa=False to avoid the `_packgqa` in the filename.
         if sm >= 90 or dtype in DTYPE_MAP_FWD_SM8x:
@@ -150,10 +166,11 @@ def get_all_kernels() -> List[Kernel]:
                     dtype=dtype,
                     head_dim=head_dim,
                     direction="fwd",
+                    softmax=softmax,
                 )
             )
-    for dtype, head_dim, sm in itertools.product(
-        DTYPE_MAP_BWD.keys(), HEAD_DIMENSIONS, SM
+    for dtype, head_dim, sm, softmax in itertools.product(
+        DTYPE_MAP_BWD.keys(), HEAD_DIMENSIONS, SM, SOFTMAX
     ):
         kernels.append(
             Kernel(
@@ -161,6 +178,7 @@ def get_all_kernels() -> List[Kernel]:
                 dtype=dtype,
                 head_dim=head_dim,
                 direction="bwd",
+                softmax=softmax,
             )
         )
     return kernels

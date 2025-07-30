@@ -22,7 +22,7 @@
 
 #include "cutlass/arch/barrier.h"
 
-namespace flash {
+namespace hstu {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -98,4 +98,4 @@ enum class BwdNamedBarriers {
   dQFullWG3 = 9,
 };
 
-} // namespace flash
+} // namespace hstu

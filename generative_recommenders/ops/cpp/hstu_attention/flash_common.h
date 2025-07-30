@@ -86,7 +86,7 @@ inline int get_max_headdim() {
 
 namespace hstu {
 
-at::Tensor hstu_mha_fwd(
+std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd(
     int64_t max_seq_len,
     double alpha,
     at::Tensor& q, // (b, s, h, d) or (total_s, h, d)
@@ -102,7 +102,11 @@ at::Tensor hstu_mha_fwd(
     const std::optional<at::Tensor>& q_descale, // (b, h_k), not (b, h)
     const std::optional<at::Tensor>& k_descale, // (b, h_k)
     const std::optional<at::Tensor>& v_descale, // (b, h_k)
-    const int64_t sm_margin);
+    const int64_t sm_margin = 0,
+    int64_t max_q_len = 0,
+    const std::optional<at::Tensor>& seq_offsets_q = std::nullopt,
+    int64_t num_softmax_heads = 0,
+    bool training = true);
 
 std::vector<at::Tensor> hstu_mha_bwd(
     int64_t max_seq_len,
@@ -114,6 +118,7 @@ std::vector<at::Tensor> hstu_mha_bwd(
     at::Tensor& dq,
     at::Tensor& dk,
     at::Tensor& dv,
+    at::Tensor& out,
     const std::optional<at::Tensor>& seq_offsets,
     bool causal,
     const std::optional<at::Tensor>& num_targets,
@@ -123,9 +128,13 @@ std::vector<at::Tensor> hstu_mha_bwd(
     int64_t contextual_seq_len,
     bool sort_by_length,
     bool const deterministic,
-    int64_t const sm_margin);
+    const int64_t sm_margin = 0,
+    int64_t max_q_len = 0,
+    const std::optional<at::Tensor>& seq_offsets_q = std::nullopt,
+    int64_t num_softmax_heads = 0,
+    const std::optional<at::Tensor>& softmax_lse = std::nullopt);
 
-at::Tensor hstu_mha_fwd_dummy(
+std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd_dummy(
     int64_t max_seq_len,
     double alpha,
     at::Tensor& q, // (b, s, h, d) or (total_s, h, d)
@@ -141,7 +150,11 @@ at::Tensor hstu_mha_fwd_dummy(
     const std::optional<at::Tensor>& q_descale, // (b, h_k), not (b, h)
     const std::optional<at::Tensor>& k_descale, // (b, h_k)
     const std::optional<at::Tensor>& v_descale, // (b, h_k)
-    const int64_t sm_margin);
+    const int64_t sm_margin = 0,
+    int64_t max_q_len = 0,
+    const std::optional<at::Tensor>& seq_offsets_q = std::nullopt,
+    int64_t num_softmax_heads = 0,
+    bool training = true);
 
 std::vector<at::Tensor> hstu_mha_bwd_dummy(
     int64_t max_seq_len,
@@ -153,6 +166,7 @@ std::vector<at::Tensor> hstu_mha_bwd_dummy(
     at::Tensor& dq,
     at::Tensor& dk,
     at::Tensor& dv,
+    at::Tensor& out,
     const std::optional<at::Tensor>& seq_offsets,
     bool causal,
     const std::optional<at::Tensor>& num_targets,
@@ -162,10 +176,14 @@ std::vector<at::Tensor> hstu_mha_bwd_dummy(
     int64_t contextual_seq_len,
     bool sort_by_length,
     bool const deterministic,
-    int64_t const sm_margin);
+    const int64_t sm_margin = 0,
+    int64_t max_q_len = 0,
+    const std::optional<at::Tensor>& seq_offsets_q = std::nullopt,
+    int64_t num_softmax_heads = 0,
+    const std::optional<at::Tensor>& softmax_lse = std::nullopt);
 
-at::Tensor hstu_mha_fwd_meta(
-    const c10::SymInt max_seq_len,
+std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd_meta(
+    const at::SymInt max_seq_len,
     double alpha,
     at::Tensor& q, // (b, s, h, d) or (total_s, h, d)
     at::Tensor& k, // (b, s, h, d) or (total_s, h, d)
@@ -180,5 +198,9 @@ at::Tensor hstu_mha_fwd_meta(
     const std::optional<at::Tensor>& q_descale, // (b, h_k), not (b, h)
     const std::optional<at::Tensor>& k_descale, // (b, h_k)
     const std::optional<at::Tensor>& v_descale, // (b, h_k)
-    const int64_t sm_margin);
+    const int64_t sm_margin = 0,
+    int64_t max_q_len = 0,
+    const std::optional<at::Tensor>& seq_offsets_q = std::nullopt,
+    int64_t num_softmax_heads = 0,
+    bool training = true);
 } // namespace hstu

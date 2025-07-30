@@ -30,7 +30,7 @@
 #include "seqlen.h"
 #include "utils.h"
 
-namespace flash {
+namespace hstu {
 
 using namespace cute;
 
@@ -257,9 +257,9 @@ struct CollectiveEpilogueBwd {
     auto smem_thr_copy_dKV = smem_tiled_copy_dKV.get_thread_slice(thread_idx);
 
     Tensor tdVrdV_out = make_tensor_like<Element>(tdVrdV);
-    flash::convert_type_out(tdVrdV, tdVrdV_out);
+    hstu::convert_type_out(tdVrdV, tdVrdV_out);
     Tensor tdKrdK_out = make_tensor_like<Element>(tdKrdK);
-    flash::convert_type_out(tdKrdK, tdKrdK_out);
+    hstu::convert_type_out(tdKrdK, tdKrdK_out);
     Tensor taccdKrdK = smem_thr_copy_dKV.retile_S(
         tdKrdK_out); // ((Atom,AtomNum), MMA_M, MMA_N)
     Tensor taccdVrdV = smem_thr_copy_dKV.retile_S(
@@ -274,7 +274,7 @@ struct CollectiveEpilogueBwd {
             sdV, sdVt)); // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
     // Make sure all WGs have finished reading K and V
-    flash::named_barrier_sync(
+    hstu::named_barrier_sync(
         NumEpilogueThreads,
         cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
     cute::copy(smem_tiled_copy_dKV, taccdVrdV, taccdVsdV);
@@ -322,11 +322,11 @@ struct CollectiveEpilogueBwd {
       // static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
 
     } else {
-      flash::named_barrier_sync(
+      hstu::named_barrier_sync(
           NumEpilogueThreads,
           cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
       static constexpr int kBlockN = get<1>(TileShape_MNK{});
-      flash::SeqlenInfo<Jagged, kBlockN> seqlen_info{
+      hstu::SeqlenInfo<Jagged, kBlockN> seqlen_info{
           bidb, size<0>(params.shape_dK), params.seq_offsets};
       Tensor mdK = make_tensor(
           make_gmem_ptr(params.ptr_dK), params.shape_dK, params.stride_dK)(
@@ -365,12 +365,12 @@ struct CollectiveEpilogueBwd {
       // Need to check OOB when reading from smem if kBlockN isn't evenly tiled
       static constexpr bool EvenN =
           kBlockN % CUTE_STATIC_V(size<0>(GmemLayoutAtom{})) == 0;
-      flash::copy<
+      hstu::copy<
           /*Is_even_MN=*/EvenN,
           /*Is_even_K=*/true,
           /*Clear_OOB_MN=*/false>(
           gmem_tiled_copy_dKV, tdKVsdV, tdKVrdV, tdKVcdKV, tdKVpdKV, kBlockN);
-      flash::copy<
+      hstu::copy<
           /*Is_even_MN=*/EvenN,
           /*Is_even_K=*/true,
           /*Clear_OOB_MN=*/false>(
@@ -378,12 +378,12 @@ struct CollectiveEpilogueBwd {
       // // Tell warp 0 that smem_k and smem_v are ready
       // cutlass::arch::fence_view_async_shared(); // ensure smem reads are done
       // before next TMA to smem_k/v
-      // flash::named_barrier_arrive(NumEpilogueThreads +
+      // hstu::named_barrier_arrive(NumEpilogueThreads +
       // cutlass::NumThreadsPerWarp,
       // static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/); Construct
       // identity layout for gdKV Clear_OOB_K must be false since we don't want
       // to write zeros to gmem
-      flash::copy<
+      hstu::copy<
           /*Is_even_MN=*/false,
           /*Is_even_K=*/false,
           /*Clear_OOB_MN=*/false,
@@ -394,7 +394,7 @@ struct CollectiveEpilogueBwd {
           tdKVcdKV,
           tdKVpdKV,
           std::min(seqlen_info.seqlen - n_block * kBlockN, kBlockN));
-      flash::copy<
+      hstu::copy<
           /*Is_even_MN=*/false,
           /*Is_even_K=*/false,
           /*Clear_OOB_MN=*/false,
@@ -419,7 +419,7 @@ struct CollectiveEpilogueBwd {
       cute::tuple<int32_t, int32_t, int32_t> const& block_coord) {
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     auto [n_block, bidh, bidb] = block_coord;
-    flash::SeqlenInfo<Jagged, kBlockN> seqlen_info{
+    hstu::SeqlenInfo<Jagged, kBlockN> seqlen_info{
         bidb, size<0>(params.shape_dK), params.seq_offsets};
     Tensor mdK = make_tensor(
         make_gmem_ptr(params.ptr_dK), params.shape_dK, params.stride_dK)(
@@ -453,7 +453,7 @@ struct CollectiveEpilogueBwd {
       tdKVpdKV(k) = get<1>(tdKVcdKV(_0{}, _0{}, k)) < get<1>(params.shape_dK);
     }
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
-    flash::copy<
+    hstu::copy<
         /*Is_even_MN=*/false,
         /*Is_even_K=*/false,
         /*Clear_OOB_MN=*/false,
@@ -464,7 +464,7 @@ struct CollectiveEpilogueBwd {
         tdKVcdKV,
         tdKVpdKV,
         seqlen_info.seqlen - n_block * kBlockN);
-    flash::copy<
+    hstu::copy<
         /*Is_even_MN=*/false,
         /*Is_even_K=*/false,
         /*Clear_OOB_MN=*/false,
@@ -478,4 +478,4 @@ struct CollectiveEpilogueBwd {
   }
 };
 
-} // namespace flash
+} // namespace hstu

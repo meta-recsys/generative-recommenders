@@ -31,7 +31,7 @@
 #include "seqlen.h"
 #include "utils.h"
 
-namespace flash {
+namespace hstu {
 
 using namespace cute;
 
@@ -43,7 +43,8 @@ template <
     int kNThreads,
     class TiledMma,
     bool dQ_swapAB,
-    bool Jagged>
+    bool Jagged,
+    bool Softmax>
 class FlashAttnBwdPostprocessConvertdQ {
  public:
   // Type Aliases
@@ -214,7 +215,7 @@ class FlashAttnBwdPostprocessConvertdQ {
     int const bidh = blockIdx.y;
     int const bidb = blockIdx.z;
 
-    flash::SeqlenInfo<Jagged, kBlockM> seqlen_info(
+    hstu::SeqlenInfo<Jagged, kBlockM> seqlen_info(
         bidb, size<0>(params.shape_dQ), params.seq_offsets);
     if (Jagged && m_block * kBlockM >= seqlen_info.seqlen) {
       return;
@@ -283,7 +284,7 @@ class FlashAttnBwdPostprocessConvertdQ {
     cute::copy(s2r_tiled_copy_dQaccum, tdQsdQaccum, tdQrdQaccum);
     // Convert tdQrdQ from fp32 to fp16
     Tensor rdQ = make_tensor_like<Element>(taccdQrdQaccum);
-    flash::convert_type_out(taccdQrdQaccum, rdQ);
+    hstu::convert_type_out(taccdQrdQaccum, rdQ);
 
     // Step 3: Copy dQ from register to smem
     auto smem_tiled_copy_dQ = make_tiled_copy_C(SmemCopyAtomdQ{}, tiled_mma_dQ);
@@ -325,13 +326,13 @@ class FlashAttnBwdPostprocessConvertdQ {
     // Need to check OOB when reading from smem if kBlockM isn't evenly tiled
     static constexpr bool EvenM =
         kBlockM % CUTE_STATIC_V(size<0>(GmemLayoutAtom{})) == 0;
-    flash::
+    hstu::
         copy</*Is_even_MN=*/EvenM, /*Is_even_K=*/true, /*Clear_OOB_MN=*/false>(
             gmem_tiled_copy_dQ, tdQsdQ, tdQrdQ, tdQcdQ, tdQpdQ, kBlockM);
 
     // Step 5: Copy dQ from register to gmem
     // Clear_OOB_K must be false since we don't want to write zeros to gmem
-    flash::copy<
+    hstu::copy<
         /*Is_even_MN=*/false,
         /*Is_even_K=*/false,
         /*Clear_OOB_MN=*/false,
@@ -345,4 +346,4 @@ class FlashAttnBwdPostprocessConvertdQ {
   }
 };
 
-} // namespace flash
+} // namespace hstu

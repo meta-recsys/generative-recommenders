@@ -31,14 +31,16 @@
 #include <cutlass/pipeline/pipeline.hpp>
 
 #include "seqlen.h"
+#include "softmax.h"
 #include "tile_scheduler.h"
 #include "utils.h"
 
-namespace flash {
+namespace hstu {
 
 using namespace cute;
 
 template <
+    bool Softmax,
     class CollectiveMainloop_,
     class CollectiveEpilogue_,
     class TileScheduler_>
@@ -71,7 +73,7 @@ class FlashAttnFwdSm90 {
   static_assert(ArchTag::kMinComputeCapability >= 90);
 
   using TileScheduler = TileScheduler_;
-  using TileSchedulerArguments = typename flash::TileSchedulerArguments;
+  using TileSchedulerArguments = typename hstu::TileSchedulerArguments;
   using TileSchedulerParams = typename TileScheduler::Params;
 
   static constexpr uint32_t NumLoadWarpGroups = 1;
@@ -345,7 +347,9 @@ class FlashAttnFwdSm90 {
         SeqlenInfo_t seqlen_info{
             get<2>(block_coord) /*bidb*/,
             get<0>(params.mainloop.shape_Q),
+            get<0>(params.mainloop.shape_K),
             params.mainloop.seq_offsets,
+            params.mainloop.seq_offsets_q,
             params.mainloop.num_targets,
         };
         auto scheduler_prefetch = [&scheduler, &params, &work_tile_info]() {
@@ -403,8 +407,8 @@ class FlashAttnFwdSm90 {
         // If there's tanh softcap, the scaling will be done before tanh.
         auto block_coord = work_tile_info.get_block_coord(params.scheduler);
         int const bidb = get<2>(block_coord);
+        int const bidh = get<1>(block_coord);
         if constexpr (Is_FP8) {
-          int const bidh = get<1>(block_coord);
           int const bidh_kv = bidh;
           float const q_descale = params.mainloop.ptr_q_descale == nullptr
               ? 1.0f
@@ -421,39 +425,82 @@ class FlashAttnFwdSm90 {
         SeqlenInfo_t seqlen_info{
             bidb,
             get<0>(params.mainloop.shape_Q),
+            get<0>(params.mainloop.shape_K),
             params.mainloop.seq_offsets,
+            params.mainloop.seq_offsets_q,
             params.mainloop.num_targets,
         };
-        bool tile_valid = collective_mainloop.mma(
-            params.mainloop,
-            pipeline_k,
-            pipeline_v,
-            smem_pipe_read,
-            tOrO,
-            threadIdx.x - MmaThreadOffset,
-            work_idx,
-            seqlen_info,
-            block_coord,
-            shared_storage);
-        if (tile_valid) {
-          // if (threadIdx.x == 128) { printf("Before epilogue, bid.x = %d,
-          // bid.y = %d, bid.z = %d, m_block = %d, bidb = %d, split_idx = %d\n",
-          // blockIdx.x, blockIdx.y, blockIdx.z, m_block, bidb, split_idx); }
-          collective_epilogue.store(
-              params.epilogue,
+        float alpha_log2 = params.mainloop.alpha_log2;
+        bool tile_valid;
+        if constexpr (Softmax) {
+          hstu::Softmax<
+              2 * (2 * kBlockM / NumMmaThreads),
+              /*Max_offset=*/!Is_FP8 ? 0 : 8>
+              softmax(alpha_log2);
+          tile_valid = collective_mainloop.mma_softmax(
+              params.mainloop,
+              pipeline_k,
+              pipeline_v,
+              smem_pipe_read,
               tOrO,
-              shared_storage,
-              tiled_mma1,
+              softmax,
               threadIdx.x - MmaThreadOffset,
-              block_coord);
+              work_idx,
+              seqlen_info,
+              block_coord,
+              shared_storage);
+          if (tile_valid) {
+            collective_epilogue.store(
+                params.epilogue,
+                tOrO,
+                shared_storage,
+                tiled_mma1,
+                threadIdx.x - MmaThreadOffset,
+                block_coord);
+            collective_epilogue.store_softmax(
+                params.epilogue,
+                softmax.row_sum,
+                tiled_mma1,
+                threadIdx.x - MmaThreadOffset,
+                block_coord);
+          } else {
+            // Write 0 to gO and -inf to gLSE.
+            // If Split, we don't have to write 0 to O if the mha_combine kernel
+            // is used, since it will not use the value of O if LSE is -inf.
+            collective_epilogue.template store_zero<true /*Clear_O*/>(
+                params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
+            // collective_epilogue.store_zero(params.epilogue, threadIdx.x -
+            // MmaThreadOffset, block_coord);
+          }
         } else {
-          // Write 0 to gO and -inf to gLSE.
-          // If Split, we don't have to write 0 to O if the mha_combine kernel
-          // is used, since it will not use the value of O if LSE is -inf.
-          collective_epilogue.template store_zero<true /*Clear_O*/>(
-              params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
-          // collective_epilogue.store_zero(params.epilogue, threadIdx.x -
-          // MmaThreadOffset, block_coord);
+          tile_valid = collective_mainloop.mma(
+              params.mainloop,
+              pipeline_k,
+              pipeline_v,
+              smem_pipe_read,
+              tOrO,
+              threadIdx.x - MmaThreadOffset,
+              work_idx,
+              seqlen_info,
+              block_coord,
+              shared_storage);
+          if (tile_valid) {
+            collective_epilogue.store(
+                params.epilogue,
+                tOrO,
+                shared_storage,
+                tiled_mma1,
+                threadIdx.x - MmaThreadOffset,
+                block_coord);
+          } else {
+            // Write 0 to gO and -inf to gLSE.
+            // If Split, we don't have to write 0 to O if the mha_combine kernel
+            // is used, since it will not use the value of O if LSE is -inf.
+            collective_epilogue.template store_zero<true /*Clear_O*/>(
+                params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
+            // collective_epilogue.store_zero(params.epilogue, threadIdx.x -
+            // MmaThreadOffset, block_coord);
+          }
         }
       }
       collective_epilogue.store_tail();
@@ -461,4 +508,4 @@ class FlashAttnFwdSm90 {
   }
 };
 
-} // namespace flash
+} // namespace hstu

@@ -26,13 +26,12 @@
 
 #include "named_barrier.h"
 
-namespace flash {
+namespace hstu {
 
 ///////////////////////////////////////////////////////////////////////////////
 
 // Host side kernel arguments
 struct TileSchedulerArguments {
-  // num_head is num_head_q if not PackGQA, else num_head_k
   int const num_blocks, num_head, num_batch;
   int const max_seq_len, headdim,
       element_size; // Used to calculate L2 swizzling
@@ -317,7 +316,7 @@ class DynamicPersistentTileScheduler {
   CUTLASS_DEVICE
   void init_consumer() const {
     if (WarpSpecialized || cutlass::canonical_warp_idx_sync() > 0) {
-      flash::named_barrier_arrive(
+      hstu::named_barrier_arrive(
           NumThreads,
           static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
     }
@@ -340,22 +339,22 @@ class DynamicPersistentTileScheduler {
       // rest of warp 0
       int new_tile_idx =
           __shfl_sync(0xffffffff, current_work.tile_idx, 0 /*lane*/);
-      flash::named_barrier_sync(
+      hstu::named_barrier_sync(
           NumThreads,
           static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
       if (threadIdx.x % NumProducerThreads == 0) {
         *tile_count_smem = current_work.tile_idx;
       }
-      flash::named_barrier_arrive(
+      hstu::named_barrier_arrive(
           NumThreads,
           static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
       return {new_tile_idx};
     } else {
-      flash::named_barrier_sync(
+      hstu::named_barrier_sync(
           NumThreads,
           static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
       int tile_idx = *tile_count_smem;
-      flash::named_barrier_arrive(
+      hstu::named_barrier_arrive(
           NumThreads,
           static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
       return {tile_idx};
@@ -439,7 +438,7 @@ class VarlenDynamicPersistentTileScheduler {
       int next_tile_idx,
       WorkTileInfo const& current_work) const {
     auto prefix_sum = [](int val) {
-      int lane = threadIdx.x % cutlass::NumThreadsPerWarp;
+      auto lane = threadIdx.x % cutlass::NumThreadsPerWarp;
       CUTLASS_PRAGMA_UNROLL
       for (int i = 1; i < cutlass::NumThreadsPerWarp; i <<= 1) {
         int32_t partial_sum = __shfl_up_sync(0xffffffff, val, i);
@@ -451,7 +450,7 @@ class VarlenDynamicPersistentTileScheduler {
     };
 
     auto get_num_m_blocks = [&](int bidb_start) {
-      int lane = threadIdx.x % cutlass::NumThreadsPerWarp;
+      auto lane = threadIdx.x % cutlass::NumThreadsPerWarp;
       int seqlen;
       if (params.seq_offsets) {
         int cur_cu_seqlen = lane + bidb_start <= params.num_batch
@@ -549,7 +548,7 @@ class VarlenDynamicPersistentTileScheduler {
             work_info.bidh,
             work_info.bidb);
       }
-      flash::named_barrier_arrive(
+      hstu::named_barrier_arrive(
           NumThreads,
           static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
       return work_info;
@@ -587,7 +586,7 @@ class VarlenDynamicPersistentTileScheduler {
           current_work.bidh,
           current_work.bidb};
       work_info = tile_idx_to_work_tile(params, new_tile_idx, work_info);
-      flash::named_barrier_sync(
+      hstu::named_barrier_sync(
           NumThreads,
           static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
       if (threadIdx.x % cutlass::NumThreadsPerWarp == 0) {
@@ -597,16 +596,16 @@ class VarlenDynamicPersistentTileScheduler {
             work_info.bidh,
             work_info.bidb);
       }
-      flash::named_barrier_arrive(
+      hstu::named_barrier_arrive(
           NumThreads,
           static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
       return work_info;
     } else {
-      flash::named_barrier_sync(
+      hstu::named_barrier_sync(
           NumThreads,
           static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemFull) /*id*/);
       int4 work_info = *work_info_smem;
-      flash::named_barrier_arrive(
+      hstu::named_barrier_arrive(
           NumThreads,
           static_cast<uint32_t>(FwdNamedBarriers::TileCountSmemEmpty) /*id*/);
       return WorkTileInfo{work_info.x, work_info.y, work_info.z, work_info.w};
@@ -614,4 +613,4 @@ class VarlenDynamicPersistentTileScheduler {
   }
 };
 
-} // namespace flash
+} // namespace hstu

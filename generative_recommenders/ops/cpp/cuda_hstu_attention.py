@@ -50,6 +50,10 @@ def cuda_hstu_mha(
     sort_by_length: bool = False,
     deterministic: bool = False,
     sm_margin: int = 0,
+    max_q_len: int = 0,
+    seq_offsets_q: Optional[torch.Tensor] = None,
+    num_softmax_heads: int = 0,
+    training: bool = True,
 ) -> torch.Tensor:
     """
     Arguments:
@@ -74,4 +78,8 @@ def cuda_hstu_mha(
         sort_by_length,
         deterministic,
         sm_margin,
+        max_q_len,
+        seq_offsets_q,
+        num_softmax_heads,
+        training,
     )

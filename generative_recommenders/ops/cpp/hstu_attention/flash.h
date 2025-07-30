@@ -19,6 +19,7 @@
 #include <vector>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+namespace hstu {
 
 struct Qkv_params {
   using index_t = int64_t;
@@ -68,17 +69,20 @@ struct Flash_fwd_params : public Qkv_params {
   index_t v_descale_head_stride;
 
   // The dimensions.
-  int b, max_seq_len, qk_d, v_d, total_seq_len;
+  int b, max_kv_len, max_q_len, qk_d, v_d, total_seq_len_q, total_seq_len_kv;
 
   // The scaling factors for the kernel.
   float alpha;
 
   int* __restrict__ seq_offsets;
+  int* __restrict__ seq_offsets_q;
+  float* __restrict__ softmax_lse;
   int* __restrict__ num_targets;
   float* __restrict__ attn_scale;
 
   // Local window size
-  int max_attn_len, contextual_seq_len, min_full_attn_seq_len;
+  int max_attn_len, contextual_seq_len, min_full_attn_seq_len,
+      num_softmax_heads;
 
   // Pointer to the RNG seed (idx 0) and offset (idx 1).
   uint64_t* rng_state;
@@ -90,6 +94,7 @@ struct Flash_fwd_params : public Qkv_params {
   bool is_local;
   bool has_contexual_mask;
   bool scalar_scale;
+  bool training;
 
   int* __restrict__ tile_count_semaphore;
 
@@ -107,6 +112,8 @@ struct Flash_bwd_params : public Flash_fwd_params {
   void* __restrict__ dq_ptr;
   void* __restrict__ dk_ptr;
   void* __restrict__ dv_ptr;
+  float* __restrict__ softmax_lse_log2;
+  float* __restrict__ softmax_d;
 
   // To accumulate dQ
   void* __restrict__ dq_accum_ptr;
@@ -128,7 +135,7 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
   int* __restrict__ sort_by_length_indices;
 
-  int max_seq_len_rounded, qk_d_rounded, v_d_rounded;
+  int max_q_len_rounded, qk_d_rounded, v_d_rounded;
 
   bool deterministic;
   index_t dq_accum_split_stride;
@@ -136,7 +143,8 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int Arch, typename T, int Headdim>
+template <int Arch, typename T, int Headdim, bool Softmax>
 void run_mha_fwd_(Flash_fwd_params& params, cudaStream_t stream);
-template <int Arch, typename T, int Headdim>
+template <int Arch, typename T, int Headdim, bool Softmax>
 void run_mha_bwd_(Flash_bwd_params& params, cudaStream_t stream);
+} // namespace hstu

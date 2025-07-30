@@ -36,6 +36,8 @@
 #include "tile_scheduler.h"
 #include "tile_size.h"
 
+namespace hstu {
+
 using namespace cute;
 
 template <
@@ -59,16 +61,18 @@ template <
     int AtomLayoutMSdP = 1,
     int AtomLayoutNdKV = 2,
     int AtomLayoutMdQ = 1,
-    bool V_in_regs = false>
-void run_flash_bwd(Flash_bwd_params& params, cudaStream_t stream) {
+    bool V_in_regs = false,
+    bool Cross = false,
+    bool Softmax = false>
+void run_flash_bwd(hstu::Flash_bwd_params& params, cudaStream_t stream) {
 #ifdef HSTU_FLASH_ATTN_DEBUG_INFO
   std::printf(
-      "[flash_bwd_launch_template] Local: (%d), Jagged: (%d), Has_targets: (%d), Causal: (%d), max_seq_len: (%d), kHeadDim: (%d), kBlockM: (%d), kBlockN: (%d)\n",
+      "[flash_bwd_launch_template] Local: (%d), Jagged: (%d), Has_targets: (%d), Causal: (%d), max_kv_len: (%d), kHeadDim: (%d), kBlockM: (%d), kBlockN: (%d)\n",
       Local,
       Jagged,
       Has_targets,
       Causal,
-      params.max_seq_len,
+      params.max_kv_len,
       kHeadDim,
       kBlockM,
       kBlockN);
@@ -80,37 +84,67 @@ void run_flash_bwd(Flash_bwd_params& params, cudaStream_t stream) {
       std::conditional_t<Arch >= 90, cutlass::arch::Sm90, cutlass::arch::Sm80>;
 
   int const total_q_padded_rounded =
-      cute::round_up(params.total_seq_len + params.b * kBlockM, kBlockM);
-  int seqlen = !Jagged ? params.max_seq_len : params.total_seq_len;
+      cute::round_up(params.total_seq_len_q + params.b * kBlockM, kBlockM);
+  int seqlen_q = !Jagged ? params.max_q_len : params.total_seq_len_q;
+  int seqlen_kv = !Jagged ? params.max_kv_len : params.total_seq_len_kv;
   int seqlen_q_rounded =
-      !Jagged ? params.max_seq_len_rounded : total_q_padded_rounded;
+      !Jagged ? params.max_q_len_rounded : total_q_padded_rounded;
   int batch = !Jagged ? params.b : 1;
 
   using TileShape_MK = cute::Shape<Int<kBlockM>, Int<kHeadDim>>;
-  using PreprocessKernel = flash::FlashAttnBwdPreprocess<
+  using PreprocessKernel = hstu::FlashAttnBwdPreprocess<
       TileShape_MK,
       Element,
       ElementAccum,
       ArchTag,
       /*Clear_dQaccum=*/true,
-      Jagged>;
+      Jagged,
+      Softmax>;
   typename PreprocessKernel::Arguments preprocess_args{
+      static_cast<Element const*>(params.o_ptr),
+      {seqlen_q, params.v_d, params.h, batch}, // shape_O
+      {params.o_row_stride,
+       _1{},
+       params.o_head_stride,
+       !Jagged ? params.o_batch_stride : 0}, // stride_O
+      static_cast<Element const*>(params.do_ptr),
+      {params.do_row_stride,
+       _1{},
+       params.do_head_stride,
+       !Jagged ? params.do_batch_stride : 0}, // stride_dO
+      static_cast<float*>(params.softmax_d),
+      {seqlen_q_rounded, params.num_softmax_heads, batch}, // shape_dPsum
+      {_1{},
+       seqlen_q_rounded,
+       !Jagged ? params.num_softmax_heads * params.max_q_len_rounded
+               : 0}, // stride_dPsum
+      static_cast<float*>(params.softmax_lse),
+      {_1{},
+       seqlen_q,
+       !Jagged ? params.num_softmax_heads * params.max_q_len_rounded
+               : 0}, // stride_LSE
+      static_cast<float*>(params.softmax_lse_log2),
+      {_1{},
+       seqlen_q_rounded,
+       !Jagged ? params.num_softmax_heads * params.max_q_len_rounded
+               : 0}, // stride_LSE_log2
       static_cast<ElementAccum*>(params.dq_accum_ptr),
       {seqlen_q_rounded * params.qk_d_rounded,
        params.h,
        batch}, // shape_dQaccum
       {_1{},
        seqlen_q_rounded * params.qk_d_rounded,
-       !Jagged ? params.qk_d_rounded * params.max_seq_len_rounded * params.h
+       !Jagged ? params.qk_d_rounded * params.max_q_len_rounded * params.h
                : 0}, // stride_dQaccum
       params.b,
       params.h,
-      params.max_seq_len,
+      params.num_softmax_heads,
+      params.max_q_len,
       params.dq_semaphore,
-      params.seq_offsets};
+      Cross ? params.seq_offsets_q : params.seq_offsets};
   typename PreprocessKernel::Params preprocess_params =
       PreprocessKernel::to_underlying_arguments(preprocess_args);
-  int num_m_block = cute::ceil_div(params.max_seq_len, kBlockM);
+  int num_m_block = cute::ceil_div(params.max_q_len, kBlockM);
   dim3 grid_m(num_m_block, params.h, params.b);
   cutlass::kernel_launch<PreprocessKernel>(
       grid_m,
@@ -127,7 +161,7 @@ void run_flash_bwd(Flash_bwd_params& params, cudaStream_t stream) {
   // Stages_dS_or_QSm80 is Stages_dS if Sm90 and Stages if Sm80
   static constexpr int Stages = Arch >= 90 ? 2 : Stages_dS_or_QSm80;
   static constexpr int Stages_dS = Arch >= 90 ? Stages_dS_or_QSm80 : 1;
-  using CollectiveMainloop = flash::CollectiveMainloopBwdSm90<
+  using CollectiveMainloop = hstu::CollectiveMainloopBwdSm90<
       Stages,
       Stages_dO,
       Stages_dS,
@@ -149,8 +183,10 @@ void run_flash_bwd(Flash_bwd_params& params, cudaStream_t stream) {
       AtomLayoutMSdP,
       AtomLayoutNdKV,
       AtomLayoutMdQ,
-      V_in_regs>;
-  using CollectiveEpilogue = flash::CollectiveEpilogueBwd<
+      V_in_regs,
+      Cross,
+      Softmax>;
+  using CollectiveEpilogue = hstu::CollectiveEpilogueBwd<
       TileShape_MNK,
       Element,
       ArchTag,
@@ -160,30 +196,34 @@ void run_flash_bwd(Flash_bwd_params& params, cudaStream_t stream) {
       NumMmaWarpGroups*(Arch >= 90 ? 1 : cutlass::NumWarpsPerWarpGroup) /
           AtomLayoutNdKV>;
   using Scheduler =
-      flash::SingleTileScheduler<Jagged, kBlockN, false /*Sort_by_length*/>;
-  using AttnKernel = flash::enable_sm90_or_later<
-      flash::
-          FlashAttnBwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
+      hstu::SingleTileScheduler<Jagged, kBlockN, false /*Sort_by_length*/>;
+  using AttnKernel = hstu::enable_sm90_or_later<hstu::FlashAttnBwdSm90<
+      Softmax,
+      CollectiveMainloop,
+      CollectiveEpilogue,
+      Scheduler>>;
 
   typename CollectiveMainloop::Arguments mainloop_args{
       static_cast<Element const*>(params.q_ptr),
-      {seqlen, params.qk_d, params.h, batch}, // shape_Q
+      {seqlen_q, params.qk_d, params.h, batch}, // shape_Q
       {params.q_row_stride,
        _1{},
        params.q_head_stride,
        !Jagged ? params.q_batch_stride : 0}, // stride_Q
       static_cast<Element const*>(params.k_ptr),
-      {seqlen, params.qk_d, params.h, batch}, // shape_K
+      {seqlen_kv, params.qk_d, params.h, batch}, // shape_K
       {params.k_row_stride,
        _1{},
        params.k_head_stride,
        !Jagged ? params.k_batch_stride : 0}, // stride_K
       static_cast<Element const*>(params.v_ptr),
+      {seqlen_kv, params.v_d, params.h, batch}, // shape_V
       {params.v_row_stride,
        _1{},
        params.v_head_stride,
        !Jagged ? params.v_batch_stride : 0}, // stride_V
       static_cast<Element const*>(params.do_ptr),
+      {seqlen_q, params.v_d, params.h, batch}, // shape_dO
       {params.do_row_stride,
        _1{},
        params.do_head_stride,
@@ -194,16 +234,29 @@ void run_flash_bwd(Flash_bwd_params& params, cudaStream_t stream) {
        batch}, // shape_dQaccum
       {_1{},
        seqlen_q_rounded * params.qk_d_rounded,
-       !Jagged ? params.qk_d_rounded * params.max_seq_len_rounded * params.h
+       !Jagged ? params.qk_d_rounded * params.max_q_len_rounded * params.h
                : 0}, // stride_dQaccum
+      static_cast<float*>(params.softmax_lse_log2),
+      {seqlen_q_rounded, params.num_softmax_heads, batch}, // shape_LSE
+      {_1{},
+       seqlen_q_rounded,
+       !Jagged ? params.num_softmax_heads * params.max_q_len_rounded
+               : 0}, // stride_LSE_log2
+      static_cast<float*>(params.softmax_d),
+      {_1{},
+       seqlen_q_rounded,
+       !Jagged ? params.num_softmax_heads * params.max_q_len_rounded
+               : 0}, // stride_dPsum
       params.max_attn_len,
       params.min_full_attn_seq_len,
       params.contextual_seq_len,
-      1.0f / params.max_seq_len,
+      1.0f / params.max_kv_len,
       params.alpha,
       params.b,
+      params.num_softmax_heads,
       params.dq_semaphore,
       params.seq_offsets,
+      params.seq_offsets_q,
       params.num_targets,
       params.attn_scale,
       params.scalar_scale};
@@ -211,7 +264,7 @@ void run_flash_bwd(Flash_bwd_params& params, cudaStream_t stream) {
       static_cast<typename CollectiveEpilogue::Element*>(params.dk_ptr),
       [&] {
         return typename CollectiveEpilogue::ShapedKV{
-            seqlen, params.qk_d, params.h, batch}; // shape_dK
+            seqlen_kv, params.qk_d, params.h, batch}; // shape_dK
       }(),
       [&] {
         return typename CollectiveEpilogue::StridedKV{
@@ -232,13 +285,13 @@ void run_flash_bwd(Flash_bwd_params& params, cudaStream_t stream) {
       params.seq_offsets};
 
   int num_blocks_n =
-      cutlass::ceil_div(params.max_seq_len, get<1>(TileShape_MNK{}));
+      cutlass::ceil_div(params.max_kv_len, get<1>(TileShape_MNK{}));
   num_blocks_n = cutlass::round_up(num_blocks_n, size<1>(ClusterShape{}));
-  typename flash::TileSchedulerArguments scheduler_args{
+  typename hstu::TileSchedulerArguments scheduler_args{
       num_blocks_n,
       params.h,
       params.b,
-      params.max_seq_len,
+      params.max_kv_len,
       params.qk_d,
       sizeof(Element),
       params.tile_count_semaphore,
@@ -293,7 +346,7 @@ void run_flash_bwd(Flash_bwd_params& params, cudaStream_t stream) {
   }
   CHECK_CUDA_KERNEL_LAUNCH();
 
-  using PostprocessKernel = flash::FlashAttnBwdPostprocessConvertdQ<
+  using PostprocessKernel = hstu::FlashAttnBwdPostprocessConvertdQ<
       TileShape_MK,
       Element,
       ElementAccum,
@@ -301,7 +354,8 @@ void run_flash_bwd(Flash_bwd_params& params, cudaStream_t stream) {
       AttnKernel::CollectiveMainloop::NumMmaThreads,
       typename AttnKernel::CollectiveMainloop::TiledMmadQ,
       AttnKernel::CollectiveMainloop::dQ_swapAB,
-      Jagged>;
+      Jagged,
+      Softmax>;
   typename PostprocessKernel::Arguments postprocess_args{
       static_cast<ElementAccum const*>(params.dq_accum_ptr),
       {seqlen_q_rounded * params.qk_d_rounded,
@@ -309,19 +363,19 @@ void run_flash_bwd(Flash_bwd_params& params, cudaStream_t stream) {
        batch}, // shape_dQaccum
       {_1{},
        seqlen_q_rounded * params.qk_d_rounded,
-       !Jagged ? params.qk_d_rounded * params.max_seq_len_rounded * params.h
+       !Jagged ? params.qk_d_rounded * params.max_q_len_rounded * params.h
                : 0}, // stride_dQaccum
       static_cast<Element*>(params.dq_ptr),
-      {seqlen, params.qk_d, params.h, batch}, // shape_dQ
+      {seqlen_q, params.qk_d, params.h, batch}, // shape_dQ
       {params.dq_row_stride,
        _1{},
        params.dq_head_stride,
        params.dq_batch_stride}, // stride_dQ
-      params.seq_offsets};
+      Cross ? params.seq_offsets_q : params.seq_offsets};
   typename PostprocessKernel::Params postprocess_params =
       PostprocessKernel::to_underlying_arguments(postprocess_args);
   int num_m_block_postprocess =
-      cute::ceil_div(params.max_seq_len, get<0>(TileShape_MK{}));
+      cute::ceil_div(params.max_q_len, get<0>(TileShape_MK{}));
   dim3 grid_m_postprocess(num_m_block_postprocess, params.h, params.b);
   int smem_size_postprocess = PostprocessKernel::SharedStorageSize;
   if (smem_size_postprocess >= 48 * 1024) {
@@ -357,50 +411,56 @@ template <
     int AtomLayoutMSdP = 1,
     int AtomLayoutNdKV = 2,
     int AtomLayoutMdQ = 1,
-    bool V_in_regs = false>
-void run_mha_bwd_dispatch(Flash_bwd_params& params, cudaStream_t stream) {
+    bool V_in_regs = false,
+    bool Softmax = false>
+void run_mha_bwd_dispatch(hstu::Flash_bwd_params& params, cudaStream_t stream) {
   BOOL_SWITCH(params.seq_offsets != nullptr, Jagged, [&] {
     BOOL_SWITCH(params.num_targets != nullptr, Has_targets, [&] {
       BOOL_SWITCH(params.has_contexual_mask, Contexual_mask, [&] {
-        run_flash_bwd<
-            Arch,
-            kHeadDim,
-            kBlockM,
-            kBlockN,
-            T,
-            Causal,
-            Local,
-            Contexual_mask,
-            Jagged,
-            Has_targets,
-            false /*Deterministic*/,
-            Stages_dO,
-            Stages_dS_or_QSm80,
-            SdP_swapAB,
-            dKV_swapAB,
-            dQ_swapAB,
-            NumMmaWarpGroups,
-            AtomLayoutMSdP,
-            AtomLayoutNdKV,
-            AtomLayoutMdQ,
-            V_in_regs>(params, stream);
+        BOOL_SWITCH(params.seq_offsets_q, Cross, [&] {
+          run_flash_bwd<
+              Arch,
+              kHeadDim,
+              kBlockM,
+              kBlockN,
+              T,
+              Causal,
+              Local,
+              Contexual_mask,
+              Jagged,
+              Has_targets,
+              false /*Deterministic*/,
+              Stages_dO,
+              Stages_dS_or_QSm80,
+              SdP_swapAB,
+              dKV_swapAB,
+              dQ_swapAB,
+              NumMmaWarpGroups,
+              AtomLayoutMSdP,
+              AtomLayoutNdKV,
+              AtomLayoutMdQ,
+              V_in_regs,
+              Cross,
+              Softmax>(params, stream);
+        });
       });
     });
   });
 }
 
-template <int Arch, typename T, int kHeadDim>
-void run_mha_bwd_(Flash_bwd_params& params, cudaStream_t stream) {
+template <int Arch, typename T, int kHeadDim, bool Softmax>
+void run_mha_bwd_(hstu::Flash_bwd_params& params, cudaStream_t stream) {
   CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Causal, Local, [&] {
-    int const kBlockM = kBlockM_bwd(Arch, kHeadDim, Causal, Local);
-    int const kBlockN = kBlockN_bwd(Arch, kHeadDim);
-    bool const V_in_regs = V_in_regs_bwd(Arch, kHeadDim);
-    static constexpr std::tuple<int, int> Stages = Stages_bwd(Arch, kHeadDim);
+    int const kBlockM = hstu::kBlockM_bwd(Arch, kHeadDim, Causal, Local);
+    int const kBlockN = hstu::kBlockN_bwd(Arch, kHeadDim);
+    bool const V_in_regs = hstu::V_in_regs_bwd(Arch, kHeadDim);
+    static constexpr std::tuple<int, int> Stages =
+        hstu::Stages_bwd(Arch, kHeadDim);
     static constexpr std::tuple<bool, bool, bool> swapAB =
-        swapAB_bwd(Arch, kHeadDim, Causal, Local);
-    int const NumMmaWarpGroups = NumMmaWarpGroups_bwd(Arch, kHeadDim);
+        hstu::swapAB_bwd(Arch, kHeadDim, Causal, Local);
+    int const NumMmaWarpGroups = hstu::NumMmaWarpGroups_bwd(Arch, kHeadDim);
     static constexpr std::tuple<int, int, int> AtomLayout =
-        AtomLayout_bwd(Arch, kHeadDim);
+        hstu::AtomLayout_bwd(Arch, kHeadDim);
     run_mha_bwd_dispatch<
         Arch,
         T,
@@ -418,6 +478,9 @@ void run_mha_bwd_(Flash_bwd_params& params, cudaStream_t stream) {
         std::get<0>(AtomLayout), /*AtomLayoutMSdP*/
         std::get<1>(AtomLayout), /*AtomLayoutNdKV*/
         std::get<2>(AtomLayout), /*AtomLayoutMdQ*/
-        V_in_regs>(params, stream);
+        V_in_regs,
+        Softmax>(params, stream);
   });
 }
+
+} // namespace hstu
