@@ -24,6 +24,17 @@ import triton
 # @manual=//triton:triton
 import triton.language as tl
 
+try:
+    # @manual=//triton:triton
+    import triton.language.extra.tlx as tlx  # type: ignore
+
+    HAS_TLX = True
+except ImportError:
+    # suppress type checking errors
+    tlx = None
+
+    HAS_TLX = False
+
 from generative_recommenders.common import (
     autotune_max_seq_len,
     prev_power_of_2,
@@ -50,6 +61,8 @@ def _host_descriptor_pre_hook(nargs):
     BLOCK_N = nargs["BLOCK_N"]
     BLOCK_D_Q = nargs["BLOCK_D_Q"]
     BLOCK_D_V = nargs["BLOCK_D_V"]
+    if "USE_TLX" in nargs and nargs["USE_TLX"]:
+        BLOCK_M = BLOCK_M // nargs["NUM_MMA_GROUPS"]
     nargs["Q"].block_shape = [BLOCK_M, BLOCK_D_Q]
     nargs["V"].block_shape = [BLOCK_N, BLOCK_D_V]
     nargs["K"].block_shape = [BLOCK_N, BLOCK_D_Q]
@@ -253,6 +266,35 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
                 pre_hook=_host_descriptor_pre_hook,
             ),
         ]
+
+        # Add 'USE_TLX' : False, 'NUM_BUFFERS': 1, 'NUM_MMA_WARPS_PER_GROUP': 1, 'NUM_MMA_GROUPS': 1 to non-TLX configs
+        for config in configs:
+            if not config.kwargs.get("USE_TLX", False):
+                config.kwargs["USE_TLX"] = False
+                config.kwargs["NUM_BUFFERS"] = 1
+                config.kwargs["NUM_MMA_WARPS_PER_GROUP"] = 1
+                config.kwargs["NUM_MMA_GROUPS"] = 1
+
+        # Add TLX configs if TLX is available
+        if HAS_TLX:
+            if torch.cuda.get_device_capability()[0] == 9:
+                # H100 configs
+                configs.append(
+                    triton.Config(
+                        {
+                            "BLOCK_M": 128,
+                            "BLOCK_N": 64,
+                            "USE_TLX": True,
+                            "NUM_BUFFERS": 2,
+                            "NUM_MMA_WARPS_PER_GROUP": 4,
+                            "NUM_MMA_GROUPS": 2,
+                        },
+                        num_stages=0,
+                        num_warps=4,
+                        pre_hook=_host_descriptor_pre_hook,
+                    ),
+                )
+
     return configs
 
 
@@ -588,6 +630,858 @@ def _hstu_attn_fwd_compute(  # noqa C901
             tl.store(out_ptrs, acc, mask=(offs_m < seq_len)[:, None])
 
 
+@triton.jit
+def _hstu_attn_fwd_compute_main_loop_tlx(  # noqa C901
+    low,
+    high,
+    seq_len,
+    offs_m,
+    offs_n,
+    acc,
+    q_tiles,
+    k_tiles,
+    v_tiles,
+    q_fulls,
+    k_fulls,
+    v_fulls,
+    k_empties,
+    v_empties,
+    v_dtype,
+    n_targets,
+    alpha,
+    end_n,
+    loop_trip_cnt,
+    max_attn_len,
+    HAS_MULTIPLE_TARGETS: tl.constexpr,
+    HAS_CONTEXTUAL_SEQ_LEN: tl.constexpr,
+    HAS_MAX_ATTN_LEN: tl.constexpr,
+    cid: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_BUFFERS: tl.constexpr,
+    MAX_SEQ_LEN: tl.constexpr,
+    WAIT_FOR_Q: tl.constexpr,
+):
+    if WAIT_FOR_Q:
+        # wait for the Q buffer to be populated by the producer
+        q_full = tlx.local_view(q_fulls, cid)
+        tlx.barrier_wait(q_full, 0)
+
+    q_tile = tlx.local_view(q_tiles, cid)
+
+    for start in tl.range(low + BLOCK_N, high, BLOCK_N, num_stages=0):
+        buf_id = loop_trip_cnt % NUM_BUFFERS
+        # buffers in a row share the same phase
+        kv_phase = (loop_trip_cnt // NUM_BUFFERS) % 2
+
+        start_n = tl.multiple_of(start, BLOCK_N)
+        offs_n_start = offs_n
+        offs_n = offs_n_start + start_n
+
+        # wait for the K buffer to be populated by the producer
+        k_full = tlx.local_view(k_fulls, buf_id)
+        tlx.barrier_wait(k_full, kv_phase)
+        k_tile = tlx.local_view(k_tiles, buf_id)
+
+        # tma can only be loaded in one order, use trans afterwards
+        k_tile = tlx.local_trans(k_tile)
+        # second
+        qk = tlx.async_dot(q_tile, k_tile)
+        # wait for the MMA using to complete
+        qk = tlx.async_dot_wait(0, qk)
+        # release the K buffer
+        k_empty = tlx.local_view(k_empties, buf_id)
+        tlx.barrier_arrive(k_empty, 1)
+
+        qk = qk * alpha
+
+        invalid_mask = offs_m[:, None] == offs_n[None, :]
+        max_ids = seq_len
+        if HAS_MULTIPLE_TARGETS:
+            max_ids = max_ids - n_targets
+            offs_m = tl.where(
+                offs_m < max_ids,
+                offs_m,
+                max_ids,
+            )
+            offs_n = tl.where(
+                offs_n < max_ids,
+                offs_n,
+                max_ids,
+            )
+        offs_m_minus_n = offs_m[:, None] - offs_n[None, :]
+        invalid_mask = invalid_mask or (offs_m_minus_n > 0)
+        if HAS_MAX_ATTN_LEN:
+            invalid_mask = invalid_mask and offs_m_minus_n <= max_attn_len
+        if HAS_CONTEXTUAL_SEQ_LEN:
+            invalid_mask = invalid_mask or (
+                offs_m[:, None] == 0 and offs_n[None, :] < max_ids
+            )
+        scale = tl.where(invalid_mask, (1.0 / MAX_SEQ_LEN), 0.0)
+        silu = fast_dividef(qk, 1.0 + fast_expf(-qk)) * scale
+        silu = silu.to(v_dtype)
+
+        # wait for the V buffer to be populated by the producer
+        v_full = tlx.local_view(v_fulls, buf_id)
+        tlx.barrier_wait(v_full, kv_phase)
+        v_tile = tlx.local_view(v_tiles, buf_id)
+        acc = tlx.async_dot(silu, v_tile, acc)
+        # wait for the MMA using to complete
+        acc = tlx.async_dot_wait(0, acc)
+        # release the V buffer
+        v_empty = tlx.local_view(v_empties, buf_id)
+        tlx.barrier_arrive(v_empty, 1)
+
+        end_n += BLOCK_N
+
+        # increment loop trip counts
+        loop_trip_cnt += 1
+
+    return acc, end_n, loop_trip_cnt
+
+
+@triton.jit
+def _hstu_attn_fwd_compute_main_loop_tlx_pipelined(  # noqa C901
+    low,
+    high,
+    seq_len,
+    offs_m,
+    offs_n,
+    acc,
+    q_tiles,
+    k_tiles,
+    v_tiles,
+    q_fulls,
+    k_fulls,
+    v_fulls,
+    k_empties,
+    v_empties,
+    v_dtype,
+    n_targets,
+    alpha,
+    end_n,
+    loop_trip_cnt,
+    max_attn_len,
+    HAS_MULTIPLE_TARGETS: tl.constexpr,
+    HAS_CONTEXTUAL_SEQ_LEN: tl.constexpr,
+    HAS_MAX_ATTN_LEN: tl.constexpr,
+    cid: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_BUFFERS: tl.constexpr,
+    MAX_SEQ_LEN: tl.constexpr,
+    WAIT_FOR_Q: tl.constexpr,
+):
+    if WAIT_FOR_Q:
+        # wait for the Q buffer to be populated by the producer
+        q_full = tlx.local_view(q_fulls, cid)
+        tlx.barrier_wait(q_full, 0)
+    q_tile = tlx.local_view(q_tiles, cid)
+
+    # wait for the K buffer to be populated by the producer
+    k_buf_id = loop_trip_cnt % NUM_BUFFERS
+    # buffers in a row share the same phase
+    k_phase = (loop_trip_cnt // NUM_BUFFERS) % 2
+
+    k_full = tlx.local_view(k_fulls, k_buf_id)
+    tlx.barrier_wait(k_full, k_phase)
+    k_tile = tlx.local_view(k_tiles, k_buf_id)
+
+    # tma can only be loaded in one order, use trans afterwards
+    k_tile = tlx.local_trans(k_tile)
+
+    # Pingpong
+    if cid == 0:
+        # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
+        tlx.named_barrier_wait(9, 256)
+    else:
+        # Consumer 1 signals its arrival at barrier 9.
+        tlx.named_barrier_arrive(9, 256)
+        # Then waits at barrier 10 until Consumer 0 finishes issuing its async_dot.
+        tlx.named_barrier_wait(10, 256)
+
+    qk = tlx.async_dot(q_tile, k_tile)
+
+    if cid == 0:
+        # After issuing async_dot, Consumer 0 signals barrier 10 to unblock Consumer 1.
+        tlx.named_barrier_arrive(10, 256)
+
+    # wait for the MMA using to complete
+    qk = tlx.async_dot_wait(0, qk)
+    # release the K buffer
+    k_empty = tlx.local_view(k_empties, k_buf_id)
+    tlx.barrier_arrive(k_empty, 1)
+
+    qk = qk * alpha
+
+    start_n = tl.multiple_of(low, BLOCK_N)
+    offs_n_start = offs_n
+    offs_n = offs_n_start + start_n
+
+    invalid_mask = offs_m[:, None] == offs_n[None, :]
+    max_ids = seq_len
+    if HAS_MULTIPLE_TARGETS:
+        max_ids = max_ids - n_targets
+        offs_m = tl.where(
+            offs_m < max_ids,
+            offs_m,
+            max_ids,
+        )
+        offs_n = tl.where(
+            offs_n < max_ids,
+            offs_n,
+            max_ids,
+        )
+    offs_m_minus_n = offs_m[:, None] - offs_n[None, :]
+    invalid_mask = invalid_mask or (offs_m_minus_n > 0)
+    if HAS_MAX_ATTN_LEN:
+        invalid_mask = invalid_mask and offs_m_minus_n <= max_attn_len
+    if HAS_CONTEXTUAL_SEQ_LEN:
+        invalid_mask = invalid_mask or (
+            offs_m[:, None] == 0 and offs_n[None, :] < max_ids
+        )
+    scale = tl.where(invalid_mask, (1.0 / MAX_SEQ_LEN), 0.0)
+    silu = fast_dividef(qk, 1.0 + fast_expf(-qk)) * scale
+    silu = silu.to(v_dtype)
+
+    loop_trip_cnt += 1
+
+    for start in tl.range(low + BLOCK_N, high, BLOCK_N, num_stages=0):
+        start_n = tl.multiple_of(start, BLOCK_N)
+        offs_n = offs_n_start + start_n
+
+        k_buf_id = loop_trip_cnt % NUM_BUFFERS
+        # buffers in a row share the same phase
+        k_phase = k_phase ^ (k_buf_id == 0)
+
+        # wait for the K buffer to be populated by the producer
+        k_full = tlx.local_view(k_fulls, k_buf_id)
+        tlx.barrier_wait(k_full, k_phase)
+        k_tile = tlx.local_view(k_tiles, k_buf_id)
+
+        # tma can only be loaded in one order, use trans afterwards
+        k_tile = tlx.local_trans(k_tile)
+
+        qk = tlx.async_dot(q_tile, k_tile)
+        # wait for the MMA using to complete
+        prev_silu = silu
+
+        v_buf_id = (loop_trip_cnt - 1) % NUM_BUFFERS
+        # v_phase = v_phase ^ (v_buf_id == 0)
+        v_phase = ((loop_trip_cnt - 1) // NUM_BUFFERS) % 2
+        v_full = tlx.local_view(v_fulls, v_buf_id)
+        tlx.barrier_wait(v_full, v_phase)
+        v_tile = tlx.local_view(v_tiles, v_buf_id)
+        acc = tlx.async_dot(prev_silu, v_tile, acc)
+        qk = tlx.async_dot_wait(1, qk)
+
+        # release the K buffer
+        k_empty = tlx.local_view(k_empties, k_buf_id)
+        tlx.barrier_arrive(k_empty, 1)
+
+        qk = qk * alpha
+        invalid_mask = offs_m[:, None] == offs_n[None, :]
+        max_ids = seq_len
+        if HAS_MULTIPLE_TARGETS:
+            max_ids = max_ids - n_targets
+            offs_m = tl.where(
+                offs_m < max_ids,
+                offs_m,
+                max_ids,
+            )
+            offs_n = tl.where(
+                offs_n < max_ids,
+                offs_n,
+                max_ids,
+            )
+        offs_m_minus_n = offs_m[:, None] - offs_n[None, :]
+        invalid_mask = invalid_mask or (offs_m_minus_n > 0)
+        if HAS_MAX_ATTN_LEN:
+            invalid_mask = invalid_mask and offs_m_minus_n <= max_attn_len
+        if HAS_CONTEXTUAL_SEQ_LEN:
+            invalid_mask = invalid_mask or (
+                offs_m[:, None] == 0 and offs_n[None, :] < max_ids
+            )
+        scale = tl.where(invalid_mask, (1.0 / MAX_SEQ_LEN), 0.0)
+        silu = fast_dividef(qk, 1.0 + fast_expf(-qk)) * scale
+        silu = silu.to(v_dtype)
+
+        acc = tlx.async_dot_wait(0, acc)
+        # release the V buffer
+        v_empty = tlx.local_view(v_empties, v_buf_id)
+        tlx.barrier_arrive(v_empty, 1)
+
+        end_n += BLOCK_N
+
+        # increment loop trip counts
+        loop_trip_cnt += 1
+        # v_buf_id = loop_trip_cnt % NUM_BUFFERS
+        # v_phase = (loop_trip_cnt // NUM_BUFFERS) % 2
+
+    # wait for the V buffer to be populated by the producer
+    v_buf_id = (loop_trip_cnt - 1) % NUM_BUFFERS
+    v_phase = ((loop_trip_cnt - 1) // NUM_BUFFERS) % 2
+    v_full = tlx.local_view(v_fulls, v_buf_id)
+    # tlx.barrier_wait(v_full, v_buf_id)
+    v_tile = tlx.local_view(v_tiles, v_buf_id)
+    tlx.barrier_wait(v_full, v_phase)
+    acc = tlx.async_dot(silu, v_tile, acc)
+    acc = tlx.async_dot_wait(0, acc)
+    # release the V buffer
+    v_empty = tlx.local_view(v_empties, v_buf_id)
+    tlx.barrier_arrive(v_empty, 1)
+
+    return acc, end_n, loop_trip_cnt
+
+
+@triton.jit
+def _hstu_attn_fwd_load_K_or_V(
+    K,
+    k_tiles,
+    k_empties,
+    k_fulls,
+    buf_id,
+    k_phase,
+    start_n,
+    seq_start,
+    offset_kh,
+    BLOCK_D_Q: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # wait for the K buffer to be released by the consumer
+    k_empty = tlx.local_view(k_empties, buf_id)
+    tlx.barrier_wait(k_empty, k_phase)
+    # load K
+    k_full = tlx.local_view(k_fulls, buf_id)
+    k_tile = tlx.local_view(k_tiles, buf_id)
+    tlx.barrier_expect_bytes(k_full, 2 * BLOCK_N * BLOCK_D_Q)  # float16
+    tlx.async_descriptor_load(
+        K,
+        k_tile,
+        [(seq_start + start_n).to(tl.int32), offset_kh.to(tl.int32)],
+        k_full,
+    )
+
+
+@triton.jit
+def _hstu_attn_fwd_load_Q(
+    Q,
+    q_tiles,
+    q_fulls,
+    cid,
+    off_z,
+    off_h,
+    stride_qh,
+    start_m,
+    seq_start,
+    DeltaSize,
+    IS_DELTA_Q: tl.constexpr,
+    BLOCK_D_Q: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    q_full = tlx.local_view(q_fulls, cid)
+    tlx.barrier_expect_bytes(q_full, 2 * BLOCK_M * BLOCK_D_Q)  # float16
+    q_tile = tlx.local_view(q_tiles, cid)
+    seq_offset = start_m + cid * BLOCK_M
+    if IS_DELTA_Q:
+        tlx.async_descriptor_load(
+            Q,
+            q_tile,
+            [
+                (off_z * DeltaSize + start_m).to(tl.int32),
+                (off_h * stride_qh).to(tl.int32),
+            ],
+            q_full,
+        )
+    else:
+        tlx.async_descriptor_load(
+            Q,
+            q_tile,
+            [
+                (seq_start + seq_offset).to(tl.int32),
+                (off_h * stride_qh).to(tl.int32),
+            ],
+            q_full,
+        )
+
+
+@triton.jit
+def _hstu_attn_fwd_caculate_range(
+    seq_len,
+    start_m,
+    n_targets,
+    contextual_seq_len,
+    max_attn_len,
+    HAS_MULTIPLE_TARGETS: tl.constexpr,
+    HAS_CONTEXTUAL_SEQ_LEN: tl.constexpr,
+    HAS_MAX_ATTN_LEN: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    if HAS_MULTIPLE_TARGETS:
+        uih_end = seq_len - n_targets
+    else:
+        uih_end = seq_len
+
+    if HAS_CONTEXTUAL_SEQ_LEN is True and start_m < contextual_seq_len:
+        # uih_end must be larger than start_m
+        low = 0
+        high = seq_len
+    else:
+        low = 0
+        high = start_m + BLOCK_M
+        if HAS_MAX_ATTN_LEN:
+            if start_m > uih_end:
+                low = uih_end - max_attn_len
+            else:
+                low = start_m - max_attn_len
+            if HAS_CONTEXTUAL_SEQ_LEN:
+                low = low if low > contextual_seq_len else 0
+            else:
+                low = low if low > 0 else 0
+        if HAS_MULTIPLE_TARGETS:
+            uih_end = (uih_end + BLOCK_N - 1) // BLOCK_N * BLOCK_N
+            if uih_end < start_m:
+                high = seq_len - n_targets
+
+    return low, high, uih_end
+
+
+@triton.jit
+def _hstu_attn_fwd_load_Q_K_V(
+    Q,
+    K,
+    V,
+    q_tiles,
+    k_tiles,
+    v_tiles,
+    q_fulls,
+    k_fulls,
+    v_fulls,
+    k_empties,
+    v_empties,
+    stride_qh,
+    stride_kh,
+    stride_vh,
+    contextual_seq_len,
+    max_attn_len,
+    DeltaSize,
+    off_z,
+    off_h,
+    start_m,
+    seq_start,
+    seq_len,
+    n_targets,
+    HAS_MULTIPLE_TARGETS: tl.constexpr,
+    IS_DELTA_Q: tl.constexpr,
+    BLOCK_D_Q: tl.constexpr,
+    BLOCK_D_V: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_BUFFERS: tl.constexpr,
+    NUM_MMA_GROUPS: tl.constexpr,
+    HAS_CONTEXTUAL_SEQ_LEN: tl.constexpr,
+    HAS_MAX_ATTN_LEN: tl.constexpr,
+):
+    # load q: it will stay in SRAM throughout
+    BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
+
+    _hstu_attn_fwd_load_Q(
+        Q=Q,
+        q_tiles=q_tiles,
+        q_fulls=q_fulls,
+        cid=0,
+        off_z=off_z,
+        off_h=off_h,
+        stride_qh=stride_qh,
+        start_m=start_m,
+        seq_start=seq_start,
+        DeltaSize=DeltaSize,
+        IS_DELTA_Q=IS_DELTA_Q,
+        BLOCK_D_Q=BLOCK_D_Q,
+        BLOCK_M=BLOCK_M_SPLIT,
+    )
+
+    off_h = off_h.to(tl.int64)
+    off_z = off_z.to(tl.int64)
+    offset_kh = off_h * stride_kh
+    offset_vh = off_h * stride_vh
+
+    low, high, uih_end = _hstu_attn_fwd_caculate_range(
+        seq_len,
+        start_m,
+        n_targets,
+        contextual_seq_len,
+        max_attn_len,
+        HAS_MULTIPLE_TARGETS,
+        HAS_CONTEXTUAL_SEQ_LEN,
+        HAS_MAX_ATTN_LEN,
+        BLOCK_M,
+        BLOCK_N,
+    )
+
+    kv_phase = 0
+    loop_trip_cnt = 0
+
+    # pyre-ignore[58]
+    buf_id = loop_trip_cnt % NUM_BUFFERS
+    # buffers in a row share the same phase
+    kv_phase = kv_phase ^ (buf_id == 0)
+
+    start_n = tl.multiple_of(low, BLOCK_N)
+
+    _hstu_attn_fwd_load_K_or_V(
+        K,
+        k_tiles,
+        k_empties,
+        k_fulls,
+        buf_id,
+        kv_phase,
+        start_n,
+        seq_start,
+        offset_kh,
+        BLOCK_D_Q,
+        BLOCK_N,
+    )
+
+    for cid in tl.range(1, NUM_MMA_GROUPS, loop_unroll_factor=NUM_MMA_GROUPS - 1):
+        _hstu_attn_fwd_load_Q(
+            Q,
+            q_tiles,
+            q_fulls,
+            cid,
+            off_z,
+            off_h,
+            stride_qh,
+            start_m,
+            seq_start,
+            DeltaSize,
+            IS_DELTA_Q,
+            BLOCK_D_Q,
+            BLOCK_M_SPLIT,
+        )
+
+    _hstu_attn_fwd_load_K_or_V(
+        V,
+        v_tiles,
+        v_empties,
+        v_fulls,
+        buf_id,
+        kv_phase,
+        start_n,
+        seq_start,
+        offset_vh,
+        BLOCK_D_V,
+        BLOCK_N,
+    )
+
+    loop_trip_cnt += 1
+
+    for start in range(low + BLOCK_N, high, BLOCK_N):
+        # pyre-ignore[58]
+        buf_id = loop_trip_cnt % NUM_BUFFERS
+        # buffers in a row share the same phase
+        kv_phase = kv_phase ^ (buf_id == 0)
+
+        start_n = tl.multiple_of(start, BLOCK_N)
+
+        _hstu_attn_fwd_load_K_or_V(
+            K,
+            k_tiles,
+            k_empties,
+            k_fulls,
+            buf_id,
+            kv_phase,
+            start_n,
+            seq_start,
+            offset_kh,
+            BLOCK_D_Q,
+            BLOCK_N,
+        )
+
+        _hstu_attn_fwd_load_K_or_V(
+            V,
+            v_tiles,
+            v_empties,
+            v_fulls,
+            buf_id,
+            kv_phase,
+            start_n,
+            seq_start,
+            offset_vh,
+            BLOCK_D_V,
+            BLOCK_N,
+        )
+
+        # increment loop trip counts
+        loop_trip_cnt += 1
+
+    # pyre-ignore[61]
+    if uih_end < start_m:
+        low_delta = start_m
+        high_delta = start_m + BLOCK_M
+        for start_delta in tl.range(low_delta, high_delta, BLOCK_N, num_stages=0):
+            # pyre-ignore[58]
+            buf_id = loop_trip_cnt % NUM_BUFFERS
+            # buffers in a row share the same phase
+            kv_phase = kv_phase ^ (buf_id == 0)
+
+            start_n = tl.multiple_of(start_delta, BLOCK_N)
+
+            _hstu_attn_fwd_load_K_or_V(
+                K,
+                k_tiles,
+                k_empties,
+                k_fulls,
+                buf_id,
+                kv_phase,
+                start_n,
+                seq_start,
+                offset_kh,
+                BLOCK_D_Q,
+                BLOCK_N,
+            )
+
+            _hstu_attn_fwd_load_K_or_V(
+                V,
+                v_tiles,
+                v_empties,
+                v_fulls,
+                buf_id,
+                kv_phase,
+                start_n,
+                seq_start,
+                offset_vh,
+                BLOCK_D_V,
+                BLOCK_N,
+            )
+
+            # increment loop trip counts
+            loop_trip_cnt += 1
+
+
+@triton.jit
+def _hstu_attn_fwd_compute_tlx(  # noqa C901
+    Q,
+    K,
+    V,
+    H,
+    DimQ,
+    DimV,
+    seq_offsets,
+    num_targets,
+    Out,
+    stride_qh,
+    stride_kh,
+    stride_vh,
+    stride_om,
+    stride_oh,
+    alpha,
+    MAX_SEQ_LEN,
+    DeltaSize,
+    contextual_seq_len,
+    max_attn_len,
+    off_z,
+    off_h,
+    pid,
+    HAS_MULTIPLE_TARGETS: tl.constexpr,
+    IS_DELTA_Q: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
+    BLOCK_D_Q: tl.constexpr,
+    BLOCK_D_V: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_BUFFERS: tl.constexpr,  #
+    NUM_MMA_WARPS_PER_GROUP: tl.constexpr,  #
+    NUM_MMA_GROUPS: tl.constexpr,  #
+    HAS_CONTEXTUAL_SEQ_LEN: tl.constexpr,
+    HAS_MAX_ATTN_LEN: tl.constexpr,
+):
+    seq_start = tl.load(seq_offsets + off_z).to(tl.int64)
+    seq_end = tl.load(seq_offsets + off_z + 1)
+    seq_len = (seq_end - seq_start).to(tl.int32)
+
+    if IS_DELTA_Q:
+        start_m = pid * BLOCK_M
+        start_m = (start_m + seq_len - DeltaSize).to(tl.int32)
+    else:
+        start_m = pid * BLOCK_M
+
+    if start_m >= seq_len:
+        return
+
+    if HAS_MULTIPLE_TARGETS:
+        n_targets = tl.load(num_targets + off_z).to(tl.int32)
+    else:
+        n_targets = None
+
+    BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
+    # allocate buffers
+    q_tiles = tlx.local_alloc(
+        (BLOCK_M_SPLIT, BLOCK_D_Q), tlx.dtype_of(Q), NUM_MMA_GROUPS
+    )
+    k_tiles = tlx.local_alloc((BLOCK_N, BLOCK_D_Q), tlx.dtype_of(K), NUM_BUFFERS)
+    v_tiles = tlx.local_alloc((BLOCK_N, BLOCK_D_V), tlx.dtype_of(V), NUM_BUFFERS)
+
+    # allocate barriers
+    q_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS, arrive_count=1)
+    k_empties = tlx.alloc_barriers(
+        num_barriers=NUM_BUFFERS, arrive_count=NUM_MMA_GROUPS
+    )
+    k_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
+    v_empties = tlx.alloc_barriers(
+        num_barriers=NUM_BUFFERS, arrive_count=NUM_MMA_GROUPS
+    )
+    v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
+
+    with tlx.async_tasks():
+        # producer group
+        with tlx.async_task("default"):
+            _hstu_attn_fwd_load_Q_K_V(
+                Q=Q,
+                K=K,
+                V=V,
+                q_tiles=q_tiles,
+                k_tiles=k_tiles,
+                v_tiles=v_tiles,
+                q_fulls=q_fulls,
+                k_fulls=k_fulls,
+                v_fulls=v_fulls,
+                k_empties=k_empties,
+                v_empties=v_empties,
+                stride_qh=stride_qh,
+                stride_kh=stride_kh,
+                stride_vh=stride_vh,
+                contextual_seq_len=contextual_seq_len,
+                max_attn_len=max_attn_len,
+                DeltaSize=DeltaSize,
+                off_z=off_z,
+                off_h=off_h,
+                start_m=start_m,
+                seq_start=seq_start,
+                seq_len=seq_len,
+                n_targets=n_targets,
+                HAS_MULTIPLE_TARGETS=HAS_MULTIPLE_TARGETS,
+                IS_DELTA_Q=IS_DELTA_Q,
+                BLOCK_D_Q=BLOCK_D_Q,
+                BLOCK_D_V=BLOCK_D_V,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                NUM_BUFFERS=NUM_BUFFERS,
+                NUM_MMA_GROUPS=NUM_MMA_GROUPS,
+                HAS_CONTEXTUAL_SEQ_LEN=HAS_CONTEXTUAL_SEQ_LEN,
+                HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
+            )
+
+        # consumer groups
+        with tlx.async_task(
+            num_warps=NUM_MMA_WARPS_PER_GROUP, registers=232, replicate=NUM_MMA_GROUPS
+        ):
+            cid = tlx.async_task_replica_id()
+            acc = tl.zeros([BLOCK_M_SPLIT, BLOCK_D_V], dtype=tl.float32)
+            # initialize offsets
+            offs_m = start_m + tl.arange(0, BLOCK_M_SPLIT) + cid * BLOCK_M_SPLIT
+            offs_n = tl.arange(0, BLOCK_N)
+
+            low, high, uih_end = _hstu_attn_fwd_caculate_range(
+                seq_len,
+                start_m,
+                n_targets,
+                contextual_seq_len,
+                max_attn_len,
+                HAS_MULTIPLE_TARGETS,
+                HAS_CONTEXTUAL_SEQ_LEN,
+                HAS_MAX_ATTN_LEN,
+                BLOCK_M,
+                BLOCK_N,
+            )
+
+            end_n = low
+            loop_trip_cnt = 0
+
+            acc, end_n, loop_trip_cnt = _hstu_attn_fwd_compute_main_loop_tlx_pipelined(
+                low=low,
+                high=high,
+                seq_len=seq_len,
+                offs_m=offs_m,
+                offs_n=offs_n,
+                acc=acc,
+                q_tiles=q_tiles,
+                k_tiles=k_tiles,
+                v_tiles=v_tiles,
+                q_fulls=q_fulls,
+                k_fulls=k_fulls,
+                v_fulls=v_fulls,
+                k_empties=k_empties,
+                v_empties=v_empties,
+                v_dtype=tlx.dtype_of(V),
+                n_targets=n_targets,
+                alpha=alpha,
+                end_n=end_n,
+                loop_trip_cnt=loop_trip_cnt,
+                max_attn_len=max_attn_len,
+                HAS_MULTIPLE_TARGETS=HAS_MULTIPLE_TARGETS,
+                HAS_CONTEXTUAL_SEQ_LEN=HAS_CONTEXTUAL_SEQ_LEN,
+                HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
+                cid=cid,
+                BLOCK_N=BLOCK_N,
+                NUM_BUFFERS=NUM_BUFFERS,
+                MAX_SEQ_LEN=MAX_SEQ_LEN,
+                WAIT_FOR_Q=1,
+            )
+
+            # pyre-ignore[61]
+            if uih_end < start_m:
+                low_delta = start_m
+                high_delta = start_m + BLOCK_M
+                acc, end_n, loop_trip_cnt = _hstu_attn_fwd_compute_main_loop_tlx(
+                    low=low_delta,
+                    high=high_delta,
+                    seq_len=seq_len,
+                    offs_m=offs_m,
+                    offs_n=offs_n,
+                    acc=acc,
+                    q_tiles=q_tiles,
+                    k_tiles=k_tiles,
+                    v_tiles=v_tiles,
+                    q_fulls=q_fulls,
+                    k_fulls=k_fulls,
+                    v_fulls=v_fulls,
+                    k_empties=k_empties,
+                    v_empties=v_empties,
+                    v_dtype=tlx.dtype_of(V),
+                    n_targets=n_targets,
+                    alpha=alpha,
+                    end_n=end_n,
+                    loop_trip_cnt=loop_trip_cnt,
+                    max_attn_len=max_attn_len,
+                    HAS_MULTIPLE_TARGETS=HAS_MULTIPLE_TARGETS,
+                    HAS_CONTEXTUAL_SEQ_LEN=HAS_CONTEXTUAL_SEQ_LEN,
+                    HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
+                    cid=cid,
+                    BLOCK_N=BLOCK_N,
+                    NUM_BUFFERS=NUM_BUFFERS,
+                    MAX_SEQ_LEN=MAX_SEQ_LEN,
+                    WAIT_FOR_Q=0,
+                )
+
+            # Don't use TMA in Jagged case since we don't want to overwrite
+            # the output of another sequence
+            if IS_DELTA_Q:
+                start_m_delta = pid * BLOCK_M + cid * BLOCK_M_SPLIT
+                offs_m_delta = start_m_delta + tl.arange(0, BLOCK_M_SPLIT)
+                offs_v_d = tl.arange(0, BLOCK_D_V)
+                off_o = Out + off_z * DeltaSize * stride_om + off_h * stride_oh
+                out_ptrs = off_o + offs_m_delta[:, None] * stride_om + offs_v_d[None, :]
+                tl.store(out_ptrs, acc, mask=(offs_m_delta < DeltaSize)[:, None])
+            else:
+                # rematerialize offsets to save registers
+                start_m = pid * BLOCK_M + cid * BLOCK_M_SPLIT
+                offs_m = start_m + tl.arange(0, BLOCK_M_SPLIT)
+                offs_v_d = tl.arange(0, BLOCK_D_V)
+                off_o = Out + seq_start * stride_om + off_h * stride_oh
+                out_ptrs = off_o + offs_m[:, None] * stride_om + offs_v_d[None, :]
+                tl.store(out_ptrs, acc, mask=(offs_m < seq_len)[:, None])
+
+
 @triton_autotune(
     configs=_get_fw_configs(),
     key=[
@@ -636,6 +1530,10 @@ def _hstu_attn_fwd(  # noqa C901
     BLOCK_D_V: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    USE_TLX: tl.constexpr,
+    NUM_BUFFERS: tl.constexpr,  #
+    NUM_MMA_WARPS_PER_GROUP: tl.constexpr,  #
+    NUM_MMA_GROUPS: tl.constexpr,  #
     HAS_CONTEXTUAL_SEQ_LEN: tl.constexpr,
     HAS_MAX_ATTN_LEN: tl.constexpr,
     HAS_SORT_BY_LENGTH_INDICES: tl.constexpr,
@@ -648,45 +1546,83 @@ def _hstu_attn_fwd(  # noqa C901
         off_z = tl.load(sort_by_length_indices + off_z)
     off_h = off_hz % H
     pid = tl.program_id(0)
-    _hstu_attn_fwd_compute(
-        Q=Q,
-        K=K,
-        V=V,
-        H=H,
-        DimQ=DimQ,
-        DimV=DimV,
-        workspace_ptr=workspace_ptr,
-        seq_offsets=seq_offsets,
-        num_targets=num_targets,
-        Out=Out,
-        stride_qm=stride_qm,
-        stride_qh=stride_qh,
-        stride_kn=stride_kn,
-        stride_kh=stride_kh,
-        stride_vn=stride_vn,
-        stride_vh=stride_vh,
-        stride_om=stride_om,
-        stride_oh=stride_oh,
-        alpha=alpha,
-        MAX_SEQ_LEN=MAX_SEQ_LEN,
-        DeltaSize=DeltaSize,
-        contextual_seq_len=contextual_seq_len,
-        max_attn_len=max_attn_len,
-        off_z=off_z,
-        off_h=off_h,
-        pid=pid,
-        HAS_MULTIPLE_TARGETS=HAS_MULTIPLE_TARGETS,
-        IS_DELTA_Q=IS_DELTA_Q,
-        ALLOW_TF32=ALLOW_TF32,
-        BLOCK_D_Q=BLOCK_D_Q,
-        BLOCK_D_V=BLOCK_D_V,
-        HAS_CONTEXTUAL_SEQ_LEN=HAS_CONTEXTUAL_SEQ_LEN,
-        HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        ENABLE_TMA=ENABLE_TMA,
-        TMA_DESC_SIZE=TMA_DESC_SIZE,
-    )
+    if USE_TLX:
+        _hstu_attn_fwd_compute_tlx(
+            Q=Q,
+            K=K,
+            V=V,
+            H=H,
+            DimQ=DimQ,
+            DimV=DimV,
+            seq_offsets=seq_offsets,
+            num_targets=num_targets,
+            Out=Out,
+            stride_qh=stride_qh,
+            stride_kh=stride_kh,
+            stride_vh=stride_vh,
+            stride_om=stride_om,
+            stride_oh=stride_oh,
+            alpha=alpha,
+            MAX_SEQ_LEN=MAX_SEQ_LEN,
+            DeltaSize=DeltaSize,
+            contextual_seq_len=contextual_seq_len,
+            max_attn_len=max_attn_len,
+            off_z=off_z,
+            off_h=off_h,
+            pid=pid,
+            HAS_MULTIPLE_TARGETS=HAS_MULTIPLE_TARGETS,
+            IS_DELTA_Q=IS_DELTA_Q,
+            ALLOW_TF32=ALLOW_TF32,
+            BLOCK_D_Q=BLOCK_D_Q,
+            BLOCK_D_V=BLOCK_D_V,
+            HAS_CONTEXTUAL_SEQ_LEN=HAS_CONTEXTUAL_SEQ_LEN,
+            HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            NUM_BUFFERS=NUM_BUFFERS,
+            NUM_MMA_WARPS_PER_GROUP=NUM_MMA_WARPS_PER_GROUP,
+            NUM_MMA_GROUPS=NUM_MMA_GROUPS,
+        )
+    else:
+        _hstu_attn_fwd_compute(
+            Q=Q,
+            K=K,
+            V=V,
+            H=H,
+            DimQ=DimQ,
+            DimV=DimV,
+            workspace_ptr=workspace_ptr,
+            seq_offsets=seq_offsets,
+            num_targets=num_targets,
+            Out=Out,
+            stride_qm=stride_qm,
+            stride_qh=stride_qh,
+            stride_kn=stride_kn,
+            stride_kh=stride_kh,
+            stride_vn=stride_vn,
+            stride_vh=stride_vh,
+            stride_om=stride_om,
+            stride_oh=stride_oh,
+            alpha=alpha,
+            MAX_SEQ_LEN=MAX_SEQ_LEN,
+            DeltaSize=DeltaSize,
+            contextual_seq_len=contextual_seq_len,
+            max_attn_len=max_attn_len,
+            off_z=off_z,
+            off_h=off_h,
+            pid=pid,
+            HAS_MULTIPLE_TARGETS=HAS_MULTIPLE_TARGETS,
+            IS_DELTA_Q=IS_DELTA_Q,
+            ALLOW_TF32=ALLOW_TF32,
+            BLOCK_D_Q=BLOCK_D_Q,
+            BLOCK_D_V=BLOCK_D_V,
+            HAS_CONTEXTUAL_SEQ_LEN=HAS_CONTEXTUAL_SEQ_LEN,
+            HAS_MAX_ATTN_LEN=HAS_MAX_ATTN_LEN,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            ENABLE_TMA=ENABLE_TMA,
+            TMA_DESC_SIZE=TMA_DESC_SIZE,
+        )
 
 
 @triton_autotune(
@@ -737,6 +1673,10 @@ def _hstu_attn_fwd_persistent(  # noqa C901
     BLOCK_D_V: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    USE_TLX: tl.constexpr,
+    NUM_BUFFERS: tl.constexpr,  #
+    NUM_MMA_WARPS_PER_GROUP: tl.constexpr,  #
+    NUM_MMA_GROUPS: tl.constexpr,  #
     HAS_CONTEXTUAL_SEQ_LEN: tl.constexpr,
     HAS_MAX_ATTN_LEN: tl.constexpr,
     HAS_SORT_BY_LENGTH_INDICES: tl.constexpr,
