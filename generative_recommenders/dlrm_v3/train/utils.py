@@ -337,6 +337,7 @@ def train_loop(
 
     for _ in range(num_epochs):
         for sample in dataloader:
+            optimizer.zero_grad()
             sample.to(device)
             (
                 _,
