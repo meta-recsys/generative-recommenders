@@ -350,6 +350,7 @@ def train_loop(
                 sample.candidates_features_kjt,
             )
             # pyre-ignore
+            optimizer.zero_grad()
             sum(aux_losses.values()).backward()
             optimizer.step()
             metric_logger.update(
