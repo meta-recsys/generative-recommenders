@@ -31,49 +31,101 @@ from generative_recommenders.common import (
 )
 
 
+def _get_layer_norm_fwd_configs() -> List[triton.Config]:
+    """Generate autotune configs for multi-row LayerNorm kernels."""
+    configs = []
+    for BLOCK_N in [1, 2, 4, 8, 16]:
+        for num_warps in [1, 2, 4]:
+            configs.append(
+                triton.Config(
+                    {"BLOCK_N": BLOCK_N},
+                    num_warps=num_warps,
+                )
+            )
+    return configs
+
+
+@triton_autotune(
+    configs=_get_layer_norm_fwd_configs(),
+    key=["BLOCK_D"],
+)
 @triton.jit
 def _layer_norm_fwd(
     X,
     Y,
     Mean,
     Rstd,
+    N,
     D,
     eps,
     stride_x,
     stride_y,
     TRAINING: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     COMPUTE_MEAN_AND_RSTD: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    X += row.to(tl.int64) * stride_x
-    Y += row.to(tl.int64) * stride_y
+    block_id = tl.program_id(0)
+    start_row = block_id * BLOCK_N
+
+    X_block_ptr = tl.make_block_ptr(
+        base=X,
+        shape=(N, D),
+        strides=(stride_x, 1),
+        offsets=(start_row, 0),
+        block_shape=(BLOCK_N, BLOCK_D),
+        order=(1, 0),
+    )
+
+    Y_block_ptr = tl.make_block_ptr(
+        base=Y,
+        shape=(N, D),
+        strides=(stride_y, 1),
+        offsets=(start_row, 0),
+        block_shape=(BLOCK_N, BLOCK_D),
+        order=(1, 0),
+    )
+
+    x_block = tl.load(X_block_ptr, boundary_check=(0, 1), padding_option="zero").to(
+        tl.float32
+    )
+
     cols = tl.arange(0, BLOCK_D)
-    x = tl.load(X + cols, mask=cols < D, other=0.0).to(tl.float32)
+    col_mask = cols < D
+    rows = start_row + tl.arange(0, BLOCK_N)
+    row_mask = rows < N
 
     if COMPUTE_MEAN_AND_RSTD:
-        mean = tl.sum(x, axis=0) / D
+        mean = tl.sum(x_block, axis=1) / D
+        if TRAINING:
+            tl.store(Mean + rows, mean, row_mask)
+        mean = tl.expand_dims(mean, 1)
     else:
-        mean = tl.load(Mean + row)
-    x_mean = tl.where(cols < D, x - mean, 0.0)
+        mean = tl.load(Mean + rows, row_mask, other=0.0)
+        mean = tl.expand_dims(mean, 1)
+
+    x_mean = x_block - mean
+    x_mean = tl.where(row_mask[:, None] & col_mask[None, :], x_mean, 0.0)
+
     if COMPUTE_MEAN_AND_RSTD:
-        _var = tl.zeros([BLOCK_D], dtype=tl.float32)
-        _var += x_mean * x_mean
-        var = tl.sum(_var, axis=0) / D
+        _var = x_mean * x_mean
+        var = tl.sum(_var, axis=1) / D
         rstd = 1 / tl.sqrt(var + eps)
         if TRAINING:
-            tl.store(Mean + row, mean)
-            tl.store(Rstd + row, rstd)
+            tl.store(Rstd + rows, rstd, row_mask)
     else:
-        rstd = tl.load(Rstd + row)
+        rstd = tl.load(Rstd + rows, row_mask, other=0.0)
 
-    # Normalize and apply linear transformation
-    mask = cols < D
+    rstd = tl.expand_dims(rstd, 1)
     y = x_mean * rstd
-    # Write output
-    tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
+
+    tl.store(Y_block_ptr, y.to(Y.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton_autotune(
+    configs=_get_layer_norm_fwd_configs(),
+    key=["BLOCK_D"],
+)
 @triton.jit
 def _weighted_layer_norm_fwd(
     X,
@@ -82,6 +134,7 @@ def _weighted_layer_norm_fwd(
     B,
     Mean,
     Rstd,
+    N,
     D,
     eps,
     stride_x,
@@ -89,41 +142,74 @@ def _weighted_layer_norm_fwd(
     IS_SWISH: tl.constexpr,
     TRAINING: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     COMPUTE_MEAN_AND_RSTD: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    X += row.to(tl.int64) * stride_x
-    Y += row.to(tl.int64) * stride_y
+    # Get the block ID and calculate starting row
+    block_id = tl.program_id(0)
+    start_row = block_id * BLOCK_N
+
+    # Load weight and bias once (shared across all rows in this block)
     cols = tl.arange(0, BLOCK_D)
-    x = tl.load(X + cols, mask=cols < D, other=0.0).to(tl.float32)
+    col_mask = cols < D
+    w = tl.load(W + cols, mask=col_mask, other=0.0).to(tl.float32)
+    b = tl.load(B + cols, mask=col_mask, other=0.0).to(tl.float32)
+
+    # Create block pointers for X and Y
+    X_block_ptr = tl.make_block_ptr(
+        base=X,
+        shape=(N, D),
+        strides=(stride_x, 1),
+        offsets=(start_row, 0),
+        block_shape=(BLOCK_N, BLOCK_D),
+        order=(1, 0),
+    )
+
+    Y_block_ptr = tl.make_block_ptr(
+        base=Y,
+        shape=(N, D),
+        strides=(stride_y, 1),
+        offsets=(start_row, 0),
+        block_shape=(BLOCK_N, BLOCK_D),
+        order=(1, 0),
+    )
+
+    x_block = tl.load(X_block_ptr, boundary_check=(0, 1), padding_option="zero").to(
+        tl.float32
+    )
+
+    rows = start_row + tl.arange(0, BLOCK_N)
+    row_mask = rows < N
 
     if COMPUTE_MEAN_AND_RSTD:
-        mean = tl.sum(x, axis=0) / D
+        mean = tl.sum(x_block, axis=1) / D
+        if TRAINING:
+            tl.store(Mean + rows, mean, row_mask)
+        mean = tl.expand_dims(mean, 1)
     else:
-        mean = tl.load(Mean + row)
+        mean = tl.load(Mean + rows, row_mask, other=0.0)
+        mean = tl.expand_dims(mean, 1)
 
-    x_mean = tl.where(cols < D, x - mean, 0.0)
+    x_mean = x_block - mean
+    x_mean = tl.where(row_mask[:, None] & col_mask[None, :], x_mean, 0.0)
+
     if COMPUTE_MEAN_AND_RSTD:
-        _var = tl.zeros([BLOCK_D], dtype=tl.float32)
-        _var += x_mean * x_mean
-        var = tl.sum(_var, axis=0) / D
+        _var = x_mean * x_mean
+        var = tl.sum(_var, axis=1) / D
         rstd = 1 / tl.sqrt(var + eps)
         if TRAINING:
-            tl.store(Mean + row, mean)
-            tl.store(Rstd + row, rstd)
+            tl.store(Rstd + rows, rstd, row_mask)
     else:
-        rstd = tl.load(Rstd + row)
+        rstd = tl.load(Rstd + rows, row_mask, other=0.0)
 
-    # Normalize and apply linear transformation
-    mask = cols < D
+    rstd = tl.expand_dims(rstd, 1)
     y = x_mean * rstd
-    w = tl.load(W + cols, mask=mask).to(tl.float32)
-    b = tl.load(B + cols, mask=mask).to(tl.float32)
-    y = y * w + b
+    y = y * w[None, :] + b[None, :]
+
     if IS_SWISH:
-        y = tl.sigmoid(y) * x
-    # Write output
-    tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
+        y = tl.sigmoid(y) * x_block
+
+    tl.store(Y_block_ptr, y.to(Y.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.jit
@@ -316,7 +402,7 @@ def triton_weighted_layer_norm_fwd(
     eps: float,
     mean: Optional[torch.Tensor] = None,
     rstd: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
     assert x.dim() == 2, f"x.dim() == {x.dim()}, expected 2"
     x = switch_to_contiguous_if_needed(x)
     N, D = x.shape
@@ -341,18 +427,22 @@ def triton_weighted_layer_norm_fwd(
     if D > BLOCK_D:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
 
-    num_warps: int = min(max(BLOCK_D // 256, 1), 8)
     if N == 0:
-        return y, mean, rstd, BLOCK_D, num_warps
+        return y, mean, rstd, BLOCK_D
+
+    # pyre-ignore[28]
+    grid = lambda meta: (  # noqa E731
+        triton.cdiv(N, meta["BLOCK_N"]),
+    )
     if learnable:
-        # pyre-ignore[28]
-        _weighted_layer_norm_fwd[(N,)](
+        _weighted_layer_norm_fwd[grid](
             x,
             y,
             weight,
             bias,
             mean,
             rstd,
+            N,
             D,
             eps,
             x.stride(0),
@@ -361,15 +451,14 @@ def triton_weighted_layer_norm_fwd(
             TRAINING=True,
             BLOCK_D=BLOCK_D,
             COMPUTE_MEAN_AND_RSTD=compute_mean_and_rstd,
-            num_warps=num_warps,
         )
     else:
-        # pyre-ignore[28]
-        _layer_norm_fwd[(N,)](
+        _layer_norm_fwd[grid](
             x,
             y,
             mean,
             rstd,
+            N,
             D,
             eps,
             x.stride(0),
@@ -377,9 +466,9 @@ def triton_weighted_layer_norm_fwd(
             TRAINING=True,
             BLOCK_D=BLOCK_D,
             COMPUTE_MEAN_AND_RSTD=compute_mean_and_rstd,
-            num_warps=num_warps,
         )
-    return y, mean, rstd, BLOCK_D, num_warps
+
+    return y, mean, rstd, BLOCK_D
 
 
 def triton_weighted_layer_norm_bwd(
@@ -392,8 +481,8 @@ def triton_weighted_layer_norm_bwd(
     learnable: bool,
     eps: float,
     BLOCK_D: int,
-    num_warps: int,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    num_warps: int = min(max(BLOCK_D // 256, 1), 8)
     if learnable:
         assert weight is not None and bias is not None
         N, D = x.shape
@@ -480,7 +569,7 @@ class LayerNormFunction(torch.autograd.Function):
         bias: Optional[torch.Tensor],
         eps: float,
     ) -> torch.Tensor:
-        y, mean, rstd, BLOCK_D, num_warps = triton_weighted_layer_norm_fwd(
+        y, mean, rstd, BLOCK_D = triton_weighted_layer_norm_fwd(
             x=x,
             weight=weight,
             bias=bias,
@@ -492,7 +581,6 @@ class LayerNormFunction(torch.autograd.Function):
         else:
             ctx.save_for_backward(x, mean, rstd)
         ctx.BLOCK_D = BLOCK_D
-        ctx.num_warps = num_warps
         ctx.eps = eps
         ctx.learnable = learnable
         return y
@@ -517,7 +605,6 @@ class LayerNormFunction(torch.autograd.Function):
             learnable=ctx.learnable,
             eps=ctx.eps,
             BLOCK_D=ctx.BLOCK_D,
-            num_warps=ctx.num_warps,
         )
         return dx, dweight, dbias, None
 
@@ -784,13 +871,17 @@ class SwishLayerNormFunction(torch.autograd.Function):
             return y
 
         # pyre-ignore[28]
-        _weighted_layer_norm_fwd[(N,)](
+        grid = lambda meta: (  # noqa E731
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+        _weighted_layer_norm_fwd[grid](
             x,
             y,
             weight,
             bias,
             mean,
             rstd,
+            N,
             D,
             eps,
             x.stride(0),
@@ -799,7 +890,6 @@ class SwishLayerNormFunction(torch.autograd.Function):
             TRAINING=True,
             BLOCK_D=BLOCK_D,
             COMPUTE_MEAN_AND_RSTD=True,
-            num_warps=num_warps,
         )
 
         return y

@@ -59,7 +59,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         sort_by_length: bool,
         enable_tma: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        normed_x, x_mean, x_rstd, BLOCK_D, num_warps = triton_weighted_layer_norm_fwd(
+        normed_x, x_mean, x_rstd, BLOCK_D = triton_weighted_layer_norm_fwd(
             x=x,
             weight=norm_weight,
             bias=norm_bias,
@@ -131,7 +131,6 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         ctx.uvqk_bias_1d = uvqk_bias.dim() == 1
         ctx.norm_eps = norm_eps
         ctx.norm_BLOCK_D = BLOCK_D
-        ctx.norm_num_warps = num_warps
         ctx.contextual_seq_len = contextual_seq_len
         ctx.sort_by_length = sort_by_length
         ctx.enable_tma = enable_tma
@@ -174,7 +173,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         else:
             num_targets = None
         if ctx.recompute_normed_x_in_backward:
-            normed_x, _, _, _, _ = triton_weighted_layer_norm_fwd(
+            normed_x, _, _, _ = triton_weighted_layer_norm_fwd(
                 x=x,
                 weight=norm_weight,
                 bias=norm_bias,
@@ -267,7 +266,6 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             learnable=True,
             eps=ctx.norm_eps,
             BLOCK_D=ctx.norm_BLOCK_D,
-            num_warps=ctx.norm_num_warps,
         )
         # pyre-ignore[7]
         return (
