@@ -193,9 +193,11 @@ class DLRMv3RandomDataset(Dataset):
         self._max_uih_len: int = (
             self._max_seq_len
             - self._max_num_candidates
-            - len(self._contextual_feature_to_max_length)
-            if self._contextual_feature_to_max_length
-            else 0
+            - (
+                len(self._contextual_feature_to_max_length)
+                if self._contextual_feature_to_max_length
+                else 0
+            )
         )
         self._is_inference = is_inference
 
