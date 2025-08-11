@@ -134,8 +134,18 @@ def pytorch_concat_2D_jagged_jagged(
     max_seq_len_right: int,
     offsets_right: torch.Tensor,
     values_right: torch.Tensor,
-    n_prefix_from_right: int,
+    is_replace: bool = False,
+    n_prefix_from_right: int = 0,
 ) -> torch.Tensor:
+    # is_replace with n_prefix_from_right != 0 is not supported yet (neither in triton)
+    if is_replace:
+        return pytorch_replace_last_n_with_jagged(
+            max_seq_len_left,
+            offsets_left,
+            values_left,
+            offsets_right,
+            values_right,
+        )
     _, D = values_left.shape
     max_seq_len = max_seq_len_left + max_seq_len_right
     B = offsets_left.shape[0] - 1
