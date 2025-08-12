@@ -78,6 +78,7 @@ def jagged_dense_bmm_broadcast_add_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    ELEMENTWISE: tl.constexpr,
 ):
     """
     Computing bmm Out = Jagged x Dense + Bias
@@ -125,9 +126,19 @@ def jagged_dense_bmm_broadcast_add_kernel(
         dn_ptrs += BLOCK_K * stride_dk
 
     if HAS_BIAS:
-        bias_ptrs = Bias + off_b * stride_bias_b + offs_n
-        bias = tl.load(bias_ptrs, mask=offs_n < N)
-        accumulator += bias[None, :].to(tl.float32)
+        if ELEMENTWISE:
+            Bias += seq_start * stride_bias_b
+            bias_ptrs = Bias + offs_m[:, None] * stride_bias_b + offs_n[None, :]
+            bias = tl.load(
+                bias_ptrs,
+                mask=(offs_m[:, None] < seq_len) & (offs_n[None, :] < N),
+                other=0.0,
+            )
+            accumulator += bias.to(tl.float32)
+        else:
+            bias_ptrs = Bias + off_b * stride_bias_b + offs_n
+            bias = tl.load(bias_ptrs, mask=offs_n < N)
+            accumulator += bias[None, :].to(tl.float32)
 
     out = accumulator.to(Out.dtype.element_ty)
 
@@ -277,6 +288,7 @@ class _JaggedDenseBmmFunction(torch.autograd.Function):
             stride_om=bmm_out.stride(0),
             HAS_BIAS=False,
             ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+            ELEMENTWISE=False,
         )
 
         ctx.save_for_backward(seq_offsets, jagged, dense)
@@ -317,6 +329,7 @@ class _JaggedDenseBmmFunction(torch.autograd.Function):
             stride_om=d_jagged.stride(0),
             HAS_BIAS=False,
             ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+            ELEMENTWISE=False,
         )
 
         grid = lambda meta: (  # noqa E731
@@ -521,7 +534,7 @@ class _JaggedDenseBroadcastAddFunction(torch.autograd.Function):
         return None, None, d_out, d_dense
 
 
-class _JaggedDenseBmmBroadcastAddFunction(torch.autograd.Function):
+class _JaggedDenseBmmAddFunction(torch.autograd.Function):
     @staticmethod
     # pyre-ignore[14]
     def forward(
@@ -531,6 +544,7 @@ class _JaggedDenseBmmBroadcastAddFunction(torch.autograd.Function):
         jagged: torch.Tensor,
         dense: torch.Tensor,
         bias: torch.Tensor,
+        elementwise: bool = False,
     ):
         jagged = switch_to_contiguous_if_needed(jagged)
         bias = switch_to_contiguous_if_needed(bias)
@@ -561,6 +575,7 @@ class _JaggedDenseBmmBroadcastAddFunction(torch.autograd.Function):
             stride_om=out.stride(0),
             HAS_BIAS=True,
             ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+            ELEMENTWISE=elementwise,
         )
 
         ctx.save_for_backward(seq_offsets, jagged, dense)
@@ -568,13 +583,14 @@ class _JaggedDenseBmmBroadcastAddFunction(torch.autograd.Function):
         ctx.max_seq_len = max_seq_len
         ctx.K = K
         ctx.N = N
+        ctx.elementwise = elementwise
         return out
 
     @staticmethod
     # pyre-ignore[14]
     def backward(
         ctx, d_out: torch.Tensor
-    ) -> Tuple[None, None, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[None, None, torch.Tensor, torch.Tensor, torch.Tensor, None]:
         seq_offsets, jagged, dense = ctx.saved_tensors
         d_jagged = torch.empty_like(jagged)
         d_dense = torch.empty_like(dense)
@@ -602,6 +618,7 @@ class _JaggedDenseBmmBroadcastAddFunction(torch.autograd.Function):
             stride_om=d_jagged.stride(0),
             HAS_BIAS=False,
             ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+            ELEMENTWISE=False,
         )
 
         grid = lambda meta: (  # noqa E731
@@ -609,12 +626,25 @@ class _JaggedDenseBmmBroadcastAddFunction(torch.autograd.Function):
             triton.cdiv(ctx.K, meta["BLOCK_M"]),
             triton.cdiv(ctx.N, meta["BLOCK_N"]),
         )
+
+        if ctx.elementwise:
+            d_bias = d_out
+            reduce_out = None
+            stride_orb = 0
+            stride_orn = 0
+            reduce_jaggedb = False
+        else:
+            reduce_out = d_bias
+            stride_orb = d_bias.stride(0)
+            stride_orn = d_bias.stride(1)
+            reduce_jaggedb = True
+
         _jagged_jagged_bmm_reduce_sum[grid](
             seq_offsets=seq_offsets,
             JaggedA=jagged,
             JaggedB=d_out,
             Out=d_dense,
-            ReduceOut=d_bias,
+            ReduceOut=reduce_out,
             M=ctx.K,
             N=ctx.N,
             AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(ctx.max_seq_len),
@@ -623,13 +653,13 @@ class _JaggedDenseBmmBroadcastAddFunction(torch.autograd.Function):
             stride_ob=d_dense.stride(0),
             stride_om=d_dense.stride(1),
             stride_on=d_dense.stride(2),
-            stride_orb=d_bias.stride(0),
-            stride_orn=d_bias.stride(1),
-            REDUCE_JAGGEDB=True,
+            stride_orb=stride_orb,
+            stride_orn=stride_orn,
+            REDUCE_JAGGEDB=reduce_jaggedb,
             ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
         )
 
-        return None, None, d_jagged, d_dense, d_bias
+        return None, None, d_jagged, d_dense, d_bias, None
 
 
 @triton.jit
@@ -1245,15 +1275,21 @@ class _Split2DJaggedFunction(torch.autograd.Function):
 
 
 @torch.fx.wrap
-def triton_jagged_dense_bmm_broadcast_add(
+def triton_jagged_dense_bmm_add(
     max_seq_len: int,
     seq_offsets: torch.Tensor,
     jagged: torch.Tensor,
     dense: torch.Tensor,
     bias: torch.Tensor,
+    elementwise: bool = False,
 ) -> torch.Tensor:
-    return _JaggedDenseBmmBroadcastAddFunction.apply(
-        max_seq_len, seq_offsets, jagged, dense, bias
+    """
+    Computing bmm Out = Jagged x Dense + Bias
+    M is the jagged dimension
+    Jagged has shape (sum_B(M_i), K), Dense has shape (B, K, N), Bias has shape (B, N) or (sum_B(M_i), N) depending on Elementwise, and Out has shape (sum_B(M_i), N)
+    """
+    return _JaggedDenseBmmAddFunction.apply(
+        max_seq_len, seq_offsets, jagged, dense, bias, elementwise
     )
 
 

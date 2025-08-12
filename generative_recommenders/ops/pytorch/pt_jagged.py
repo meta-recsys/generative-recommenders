@@ -74,12 +74,13 @@ def pytorch_jagged_dense_broadcast_add(
     return jagged_out
 
 
-def pytorch_jagged_dense_bmm_broadcast_add(
+def pytorch_jagged_dense_bmm_add(
     max_seq_len: int,
     seq_offsets: torch.Tensor,
     jagged: torch.Tensor,
     dense: torch.Tensor,
     bias: torch.Tensor,
+    elementwise: bool = False,
 ) -> torch.Tensor:
     dtype = jagged.dtype
     jagged = jagged.to(torch.float32)
@@ -91,9 +92,19 @@ def pytorch_jagged_dense_bmm_broadcast_add(
         padding_value=0.0,
     )
     bmm_out = torch.bmm(padded_jagged, dense)
-    jagged_out = torch.ops.fbgemm.dense_to_jagged(
-        bmm_out + bias.unsqueeze(1), [seq_offsets], total_L=jagged.shape[0]
-    )[0]
+
+    if elementwise:
+        jagged_out = (
+            torch.ops.fbgemm.dense_to_jagged(
+                bmm_out, [seq_offsets], total_L=jagged.shape[0]
+            )[0]
+            + bias
+        )
+    else:
+        jagged_out = torch.ops.fbgemm.dense_to_jagged(
+            bmm_out + bias.unsqueeze(1), [seq_offsets], total_L=jagged.shape[0]
+        )[0]
+
     jagged_out = jagged_out.to(dtype)
     return jagged_out
 

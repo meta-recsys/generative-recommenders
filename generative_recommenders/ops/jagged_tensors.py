@@ -21,9 +21,7 @@ from typing import Optional, Tuple
 import torch
 
 from generative_recommenders.common import HammerKernel
-from generative_recommenders.ops.pytorch.pt_jagged import (
-    pytorch_jagged_dense_bmm_broadcast_add,
-)
+from generative_recommenders.ops.pytorch.pt_jagged import pytorch_jagged_dense_bmm_add
 from generative_recommenders.ops.pytorch.pt_jagged_tensors import (
     pytorch_concat_2D_jagged,
     pytorch_hstu_concat_l2_embeddings,
@@ -31,9 +29,7 @@ from generative_recommenders.ops.pytorch.pt_jagged_tensors import (
     pytorch_split_2D_jagged,
 )
 
-from generative_recommenders.ops.triton.triton_jagged import (
-    triton_jagged_dense_bmm_broadcast_add,
-)
+from generative_recommenders.ops.triton.triton_jagged import triton_jagged_dense_bmm_add
 from generative_recommenders.ops.triton.triton_jagged_tensors import (
     triton_concat_2D_jagged,
     triton_split_2D_jagged,
@@ -228,12 +224,13 @@ def jagged_dense_bmm_broadcast_add(
         torch._assert(bias.shape[0] == B, "wrong bias shape[0]")
         torch._assert(bias.shape[1] == N, "wrong bias shape[1]")
     if kernel == HammerKernel.TRITON:
-        return triton_jagged_dense_bmm_broadcast_add(
+        return triton_jagged_dense_bmm_add(
             max_seq_len=max_seq_len,
             seq_offsets=seq_offsets,
             jagged=jagged,
             dense=dense,
             bias=bias,
+            elementwise=False,
         )
     elif kernel == HammerKernel.TRITON_CC:
         return triton_cc_jagged_dense_bmm(
@@ -244,7 +241,7 @@ def jagged_dense_bmm_broadcast_add(
             bias=bias,
         )
     else:
-        return pytorch_jagged_dense_bmm_broadcast_add(
+        return pytorch_jagged_dense_bmm_add(
             max_seq_len=max_seq_len,
             seq_offsets=seq_offsets,
             jagged=jagged,
