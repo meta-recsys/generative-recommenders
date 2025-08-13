@@ -88,11 +88,13 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         if fp8_in_addmm_fwd:
             assert x_scale is not None and normed_x_fp8 is not None
             uvqk = fp8_rowwise_quantize_addmm(
+                x=normed_x,
                 x_fp8=normed_x_fp8,
                 w=uvqk_weight,
                 y=uvqk_bias,
                 x_scale=x_scale,
                 custom_kernel=False,
+                is_inference=False,
             ).contiguous()
         else:
             uvqk = triton_addmm_fwd(x=normed_x, w=uvqk_weight, y=uvqk_bias).contiguous()
@@ -240,11 +242,13 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             if ctx.fp8_in_addmm_fwd:
                 x_scale, normed_x_fp8 = ctx.saved_tensors[idx : idx + 2]
                 uvqk = fp8_rowwise_quantize_addmm(
+                    x=normed_x,
                     x_fp8=normed_x_fp8,
                     w=uvqk_weight,
                     y=uvqk_bias,
                     x_scale=x_scale,
                     custom_kernel=False,
+                    is_inference=False,
                 )
                 idx += 2
             else:
