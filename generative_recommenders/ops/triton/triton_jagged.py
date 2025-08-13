@@ -35,9 +35,9 @@ from generative_recommenders.common import (
 def _get_bmm_configs() -> List[triton.Config]:
     configs = []
     for BLOCK_M in [64, 128]:
-        for BLOCK_N in [64, 128]:
+        for BLOCK_N in [64, 128, 256]:
             for BLOCK_K in [32, 64]:
-                for num_stages in [2, 3]:
+                for num_stages in [3, 5]:
                     for num_warps in [4, 8]:
                         configs.append(
                             triton.Config(
@@ -137,8 +137,29 @@ def jagged_dense_bmm_broadcast_add_kernel(
     tl.store(out_ptrs, out, mask=(offs_m[:, None] < seq_len) & (offs_n[None, :] < N))
 
 
+def _get_bmm_reduce_sum_configs() -> List[triton.Config]:
+    configs = []
+    for BLOCK_M in [64, 128]:
+        for BLOCK_N in [64, 128]:
+            for BLOCK_K in [64, 128]:
+                for num_stages in [3, 4]:
+                    for num_warps in [4, 8]:
+                        configs.append(
+                            triton.Config(
+                                {
+                                    "BLOCK_M": BLOCK_M,
+                                    "BLOCK_N": BLOCK_N,
+                                    "BLOCK_K": BLOCK_K,
+                                },
+                                num_stages=num_stages,
+                                num_warps=num_warps,
+                            )
+                        )
+    return configs
+
+
 @triton_autotune(
-    configs=_get_bmm_configs(),
+    configs=_get_bmm_reduce_sum_configs(),
     key=["M", "N", "AUTOTUNE_MAX_SEQ_LEN"],
 )
 @triton.jit
@@ -170,9 +191,9 @@ def _jagged_jagged_bmm_reduce_sum(
     JaggedA has shape (sum_B(K_i), M), JaggedB has shape (sum_B(K_i), N), and Out has shape (B, M, N)
     """
 
-    off_b = tl.program_id(0)
-    off_m = tl.program_id(1)
-    off_n = tl.program_id(2)
+    off_m = tl.program_id(0)
+    off_n = tl.program_id(1)
+    off_b = tl.program_id(2)
 
     seq_start = tl.load(seq_offsets + off_b).to(tl.int64)
     seq_end = tl.load(seq_offsets + off_b + 1)
@@ -320,9 +341,9 @@ class _JaggedDenseBmmFunction(torch.autograd.Function):
         )
 
         grid = lambda meta: (  # noqa E731
-            ctx.B,
             triton.cdiv(ctx.D, meta["BLOCK_M"]),
             triton.cdiv(ctx.K, meta["BLOCK_N"]),
+            ctx.B,
         )
         _jagged_jagged_bmm_reduce_sum[grid](
             seq_offsets=seq_offsets,
@@ -605,9 +626,9 @@ class _JaggedDenseBmmBroadcastAddFunction(torch.autograd.Function):
         )
 
         grid = lambda meta: (  # noqa E731
-            ctx.B,
             triton.cdiv(ctx.K, meta["BLOCK_M"]),
             triton.cdiv(ctx.N, meta["BLOCK_N"]),
+            ctx.B,
         )
         _jagged_jagged_bmm_reduce_sum[grid](
             seq_offsets=seq_offsets,
