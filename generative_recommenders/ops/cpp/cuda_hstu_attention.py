@@ -17,6 +17,7 @@
 from typing import Optional
 
 import torch
+from generative_recommenders.ops.utils import is_sm100
 
 try:
     # We need to import the CUDA kernels after importing torch
@@ -24,6 +25,9 @@ try:
 except:
     pass
 try:
+    torch.ops.load_library(
+        "//generative_recommenders/fb/ultra/ops/blackwell/hstu_attention:hstu_flash_attention"
+    )
     torch.ops.load_library(
         "//generative_recommenders/ops/cpp/hstu_attention:hstu_flash_attention"
     )
@@ -59,27 +63,48 @@ def cuda_hstu_mha(
     Arguments:
         q, k, v: (batch_size, seqlen, nheads, headdim) or (total_seqlen, nheads, headdim)
     """
-    return torch.ops.hstu.hstu_mha(
-        max_seq_len,
-        alpha,
-        q,
-        k,
-        v,
-        seq_offsets,
-        causal,
-        num_targets,
-        attn_scale,
-        max_attn_len,
-        min_full_attn_seq_len,
-        contextual_seq_len,
-        q_descale,
-        k_descale,
-        v_descale,
-        sort_by_length,
-        deterministic,
-        sm_margin,
-        max_q_len,
-        seq_offsets_q,
-        num_softmax_heads,
-        training,
-    )
+    if is_sm100():
+        return torch.ops.bw_hstu.bw_hstu_mha(
+            max_seq_len,
+            alpha,
+            q,
+            k,
+            v,
+            seq_offsets,
+            causal,
+            num_targets,
+            max_attn_len,
+            min_full_attn_seq_len,
+            contextual_seq_len,
+            q_descale,
+            k_descale,
+            v_descale,
+            sort_by_length,
+            deterministic,
+            sm_margin,
+        )
+    else:
+        return torch.ops.hstu.hstu_mha(
+            max_seq_len,
+            alpha,
+            q,
+            k,
+            v,
+            seq_offsets,
+            causal,
+            num_targets,
+            attn_scale,
+            max_attn_len,
+            min_full_attn_seq_len,
+            contextual_seq_len,
+            q_descale,
+            k_descale,
+            v_descale,
+            sort_by_length,
+            deterministic,
+            sm_margin,
+            max_q_len,
+            seq_offsets_q,
+            num_softmax_heads,
+            training,
+        )

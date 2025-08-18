@@ -27,13 +27,16 @@ try:
     from generative_recommenders.fb.ultra.ops.fp8.layer_norm_quantization import (
         triton_weighted_layer_norm_quantization_fwd,
     )
+
+    torch.ops.load_library(
+        "//generative_recommenders/fb/ultra/ops/blackwell/hstu_attention:hstu_flash_attention"
+    )
+    torch.ops.load_library(
+        "//generative_recommenders/ops/cpp/hstu_attention:hstu_flash_attention"
+    )
 except ImportError:
     pass
 
-
-torch.ops.load_library(
-    "//generative_recommenders/ops/cpp/hstu_attention:hstu_flash_attention"
-)
 
 from generative_recommenders.ops.triton.triton_addmm import (
     triton_addmm_bwd,
@@ -42,6 +45,7 @@ from generative_recommenders.ops.triton.triton_addmm import (
 from generative_recommenders.ops.triton.triton_layer_norm import (
     triton_weighted_layer_norm_bwd,
 )
+from generative_recommenders.ops.utils import is_sm100
 from torch.nn import functional as F
 
 
@@ -114,24 +118,43 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             u = F.silu(u)
         elif recompute_uvqk_in_backward:
             u = u.clone()  # otherwise the whole uvqk will be saved
-        out, _ = torch.ops.hstu.hstu_mha_fwd(
-            max_seq_len,
-            alpha,
-            q,
-            k,
-            v,
-            seq_offsets,
-            True,  # causal
-            num_targets,
-            attn_scale,
-            max_attn_len,
-            full_attn_size,
-            contextual_seq_len,
-            None,  # q_descale
-            None,  # k_descale
-            None,  # v_descale
-            0,  # sm_margin
-        )
+        if is_sm100():
+            out = torch.ops.bw_hstu.bw_hstu_mha_fwd(
+                max_seq_len,
+                alpha,
+                q,
+                k,
+                v,
+                seq_offsets,
+                True,  # causal
+                num_targets,
+                max_attn_len,
+                full_attn_size,
+                contextual_seq_len,
+                None,  # q_descale
+                None,  # k_descale
+                None,  # v_descale
+                0,  # sm_margin
+            )
+        else:
+            out, _ = torch.ops.hstu.hstu_mha_fwd(
+                max_seq_len,
+                alpha,
+                q,
+                k,
+                v,
+                seq_offsets,
+                True,  # causal
+                num_targets,
+                attn_scale,
+                max_attn_len,
+                full_attn_size,
+                contextual_seq_len,
+                None,  # q_descale
+                None,  # k_descale
+                None,  # v_descale
+                0,  # sm_margin
+            )
         # update ctx
         saved_tensors = [
             x,
@@ -283,28 +306,50 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         dk = dk.view(-1, ctx.num_heads, ctx.attn_dim)
         dv = dv.view(-1, ctx.num_heads, ctx.hidden_dim)
         # Note: the two operations below update duvqk in place
-        _dq, _dk, _dv = torch.ops.hstu.hstu_mha_bwd(
-            ctx.max_seq_len,
-            ctx.alpha,
-            dout,
-            q,
-            k,
-            v,
-            dq,
-            dk,
-            dv,
-            out,
-            seq_offsets,
-            True,  # causal
-            num_targets,
-            attn_scale,
-            ctx.max_attn_len,
-            ctx.full_attn_size,
-            ctx.contextual_seq_len,
-            ctx.sort_by_length,
-            False,  # deterministic
-            0,  # sm_margin
-        )
+        if is_sm100():
+            _dq, _dk, _dv = torch.ops.bw_hstu.bw_hstu_mha_bwd(
+                ctx.max_seq_len,
+                ctx.alpha,
+                dout,
+                q,
+                k,
+                v,
+                dq,
+                dk,
+                dv,
+                seq_offsets,
+                True,  # causal
+                num_targets,
+                ctx.max_attn_len,
+                ctx.full_attn_size,
+                ctx.contextual_seq_len,
+                ctx.sort_by_length,
+                False,  # deterministic
+                0,  # sm_margin
+            )
+        else:
+            _dq, _dk, _dv = torch.ops.hstu.hstu_mha_bwd(
+                ctx.max_seq_len,
+                ctx.alpha,
+                dout,
+                q,
+                k,
+                v,
+                dq,
+                dk,
+                dv,
+                out,
+                seq_offsets,
+                True,  # causal
+                num_targets,
+                attn_scale,
+                ctx.max_attn_len,
+                ctx.full_attn_size,
+                ctx.contextual_seq_len,
+                ctx.sort_by_length,
+                False,  # deterministic
+                0,  # sm_margin
+            )
         if dq.data_ptr() != _dq.data_ptr():
             dq.copy_(_dq)
         if dk.data_ptr() != _dk.data_ptr():
