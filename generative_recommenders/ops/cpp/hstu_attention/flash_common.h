@@ -106,7 +106,13 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd(
     int64_t max_q_len = 0,
     const std::optional<at::Tensor>& seq_offsets_q = std::nullopt,
     int64_t num_softmax_heads = 0,
-    bool training = true);
+    bool training = true,
+    const std::optional<at::Tensor>& max_seq_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& contextual_seq_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& max_attn_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
+        std::nullopt,
+    int64_t num_groups = 1);
 
 std::vector<at::Tensor> hstu_mha_bwd(
     int64_t max_seq_len,
@@ -132,7 +138,13 @@ std::vector<at::Tensor> hstu_mha_bwd(
     int64_t max_q_len = 0,
     const std::optional<at::Tensor>& seq_offsets_q = std::nullopt,
     int64_t num_softmax_heads = 0,
-    const std::optional<at::Tensor>& softmax_lse = std::nullopt);
+    const std::optional<at::Tensor>& softmax_lse = std::nullopt,
+    const std::optional<at::Tensor>& max_seq_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& contextual_seq_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& max_attn_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
+        std::nullopt,
+    int64_t num_groups = 1);
 
 std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd_dummy(
     int64_t max_seq_len,
@@ -154,7 +166,13 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd_dummy(
     int64_t max_q_len = 0,
     const std::optional<at::Tensor>& seq_offsets_q = std::nullopt,
     int64_t num_softmax_heads = 0,
-    bool training = true);
+    bool training = true,
+    const std::optional<at::Tensor>& max_seq_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& contextual_seq_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& max_attn_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
+        std::nullopt,
+    int64_t num_groups = 1);
 
 std::vector<at::Tensor> hstu_mha_bwd_dummy(
     int64_t max_seq_len,
@@ -180,7 +198,13 @@ std::vector<at::Tensor> hstu_mha_bwd_dummy(
     int64_t max_q_len = 0,
     const std::optional<at::Tensor>& seq_offsets_q = std::nullopt,
     int64_t num_softmax_heads = 0,
-    const std::optional<at::Tensor>& softmax_lse = std::nullopt);
+    const std::optional<at::Tensor>& softmax_lse = std::nullopt,
+    const std::optional<at::Tensor>& max_seq_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& contextual_seq_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& max_attn_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
+        std::nullopt,
+    int64_t num_groups = 1);
 
 std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd_meta(
     const at::SymInt max_seq_len,
@@ -202,5 +226,11 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd_meta(
     int64_t max_q_len = 0,
     const std::optional<at::Tensor>& seq_offsets_q = std::nullopt,
     int64_t num_softmax_heads = 0,
-    bool training = true);
+    bool training = true,
+    const std::optional<at::Tensor>& max_seq_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& contextual_seq_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& max_attn_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
+        std::nullopt,
+    int64_t num_groups = 1);
 } // namespace hstu

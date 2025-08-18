@@ -504,10 +504,16 @@ struct CollectiveMainloopBwdSm90 {
     float const alpha;
     int const num_batch;
     int const num_softmax_heads;
+    int const num_groups;
+    int const batch_size_per_group;
     int* const dq_semaphore;
     int const* const seq_offsets = nullptr;
     int const* const seq_offsets_q = nullptr;
     int const* const num_targets = nullptr;
+    int const* const max_seq_len_tensor = nullptr;
+    int const* const contextual_seq_len_tensor = nullptr;
+    int const* const max_attn_len_tensor = nullptr;
+    int const* const min_full_attn_seq_len_tensor = nullptr;
     float const* const attn_scale = nullptr;
     bool const scalar_scale = true;
   };
@@ -537,10 +543,16 @@ struct CollectiveMainloopBwdSm90 {
     float const alpha_log2;
     int const num_batch;
     int const num_softmax_heads;
+    int const num_groups;
+    int const batch_size_per_group;
     int* const dq_semaphore;
     int const* const seq_offsets = nullptr;
     int const* const seq_offsets_q = nullptr;
     int const* const num_targets;
+    int const* const max_seq_len_tensor = nullptr;
+    int const* const contextual_seq_len_tensor = nullptr;
+    int const* const max_attn_len_tensor = nullptr;
+    int const* const min_full_attn_seq_len_tensor = nullptr;
     float const* const attn_scale;
     bool const scalar_scale = true;
   };
@@ -606,10 +618,16 @@ struct CollectiveMainloopBwdSm90 {
         float(args.alpha * M_LOG2E),
         args.num_batch,
         args.num_softmax_heads,
+        args.num_groups,
+        args.batch_size_per_group,
         args.dq_semaphore,
         args.seq_offsets,
         args.seq_offsets_q,
         args.num_targets,
+        args.max_seq_len_tensor,
+        args.contextual_seq_len_tensor,
+        args.max_attn_len_tensor,
+        args.min_full_attn_seq_len_tensor,
         args.attn_scale,
         args.scalar_scale};
   }
@@ -800,6 +818,17 @@ struct CollectiveMainloopBwdSm90 {
         return;
       }
     }
+    int min_full_attn_seq_len_, max_attn_len_, contextual_seq_len_;
+    if (params.num_groups > 1) {
+      int group_id = bidb / params.batch_size_per_group;
+      min_full_attn_seq_len_ = params.min_full_attn_seq_len_tensor[group_id];
+      max_attn_len_ = params.max_attn_len_tensor[group_id];
+      contextual_seq_len_ = params.contextual_seq_len_tensor[group_id];
+    } else {
+      min_full_attn_seq_len_ = params.min_full_attn_seq_len;
+      max_attn_len_ = params.max_attn_len;
+      contextual_seq_len_ = params.contextual_seq_len;
+    }
     int m_block_min, m_block_max;
     if constexpr (Cross) {
       auto m_block_min_max = get_cross_m_block_min_max(
@@ -811,8 +840,8 @@ struct CollectiveMainloopBwdSm90 {
       m_block_max = get<1>(m_block_min_max);
     } else {
       auto m_block_min_max = get_m_block_min_max(
-          params.max_attn_len,
-          params.contextual_seq_len,
+          max_attn_len_,
+          contextual_seq_len_,
           seqlen_info.uihlen_q,
           seqlen_info.seqlen_q,
           n_block);
@@ -822,13 +851,13 @@ struct CollectiveMainloopBwdSm90 {
     auto full_m_block_min_max = get_full_m_block_min_max(
         seqlen_info.uihlen_q,
         seqlen_info.seqlen_q,
-        params.min_full_attn_seq_len,
+        min_full_attn_seq_len_,
         m_block_max,
         n_block);
     int const full_m_block_min = get<0>(full_m_block_min_max);
     int const full_m_block_max = get<1>(full_m_block_min_max);
     int contexual_m_block_max = get_contexual_m_block_max(
-        seqlen_info.uihlen_q, params.contextual_seq_len, m_block_min, n_block);
+        seqlen_info.uihlen_q, contextual_seq_len_, m_block_min, n_block);
 
     Tensor sQ = make_tensor(
         make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()),
@@ -1134,6 +1163,17 @@ struct CollectiveMainloopBwdSm90 {
         return;
       }
     }
+    int min_full_attn_seq_len_, max_attn_len_, contextual_seq_len_;
+    if (params.num_groups > 1) {
+      int group_id = bidb / params.batch_size_per_group;
+      min_full_attn_seq_len_ = params.min_full_attn_seq_len_tensor[group_id];
+      max_attn_len_ = params.max_attn_len_tensor[group_id];
+      contextual_seq_len_ = params.contextual_seq_len_tensor[group_id];
+    } else {
+      min_full_attn_seq_len_ = params.min_full_attn_seq_len;
+      max_attn_len_ = params.max_attn_len;
+      contextual_seq_len_ = params.contextual_seq_len;
+    }
     int m_block_min, m_block_max;
     if constexpr (Cross) {
       auto m_block_min_max = get_cross_m_block_min_max(
@@ -1145,8 +1185,8 @@ struct CollectiveMainloopBwdSm90 {
       m_block_max = get<1>(m_block_min_max);
     } else {
       auto m_block_min_max = get_m_block_min_max(
-          params.max_attn_len,
-          params.contextual_seq_len,
+          max_attn_len_,
+          contextual_seq_len_,
           seqlen_info.uihlen_q,
           seqlen_info.seqlen_q,
           n_block);
@@ -1156,13 +1196,13 @@ struct CollectiveMainloopBwdSm90 {
     auto full_m_block_min_max = get_full_m_block_min_max(
         seqlen_info.uihlen_q,
         seqlen_info.seqlen_q,
-        params.min_full_attn_seq_len,
+        min_full_attn_seq_len_,
         m_block_max,
         n_block);
     int const full_m_block_min = get<0>(full_m_block_min_max);
     int const full_m_block_max = get<1>(full_m_block_min_max);
     int contexual_m_block_max = get_contexual_m_block_max(
-        seqlen_info.uihlen_q, params.contextual_seq_len, m_block_min, n_block);
+        seqlen_info.uihlen_q, contextual_seq_len_, m_block_min, n_block);
 
     Tensor sdQ = make_tensor(
         make_smem_ptr(shared_storage.tensors.mainloop.smem_dqacc.data()),
@@ -1316,6 +1356,29 @@ struct CollectiveMainloopBwdSm90 {
         return false;
       }
     }
+    int min_full_attn_seq_len_, max_attn_len_, contextual_seq_len_;
+    float scalar_scale_val_;
+    if (params.num_groups > 1) {
+      int group_id = bidb / params.batch_size_per_group;
+      min_full_attn_seq_len_ = params.min_full_attn_seq_len_tensor[group_id];
+      max_attn_len_ = params.max_attn_len_tensor[group_id];
+      contextual_seq_len_ = params.contextual_seq_len_tensor[group_id];
+      int max_seq_len_per_group = params.max_seq_len_tensor[group_id];
+      // attention scale
+      scalar_scale_val_ = params.scalar_scale
+          ? (params.attn_scale == nullptr ? 1.0f / max_seq_len_per_group
+                                          : params.attn_scale[group_id])
+          : 0;
+    } else {
+      min_full_attn_seq_len_ = params.min_full_attn_seq_len;
+      max_attn_len_ = params.max_attn_len;
+      contextual_seq_len_ = params.contextual_seq_len;
+      // attention scale
+      scalar_scale_val_ = params.scalar_scale
+          ? (params.attn_scale == nullptr ? params.max_seq_len_inv
+                                          : params.attn_scale[0])
+          : 0;
+    }
     int m_block_min, m_block_max;
     if constexpr (Cross) {
       auto m_block_min_max = get_cross_m_block_min_max(
@@ -1327,8 +1390,8 @@ struct CollectiveMainloopBwdSm90 {
       m_block_max = get<1>(m_block_min_max);
     } else {
       auto m_block_min_max = get_m_block_min_max(
-          params.max_attn_len,
-          params.contextual_seq_len,
+          max_attn_len_,
+          contextual_seq_len_,
           seqlen_info.uihlen_q,
           seqlen_info.seqlen_q,
           n_block);
@@ -1338,13 +1401,13 @@ struct CollectiveMainloopBwdSm90 {
     auto full_m_block_min_max = get_full_m_block_min_max(
         seqlen_info.uihlen_q,
         seqlen_info.seqlen_q,
-        params.min_full_attn_seq_len,
+        min_full_attn_seq_len_,
         m_block_max,
         n_block);
     int const full_m_block_min = get<0>(full_m_block_min_max);
     int const full_m_block_max = get<1>(full_m_block_min_max);
     int contexual_m_block_max = get_contexual_m_block_max(
-        seqlen_info.uihlen_q, params.contextual_seq_len, m_block_min, n_block);
+        seqlen_info.uihlen_q, contextual_seq_len_, m_block_min, n_block);
 
     Tensor sQ = make_tensor(
         make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()),
@@ -1490,9 +1553,9 @@ struct CollectiveMainloopBwdSm90 {
         thread_idx,
         seqlen_info.seqlen_q,
         seqlen_info.seqlen_kv,
-        params.max_attn_len,
-        params.min_full_attn_seq_len,
-        params.contextual_seq_len,
+        max_attn_len_,
+        min_full_attn_seq_len_,
+        contextual_seq_len_,
         seqlen_info.uihlen_q);
 
     int m_block = m_block_min;
@@ -1516,11 +1579,6 @@ struct CollectiveMainloopBwdSm90 {
           cute::as_position_independent_swizzle_tensor(sV));
       cute::copy(smem_tiled_copy_V, tdPsV_copy_view, tdPrV_copy_view);
     }
-    // attention scale
-    float scalar_scale_val = params.scalar_scale
-        ? (params.attn_scale == nullptr ? params.max_seq_len_inv
-                                        : params.attn_scale[0])
-        : 0;
     static constexpr int Qdim = !SdP_swapAB ? 0 : 1;
     auto thread0_mma_SdP = tiled_mma_SdP.get_thread_slice(_0{});
     Tensor cS =
@@ -1578,7 +1636,7 @@ struct CollectiveMainloopBwdSm90 {
       mask_fn(tSrS, m_block);
 #pragma unroll
       for (int mi = 0; mi < size<0>(scores); ++mi) {
-        float scale = scalar_scale_val;
+        float scale = scalar_scale_val_;
         if (!params.scalar_scale) {
           int q_index = qdim_offset + int(get<Qdim>(t0ScS_rowcol(mi, _0{})));
           if (q_index < seqlen_info.seqlen_q) {
@@ -1601,7 +1659,7 @@ struct CollectiveMainloopBwdSm90 {
       Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
 #pragma unroll
       for (int mi = 0; mi < size<0>(dS); ++mi) {
-        float scale = scalar_scale_val;
+        float scale = scalar_scale_val_;
         if (!params.scalar_scale) {
           int q_index = qdim_offset + int(get<Qdim>(t0ScS_rowcol(mi, _0{})));
           if (q_index < seqlen_info.seqlen_q) {
@@ -1959,8 +2017,7 @@ struct CollectiveMainloopBwdSm90 {
               !Local || !SeparateMaskingIterations
               ? m_block_max
               : std::min(
-                    m_block_max,
-                    (n_block * kBlockN + params.max_attn_len) / kBlockM);
+                    m_block_max, (n_block * kBlockN + max_attn_len_) / kBlockM);
           CUTLASS_PRAGMA_NO_UNROLL
           for (; m_block < m_block_max_before_local_mask; ++m_block) {
             bwd_step(m_block, mask_fn);
@@ -2083,8 +2140,7 @@ struct CollectiveMainloopBwdSm90 {
           !Local || !SeparateMaskingIterations
           ? m_block_max
           : std::min(
-                m_block_max,
-                (n_block * kBlockN + params.max_attn_len) / kBlockM);
+                m_block_max, (n_block * kBlockN + max_attn_len_) / kBlockM);
       CUTLASS_PRAGMA_NO_UNROLL
       for (; m_block < m_block_max_before_local_mask; ++m_block) {
         bwd_step(m_block, mask_fn);
@@ -2199,6 +2255,17 @@ struct CollectiveMainloopBwdSm90 {
         return false;
       }
     }
+    int min_full_attn_seq_len_, max_attn_len_, contextual_seq_len_;
+    if (params.num_groups > 1) {
+      int group_id = bidb / params.num_groups;
+      min_full_attn_seq_len_ = params.min_full_attn_seq_len_tensor[group_id];
+      max_attn_len_ = params.max_attn_len_tensor[group_id];
+      contextual_seq_len_ = params.contextual_seq_len_tensor[group_id];
+    } else {
+      min_full_attn_seq_len_ = params.min_full_attn_seq_len;
+      max_attn_len_ = params.max_attn_len;
+      contextual_seq_len_ = params.contextual_seq_len;
+    }
     int m_block_min, m_block_max;
     if constexpr (Cross) {
       auto m_block_min_max = get_cross_m_block_min_max(
@@ -2210,8 +2277,8 @@ struct CollectiveMainloopBwdSm90 {
       m_block_max = get<1>(m_block_min_max);
     } else {
       auto m_block_min_max = get_m_block_min_max(
-          params.max_attn_len,
-          params.contextual_seq_len,
+          max_attn_len_,
+          contextual_seq_len_,
           seqlen_info.uihlen_q,
           seqlen_info.seqlen_q,
           n_block);
@@ -2221,13 +2288,13 @@ struct CollectiveMainloopBwdSm90 {
     auto full_m_block_min_max = get_full_m_block_min_max(
         seqlen_info.uihlen_q,
         seqlen_info.seqlen_q,
-        params.min_full_attn_seq_len,
+        min_full_attn_seq_len_,
         m_block_max,
         n_block);
     int const full_m_block_min = get<0>(full_m_block_min_max);
     int const full_m_block_max = get<1>(full_m_block_min_max);
     int contexual_m_block_max = get_contexual_m_block_max(
-        seqlen_info.uihlen_q, params.contextual_seq_len, m_block_min, n_block);
+        seqlen_info.uihlen_q, contextual_seq_len_, m_block_min, n_block);
 
     Tensor sQ = make_tensor(
         make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()),
@@ -2398,9 +2465,9 @@ struct CollectiveMainloopBwdSm90 {
         thread_idx,
         seqlen_info.seqlen_q,
         seqlen_info.seqlen_kv,
-        params.max_attn_len,
-        params.min_full_attn_seq_len,
-        params.contextual_seq_len,
+        max_attn_len_,
+        min_full_attn_seq_len_,
+        contextual_seq_len_,
         seqlen_info.uihlen_q);
 
     int m_block = m_block_min;
@@ -2871,8 +2938,7 @@ struct CollectiveMainloopBwdSm90 {
               !Local || !SeparateMaskingIterations
               ? m_block_max
               : std::min(
-                    m_block_max,
-                    (n_block * kBlockN + params.max_attn_len) / kBlockM);
+                    m_block_max, (n_block * kBlockN + max_attn_len_) / kBlockM);
           CUTLASS_PRAGMA_NO_UNROLL
           for (; m_block < m_block_max_before_local_mask; ++m_block) {
             bwd_step(m_block, mask_fn);
@@ -2995,8 +3061,7 @@ struct CollectiveMainloopBwdSm90 {
           !Local || !SeparateMaskingIterations
           ? m_block_max
           : std::min(
-                m_block_max,
-                (n_block * kBlockN + params.max_attn_len) / kBlockM);
+                m_block_max, (n_block * kBlockN + max_attn_len_) / kBlockM);
       CUTLASS_PRAGMA_NO_UNROLL
       for (; m_block < m_block_max_before_local_mask; ++m_block) {
         bwd_step(m_block, mask_fn);

@@ -58,6 +58,11 @@ def cuda_hstu_mha(
     seq_offsets_q: Optional[torch.Tensor] = None,
     num_softmax_heads: int = 0,
     training: bool = True,
+    max_seq_len_tensor: Optional[torch.Tensor] = None,
+    contextual_seq_len_tensor: Optional[torch.Tensor] = None,
+    max_attn_len_tensor: Optional[torch.Tensor] = None,
+    min_full_attn_seq_len_tensor: Optional[torch.Tensor] = None,
+    num_groups: int = 1,
 ) -> torch.Tensor:
     """
     Arguments:
@@ -107,4 +112,9 @@ def cuda_hstu_mha(
             seq_offsets_q,
             num_softmax_heads,
             training,
+            max_seq_len_tensor,
+            contextual_seq_len_tensor,
+            max_attn_len_tensor,
+            min_full_attn_seq_len_tensor,
+            num_groups,
         )

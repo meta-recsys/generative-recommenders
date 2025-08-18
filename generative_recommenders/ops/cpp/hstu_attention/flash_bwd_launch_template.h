@@ -254,10 +254,16 @@ void run_flash_bwd(hstu::Flash_bwd_params& params, cudaStream_t stream) {
       params.alpha,
       params.b,
       params.num_softmax_heads,
+      params.num_groups,
+      params.batch_size_per_group,
       params.dq_semaphore,
       params.seq_offsets,
       params.seq_offsets_q,
       params.num_targets,
+      params.max_seq_len_tensor,
+      params.contextual_seq_len_tensor,
+      params.max_attn_len_tensor,
+      params.min_full_attn_seq_len_tensor,
       params.attn_scale,
       params.scalar_scale};
   typename CollectiveEpilogue::Arguments epilogue_args{

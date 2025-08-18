@@ -71,6 +71,13 @@ struct Flash_fwd_params : public Qkv_params {
   // The dimensions.
   int b, max_kv_len, max_q_len, qk_d, v_d, total_seq_len_q, total_seq_len_kv;
 
+  // groups
+  int num_groups, batch_size_per_group;
+  int* __restrict__ max_seq_len_tensor;
+  int* __restrict__ contextual_seq_len_tensor;
+  int* __restrict__ max_attn_len_tensor;
+  int* __restrict__ min_full_attn_seq_len_tensor;
+
   // The scaling factors for the kernel.
   float alpha;
 

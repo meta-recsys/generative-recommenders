@@ -74,7 +74,13 @@ class HSTUFlashAttentionFunctionGPU
       int64_t max_q_len,
       const std::optional<at::Tensor>& seq_offsets_q,
       int64_t num_softmax_heads,
-      bool training) {
+      bool training,
+      const std::optional<at::Tensor>& max_seq_len_tensor = std::nullopt,
+      const std::optional<at::Tensor>& contextual_seq_len_tensor = std::nullopt,
+      const std::optional<at::Tensor>& max_attn_len_tensor = std::nullopt,
+      const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
+          std::nullopt,
+      int64_t num_groups = 1) {
     ctx->saved_data["max_seq_len"] = max_seq_len;
     ctx->saved_data["alpha"] = alpha;
     ctx->saved_data["causal"] = causal;
@@ -86,6 +92,7 @@ class HSTUFlashAttentionFunctionGPU
     ctx->saved_data["sm_margin"] = sm_margin;
     ctx->saved_data["max_q_len"] = max_q_len;
     ctx->saved_data["num_softmax_heads"] = num_softmax_heads;
+    ctx->saved_data["num_groups"] = num_groups;
     auto fwd_out = hstu::hstu_mha_fwd(
         max_seq_len, // max_seq_len
         alpha, // alpha
@@ -106,7 +113,11 @@ class HSTUFlashAttentionFunctionGPU
         max_q_len, // max_q_len
         seq_offsets_q, // seq_offsets_q
         num_softmax_heads, // num_softmax_heads
-        training);
+        training,
+        max_seq_len_tensor,
+        contextual_seq_len_tensor,
+        max_attn_len_tensor,
+        min_full_attn_seq_len_tensor);
     auto out = get<0>(fwd_out);
     auto softmax_lse = get<1>(fwd_out);
     ctx->save_for_backward(
@@ -118,7 +129,11 @@ class HSTUFlashAttentionFunctionGPU
          num_targets.value_or(at::Tensor()),
          attn_scale.value_or(at::Tensor()),
          seq_offsets_q.value_or(at::Tensor()),
-         softmax_lse.value_or(at::Tensor())});
+         softmax_lse.value_or(at::Tensor()),
+         max_seq_len_tensor.value_or(at::Tensor()),
+         contextual_seq_len_tensor.value_or(at::Tensor()),
+         max_attn_len_tensor.value_or(at::Tensor()),
+         min_full_attn_seq_len_tensor.value_or(at::Tensor())});
     return out;
   }
 
@@ -136,6 +151,10 @@ class HSTUFlashAttentionFunctionGPU
     auto attn_scale = saved_tensors[6];
     auto seq_offsets_q = saved_tensors[7];
     auto softmax_lse = saved_tensors[8];
+    auto max_seq_len_tensor = saved_tensors[9];
+    auto contextual_seq_len_tensor = saved_tensors[10];
+    auto max_attn_len_tensor = saved_tensors[11];
+    auto min_full_attn_seq_len_tensor = saved_tensors[12];
     auto seq_offsets_opt =
         seq_offsets.defined() ? std::optional(seq_offsets) : std::nullopt;
     auto num_targets_opt =
@@ -146,6 +165,19 @@ class HSTUFlashAttentionFunctionGPU
         seq_offsets_q.defined() ? std::optional(seq_offsets_q) : std::nullopt;
     auto softmax_lse_opt =
         softmax_lse.defined() ? std::optional(softmax_lse) : std::nullopt;
+    auto max_seq_len_tensor_opt = max_seq_len_tensor.defined()
+        ? std::optional(max_seq_len_tensor)
+        : std::nullopt;
+    auto contextual_seq_len_tensor_opt = contextual_seq_len_tensor.defined()
+        ? std::optional(contextual_seq_len_tensor)
+        : std::nullopt;
+    auto max_attn_len_tensor_opt = max_attn_len_tensor.defined()
+        ? std::optional(max_attn_len_tensor)
+        : std::nullopt;
+    auto min_full_attn_seq_len_tensor_opt =
+        min_full_attn_seq_len_tensor.defined()
+        ? std::optional(min_full_attn_seq_len_tensor)
+        : std::nullopt;
 
     auto dq = at::empty_like(q);
     auto dk = at::empty_like(k);
@@ -175,7 +207,12 @@ class HSTUFlashAttentionFunctionGPU
         saved_data["max_q_len"].toInt(), // max_q_len
         seq_offsets_q_opt, // seq_offsets_q
         saved_data["num_softmax_heads"].toInt(), // num_softmax_heads
-        softmax_lse_opt);
+        softmax_lse_opt,
+        max_seq_len_tensor_opt,
+        contextual_seq_len_tensor_opt,
+        max_attn_len_tensor_opt,
+        min_full_attn_seq_len_tensor_opt,
+        saved_data["num_groups"].toInt());
 
     return {
         torch::autograd::Variable(), // max_seq_len
@@ -200,6 +237,10 @@ class HSTUFlashAttentionFunctionGPU
         torch::autograd::Variable(), // seq_offsets_q
         torch::autograd::Variable(), // num_softmax_heads
         torch::autograd::Variable(), // training
+        torch::autograd::Variable(), // max_seq_len_tensor
+        torch::autograd::Variable(), // contextual_seq_len_tensor
+        torch::autograd::Variable(), // max_attn_len_tensor
+        torch::autograd::Variable(), // min_full_attn_seq_len_tensor
     };
   }
 };
@@ -226,7 +267,13 @@ at::Tensor cuda_hstu_mha(
     int64_t max_q_len = 0,
     const std::optional<at::Tensor>& seq_offsets_q = std::nullopt,
     int64_t num_softmax_heads = 0,
-    bool training = true) {
+    bool training = true,
+    const std::optional<at::Tensor>& max_seq_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& contextual_seq_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& max_attn_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
+        std::nullopt,
+    int64_t num_groups = 1) {
   return hstu::HSTUFlashAttentionFunctionGPU::apply(
       max_seq_len,
       alpha,
@@ -274,7 +321,13 @@ at::Tensor hstu_mha_cpu(
     int64_t max_q_len = 0,
     const std::optional<at::Tensor>& seq_offsets_q = std::nullopt,
     int64_t num_softmax_heads = 0,
-    bool training = true) {
+    bool training = true,
+    const std::optional<at::Tensor>& max_seq_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& contextual_seq_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& max_attn_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
+        std::nullopt,
+    int64_t num_groups = 1) {
   auto fwd_out = hstu::hstu_mha_fwd_dummy(
       max_seq_len,
       alpha,
@@ -321,7 +374,13 @@ at::Tensor hstu_mha_meta(
     int64_t max_q_len = 0,
     const std::optional<at::Tensor>& seq_offsets_q = std::nullopt,
     int64_t num_softmax_heads = 0,
-    bool training = true) {
+    bool training = true,
+    const std::optional<at::Tensor>& max_seq_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& contextual_seq_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& max_attn_len_tensor = std::nullopt,
+    const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
+        std::nullopt,
+    int64_t num_groups = 1) {
   auto fwd_out = hstu::hstu_mha_fwd_meta(
       max_seq_len,
       alpha,
@@ -368,7 +427,12 @@ TORCH_LIBRARY_FRAGMENT(hstu, m) {
       "int max_q_len = 0,"
       "Tensor? seq_offsets_q = None,"
       "int num_softmax_heads = 0,"
-      "bool training = True"
+      "bool training = True,"
+      "Tensor? max_seq_len_tensor = None,"
+      "Tensor? contextual_seq_len_tensor = None,"
+      "Tensor? max_attn_len_tensor = None,"
+      "Tensor? min_full_attn_seq_len_tensor = None,"
+      "int num_groups = 1"
       ") -> (Tensor, Tensor?)");
 
   m.def(
@@ -396,7 +460,12 @@ TORCH_LIBRARY_FRAGMENT(hstu, m) {
       "int max_q_len = 0,"
       "Tensor? seq_offsets_q = None,"
       "int num_softmax_heads = 0,"
-      "Tensor? softmax_lse = None"
+      "Tensor? softmax_lse = None,"
+      "Tensor? max_seq_len_tensor = None,"
+      "Tensor? contextual_seq_len_tensor = None,"
+      "Tensor? max_attn_len_tensor = None,"
+      "Tensor? min_full_attn_seq_len_tensor = None,"
+      "int num_groups = 1"
       ") -> Tensor[]");
 
   m.def(
@@ -422,7 +491,12 @@ TORCH_LIBRARY_FRAGMENT(hstu, m) {
       "int max_q_len = 0,"
       "Tensor? seq_offsets_q = None,"
       "int num_softmax_heads = 0,"
-      "bool training = True"
+      "bool training = True,"
+      "Tensor? max_seq_len_tensor = None,"
+      "Tensor? contextual_seq_len_tensor = None,"
+      "Tensor? max_attn_len_tensor = None,"
+      "Tensor? min_full_attn_seq_len_tensor = None,"
+      "int num_groups = 1"
       ") -> Tensor");
 
   m.impl(

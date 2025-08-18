@@ -71,6 +71,11 @@ void set_params_fprop(
     void* attn_scale,
     void* seq_offsets_q,
     void* softmax_lse,
+    void* max_seq_len_tensor,
+    void* contextual_seq_len_tensor,
+    void* max_attn_len_tensor,
+    void* min_full_attn_seq_len_tensor,
+    const int num_groups,
     bool causal,
     float alpha,
     const bool scalar_scale,
@@ -114,6 +119,14 @@ void set_params_fprop(
   params.num_targets = static_cast<int*>(num_targets);
   params.attn_scale = static_cast<float*>(attn_scale);
   params.softmax_lse = static_cast<float*>(softmax_lse);
+  params.max_seq_len_tensor = static_cast<int*>(max_seq_len_tensor);
+  params.contextual_seq_len_tensor =
+      static_cast<int*>(contextual_seq_len_tensor);
+  params.max_attn_len_tensor = static_cast<int*>(max_attn_len_tensor);
+  params.min_full_attn_seq_len_tensor =
+      static_cast<int*>(min_full_attn_seq_len_tensor);
+  params.num_groups = num_groups;
+  params.batch_size_per_group = b / num_groups;
 
   // Set the dimensions.
   params.b = b;
@@ -127,6 +140,8 @@ void set_params_fprop(
 
   params.alpha = alpha;
 
+  // Note: when num_groups > 1, max_attn_len, contextual_seq_len,
+  // min_full_attn_seq_len represent the max value in the tensor.
   params.is_local = max_attn_len > 0;
   params.is_causal = causal && (!params.is_local);
   params.has_contexual_mask = contextual_seq_len > 0;
@@ -182,6 +197,11 @@ void set_params_dgrad(
     void* softmax_lse,
     void* softmax_d,
     void* softmax_lse_log2,
+    void* max_seq_len_tensor,
+    void* contextual_seq_len_tensor,
+    void* max_attn_len_tensor,
+    void* min_full_attn_seq_len_tensor,
+    const int num_groups,
     const bool scalar_scale,
     const bool causal,
     const float alpha,
@@ -210,6 +230,11 @@ void set_params_dgrad(
       attn_scale,
       seq_offsets_q,
       softmax_lse,
+      max_seq_len_tensor,
+      contextual_seq_len_tensor,
+      max_attn_len_tensor,
+      min_full_attn_seq_len_tensor,
+      num_groups,
       causal,
       alpha,
       scalar_scale,
@@ -386,7 +411,12 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd_meta(
     int64_t max_q_len,
     const std::optional<at::Tensor>& seq_offsets_q,
     int64_t num_softmax_heads,
-    bool training) {
+    bool training,
+    const std::optional<at::Tensor>& max_seq_len_tensor,
+    const std::optional<at::Tensor>& contextual_seq_len_tensor,
+    const std::optional<at::Tensor>& max_attn_len_tensor,
+    const std::optional<at::Tensor>& min_full_attn_seq_len_tensor,
+    int64_t num_groups) {
   auto q_type = q.scalar_type();
   auto const sizes = q.sym_sizes();
   at::Tensor seq_offsets_;
@@ -436,7 +466,12 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd_dummy(
     const int64_t max_q_len,
     const std::optional<at::Tensor>& seq_offsets_q,
     int64_t num_softmax_heads,
-    bool training) {
+    bool training,
+    const std::optional<at::Tensor>& max_seq_len_tensor,
+    const std::optional<at::Tensor>& contextual_seq_len_tensor,
+    const std::optional<at::Tensor>& max_attn_len_tensor,
+    const std::optional<at::Tensor>& min_full_attn_seq_len_tensor,
+    int64_t num_groups) {
   auto q_type = q.scalar_type();
   auto const sizes = q.sizes();
   at::Tensor seq_offsets_;
@@ -491,7 +526,12 @@ std::vector<at::Tensor> hstu_mha_bwd_dummy(
     const int64_t max_q_len,
     const std::optional<at::Tensor>& seq_offsets_q,
     int64_t num_softmax_heads,
-    const std::optional<at::Tensor>& softmax_lse) {
+    const std::optional<at::Tensor>& softmax_lse,
+    const std::optional<at::Tensor>& max_seq_len_tensor,
+    const std::optional<at::Tensor>& contextual_seq_len_tensor,
+    const std::optional<at::Tensor>& max_attn_len_tensor,
+    const std::optional<at::Tensor>& min_full_attn_seq_len_tensor,
+    int64_t num_groups) {
   return {dq, dk, dv};
 };
 
@@ -515,7 +555,12 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd(
     int64_t max_q_len,
     const std::optional<at::Tensor>& seq_offsets_q,
     int64_t num_softmax_heads,
-    bool training) {
+    bool training,
+    const std::optional<at::Tensor>& max_seq_len_tensor,
+    const std::optional<at::Tensor>& contextual_seq_len_tensor,
+    const std::optional<at::Tensor>& max_attn_len_tensor,
+    const std::optional<at::Tensor>& min_full_attn_seq_len_tensor,
+    int64_t num_groups) {
   auto dprops = at::cuda::getCurrentDeviceProperties();
   bool is_sm9x = dprops->major >= 9;
   TORCH_CHECK(is_sm9x, "HSTU Attention only supports Hopper GPUs or newer.");
@@ -593,6 +638,36 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd(
         attn_scale_.dtype() == torch::kFloat32,
         "attn_scale_ must have dtype torch.float32");
   }
+  at::Tensor max_seq_len_tensor_;
+  at::Tensor contextual_seq_len_tensor_;
+  at::Tensor max_attn_len_tensor_;
+  at::Tensor min_full_attn_seq_len_tensor_;
+  if (num_groups > 1) {
+    TORCH_CHECK(
+        max_seq_len_tensor.has_value(),
+        "max_seq_len_tensor cannot be empty for num_groups > 1.");
+    TORCH_CHECK(
+        contextual_seq_len_tensor.has_value(),
+        "contextual_seq_len_tensor cannot be empty for num_groups > 1.");
+    TORCH_CHECK(
+        max_attn_len_tensor.has_value(),
+        "max_attn_len_tensor cannot be empty for num_groups > 1.");
+    TORCH_CHECK(
+        min_full_attn_seq_len_tensor.has_value(),
+        "min_full_attn_seq_len_tensor cannot be empty for num_groups > 1.");
+    max_seq_len_tensor_ = max_seq_len_tensor.value();
+    contextual_seq_len_tensor_ = contextual_seq_len_tensor.value();
+    max_attn_len_tensor_ = max_attn_len_tensor.value();
+    min_full_attn_seq_len_tensor_ = min_full_attn_seq_len_tensor.value();
+    CHECK_DEVICE(max_seq_len_tensor_);
+    CHECK_DEVICE(contextual_seq_len_tensor_);
+    CHECK_DEVICE(max_attn_len_tensor_);
+    CHECK_DEVICE(min_full_attn_seq_len_tensor_);
+    TORCH_CHECK(max_seq_len_tensor_.dtype() == torch::kInt32);
+    TORCH_CHECK(contextual_seq_len_tensor_.dtype() == torch::kInt32);
+    TORCH_CHECK(max_attn_len_tensor_.dtype() == torch::kInt32);
+    TORCH_CHECK(min_full_attn_seq_len_tensor_.dtype() == torch::kInt32);
+  }
 #ifdef HSTU_FLASH_ATTN_DEBUG_INFO
   if (is_jagged && has_multiple_targets) {
     auto uih_lengths = seq_offsets_.slice(0, 1)
@@ -614,6 +689,8 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd(
   auto const sizes_q = q.sizes();
   auto const sizes_k = k.sizes();
   const int batch_size = !is_jagged ? sizes_q[0] : seq_offsets_.size(0) - 1;
+  TORCH_CHECK(
+      batch_size % num_groups == 0, "batch_size not divisible by num_groups");
   int total_seq_len_q = !is_jagged ? batch_size * max_q_len : sizes_q[0];
   int total_seq_len_kv = !is_jagged ? batch_size * max_seq_len : sizes_k[0];
   int num_heads = q.size(-2);
@@ -704,6 +781,11 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd(
       !has_attn_scale ? nullptr : attn_scale_.data_ptr(),
       !is_cross_attn ? nullptr : seq_offsets_q_.data_ptr(),
       (num_softmax_heads == 0) ? nullptr : softmax_lse.value().data_ptr(),
+      num_groups > 1 ? max_seq_len_tensor_.data_ptr() : nullptr,
+      num_groups > 1 ? contextual_seq_len_tensor_.data_ptr() : nullptr,
+      num_groups > 1 ? max_attn_len_tensor_.data_ptr() : nullptr,
+      num_groups > 1 ? min_full_attn_seq_len_tensor_.data_ptr() : nullptr,
+      num_groups,
       causal,
       alpha,
       scalar_scale,
@@ -876,7 +958,12 @@ std::vector<at::Tensor> hstu_mha_bwd(
     int64_t max_q_len,
     const std::optional<at::Tensor>& seq_offsets_q,
     int64_t num_softmax_heads,
-    const std::optional<at::Tensor>& softmax_lse) {
+    const std::optional<at::Tensor>& softmax_lse,
+    const std::optional<at::Tensor>& max_seq_len_tensor,
+    const std::optional<at::Tensor>& contextual_seq_len_tensor,
+    const std::optional<at::Tensor>& max_attn_len_tensor,
+    const std::optional<at::Tensor>& min_full_attn_seq_len_tensor,
+    int64_t num_groups) {
 #ifdef FLASHATTENTION_DISABLE_BACKWARD
   TORCH_CHECK(false, "This flash attention build does not support backward.");
 #endif
@@ -970,9 +1057,41 @@ std::vector<at::Tensor> hstu_mha_bwd(
   } else {
     max_q_len = max_seq_len;
   }
+  at::Tensor max_seq_len_tensor_;
+  at::Tensor contextual_seq_len_tensor_;
+  at::Tensor max_attn_len_tensor_;
+  at::Tensor min_full_attn_seq_len_tensor_;
+  if (num_groups > 1) {
+    TORCH_CHECK(
+        max_seq_len_tensor.has_value(),
+        "max_seq_len_tensor cannot be empty for num_groups > 1.");
+    TORCH_CHECK(
+        contextual_seq_len_tensor.has_value(),
+        "contextual_seq_len_tensor cannot be empty for num_groups > 1.");
+    TORCH_CHECK(
+        max_attn_len_tensor.has_value(),
+        "max_attn_len_tensor cannot be empty for num_groups > 1.");
+    TORCH_CHECK(
+        min_full_attn_seq_len_tensor.has_value(),
+        "min_full_attn_seq_len_tensor cannot be empty for num_groups > 1.");
+    max_seq_len_tensor_ = max_seq_len_tensor.value();
+    contextual_seq_len_tensor_ = contextual_seq_len_tensor.value();
+    max_attn_len_tensor_ = max_attn_len_tensor.value();
+    min_full_attn_seq_len_tensor_ = min_full_attn_seq_len_tensor.value();
+    CHECK_DEVICE(max_seq_len_tensor_);
+    CHECK_DEVICE(contextual_seq_len_tensor_);
+    CHECK_DEVICE(max_attn_len_tensor_);
+    CHECK_DEVICE(min_full_attn_seq_len_tensor_);
+    TORCH_CHECK(max_seq_len_tensor_.dtype() == torch::kInt32);
+    TORCH_CHECK(contextual_seq_len_tensor_.dtype() == torch::kInt32);
+    TORCH_CHECK(max_attn_len_tensor_.dtype() == torch::kInt32);
+    TORCH_CHECK(min_full_attn_seq_len_tensor_.dtype() == torch::kInt32);
+  }
   auto const sizes_q = q.sizes();
   auto const sizes_kv = k.sizes();
   int const batch_size = !is_jagged ? sizes_q[0] : seq_offsets_.size(0) - 1;
+  TORCH_CHECK(
+      batch_size % num_groups == 0, "batch_size not divisible by num_groups");
   if (!is_jagged) {
     max_seq_len = sizes_kv[1];
   }
@@ -1122,6 +1241,11 @@ std::vector<at::Tensor> hstu_mha_bwd(
       num_softmax_heads == 0 ? nullptr : softmax_lse.value().data_ptr(),
       num_softmax_heads == 0 ? nullptr : softmax_d.data_ptr(),
       num_softmax_heads == 0 ? nullptr : softmax_lse_log2.data_ptr(),
+      num_groups > 1 ? max_seq_len_tensor_.data_ptr() : nullptr,
+      num_groups > 1 ? contextual_seq_len_tensor_.data_ptr() : nullptr,
+      num_groups > 1 ? max_attn_len_tensor_.data_ptr() : nullptr,
+      num_groups > 1 ? min_full_attn_seq_len_tensor_.data_ptr() : nullptr,
+      num_groups,
       scalar_scale,
       causal,
       alpha,

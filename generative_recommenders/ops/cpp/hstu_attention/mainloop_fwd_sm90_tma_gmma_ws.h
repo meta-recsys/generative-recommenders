@@ -486,9 +486,15 @@ struct CollectiveMainloopFwdSm90 {
     int const min_full_attn_seq_len;
     int const contextual_seq_len;
     int const num_softmax_heads;
+    int const num_groups;
+    int const batch_size_per_group;
     int const* const seq_offsets = nullptr;
     int const* const seq_offsets_q = nullptr;
     int const* const num_targets = nullptr;
+    int const* const max_seq_len_tensor = nullptr;
+    int const* const contextual_seq_len_tensor = nullptr;
+    int const* const max_attn_len_tensor = nullptr;
+    int const* const min_full_attn_seq_len_tensor = nullptr;
     float const* const attn_scale = nullptr;
     bool const scalar_scale = true;
   };
@@ -517,9 +523,15 @@ struct CollectiveMainloopFwdSm90 {
     int const min_full_attn_seq_len;
     int const contextual_seq_len;
     int const num_softmax_heads;
+    int const num_groups;
+    int const batch_size_per_group;
     int const* const seq_offsets = nullptr;
     int const* const seq_offsets_q = nullptr;
     int const* const num_targets = nullptr;
+    int const* const max_seq_len_tensor = nullptr;
+    int const* const contextual_seq_len_tensor = nullptr;
+    int const* const max_attn_len_tensor = nullptr;
+    int const* const min_full_attn_seq_len_tensor = nullptr;
     float const* const attn_scale = nullptr;
     bool const scalar_scale = true;
   };
@@ -592,9 +604,15 @@ struct CollectiveMainloopFwdSm90 {
         args.min_full_attn_seq_len,
         args.contextual_seq_len,
         args.num_softmax_heads,
+        args.num_groups,
+        args.batch_size_per_group,
         args.seq_offsets,
         args.seq_offsets_q,
         args.num_targets,
+        args.max_seq_len_tensor,
+        args.contextual_seq_len_tensor,
+        args.max_attn_len_tensor,
+        args.min_full_attn_seq_len_tensor,
         args.attn_scale,
         args.scalar_scale};
   }
@@ -745,6 +763,17 @@ struct CollectiveMainloopFwdSm90 {
         return;
       }
     }
+    int min_full_attn_seq_len_, max_attn_len_, contextual_seq_len_;
+    if (params.num_groups > 1) {
+      int group_id = bidb / params.batch_size_per_group;
+      min_full_attn_seq_len_ = params.min_full_attn_seq_len_tensor[group_id];
+      max_attn_len_ = params.max_attn_len_tensor[group_id];
+      contextual_seq_len_ = params.contextual_seq_len_tensor[group_id];
+    } else {
+      min_full_attn_seq_len_ = params.min_full_attn_seq_len;
+      max_attn_len_ = params.max_attn_len;
+      contextual_seq_len_ = params.contextual_seq_len;
+    }
     int n_block_min, n_block_max;
     if constexpr (Cross) {
       auto n_block_min_max = get_cross_n_block_min_max(
@@ -756,9 +785,9 @@ struct CollectiveMainloopFwdSm90 {
       n_block_max = get<1>(n_block_min_max);
     } else {
       auto n_block_min_max = get_n_block_min_max(
-          params.max_attn_len,
-          params.min_full_attn_seq_len,
-          params.contextual_seq_len,
+          max_attn_len_,
+          min_full_attn_seq_len_,
+          contextual_seq_len_,
           seqlen_info.uihlen_q,
           m_block);
       n_block_min = get<0>(n_block_min_max);
@@ -1069,8 +1098,8 @@ struct CollectiveMainloopFwdSm90 {
       if constexpr (Contexual_mask) {
         int contexual_n_block_max = get_contexual_n_block_max(
             n_block_min,
-            params.min_full_attn_seq_len,
-            params.contextual_seq_len,
+            min_full_attn_seq_len_,
+            contextual_seq_len_,
             seqlen_info.uihlen_q,
             m_block);
 #pragma unroll 1
@@ -1189,6 +1218,29 @@ struct CollectiveMainloopFwdSm90 {
         return false;
       }
     }
+    int min_full_attn_seq_len_, max_attn_len_, contextual_seq_len_;
+    float scalar_scale_val_;
+    if (params.num_groups > 1) {
+      int group_id = bidb / params.batch_size_per_group;
+      min_full_attn_seq_len_ = params.min_full_attn_seq_len_tensor[group_id];
+      max_attn_len_ = params.max_attn_len_tensor[group_id];
+      contextual_seq_len_ = params.contextual_seq_len_tensor[group_id];
+      int max_seq_len_per_group = params.max_seq_len_tensor[group_id];
+      // attention scale
+      scalar_scale_val_ = params.scalar_scale
+          ? (params.attn_scale == nullptr ? 1.0f / max_seq_len_per_group
+                                          : params.attn_scale[group_id])
+          : 0;
+    } else {
+      min_full_attn_seq_len_ = params.min_full_attn_seq_len;
+      max_attn_len_ = params.max_attn_len;
+      contextual_seq_len_ = params.contextual_seq_len;
+      // attention scale
+      scalar_scale_val_ = params.scalar_scale
+          ? (params.attn_scale == nullptr ? params.max_seq_len_inv
+                                          : params.attn_scale[0])
+          : 0;
+    }
     int n_block_min, n_block_max;
     if constexpr (Cross) {
       auto n_block_min_max = get_cross_n_block_min_max(
@@ -1200,9 +1252,9 @@ struct CollectiveMainloopFwdSm90 {
       n_block_max = get<1>(n_block_min_max);
     } else {
       auto n_block_min_max = get_n_block_min_max(
-          params.max_attn_len,
-          params.min_full_attn_seq_len,
-          params.contextual_seq_len,
+          max_attn_len_,
+          min_full_attn_seq_len_,
+          contextual_seq_len_,
           seqlen_info.uihlen_q,
           m_block);
       n_block_min = get<0>(n_block_min_max);
@@ -1289,19 +1341,14 @@ struct CollectiveMainloopFwdSm90 {
         thread_idx,
         seqlen_info.seqlen_q,
         seqlen_info.seqlen_kv,
-        params.max_attn_len,
-        params.min_full_attn_seq_len,
-        params.contextual_seq_len,
+        max_attn_len_,
+        min_full_attn_seq_len_,
+        contextual_seq_len_,
         seqlen_info.uihlen_q);
 
     auto& barrier_Q = shared_storage.pipelines.barrier_Q;
     barrier_Q.wait(work_idx % 2);
 
-    // attention scale
-    float scalar_scale_val = params.scalar_scale
-        ? (params.attn_scale == nullptr ? params.max_seq_len_inv
-                                        : params.attn_scale[0])
-        : 0;
     static constexpr int Qdim = 0;
     auto thread_mma = tiled_mma0.get_thread_slice(thread_idx);
     auto thread0_mma = tiled_mma0.get_thread_slice(_0{});
@@ -1342,7 +1389,7 @@ struct CollectiveMainloopFwdSm90 {
     pipeline_k.consumer_release(smem_pipe_read);
 #pragma unroll
     for (int mi = 0; mi < size<0>(tSrS_rowcol); ++mi) {
-      float scale = scalar_scale_val;
+      float scale = scalar_scale_val_;
       if (!params.scalar_scale) {
         int q_index = qdim_offset + int(get<Qdim>(t0ScS_rowcol(mi, _0{})));
         if (q_index < seqlen_info.seqlen_q) {
@@ -1450,7 +1497,7 @@ struct CollectiveMainloopFwdSm90 {
       pipeline_k.consumer_release(smem_pipe_read); // release K
 #pragma unroll
       for (int mi = 0; mi < size<0>(tSrS_rowcol); ++mi) {
-        float scale = scalar_scale_val;
+        float scale = scalar_scale_val_;
         if (!params.scalar_scale) {
           int q_index = qdim_offset + int(get<Qdim>(t0ScS_rowcol(mi, _0{})));
           if (q_index < seqlen_info.seqlen_q) {
@@ -1542,11 +1589,10 @@ struct CollectiveMainloopFwdSm90 {
       if constexpr (Local) {
         if (m_idx_max <=
             cute::ceil_div(
-                seqlen_info.uihlen_q - params.min_full_attn_seq_len, kBlockM) *
+                seqlen_info.uihlen_q - min_full_attn_seq_len_, kBlockM) *
                 kBlockM) {
           n_block_min_before_local_mask = std::max(
-              n_block_min,
-              cute::ceil_div(m_idx_max - params.max_attn_len, kBlockN));
+              n_block_min, cute::ceil_div(m_idx_max - max_attn_len_, kBlockN));
         }
       }
       auto no_mask_fn = [](auto& tSrS, int n_block) {};
@@ -1600,8 +1646,8 @@ struct CollectiveMainloopFwdSm90 {
       if constexpr (Contexual_mask) {
         int contexual_n_block_max = get_contexual_n_block_max(
             n_block_min,
-            params.min_full_attn_seq_len,
-            params.contextual_seq_len,
+            min_full_attn_seq_len_,
+            contextual_seq_len_,
             seqlen_info.uihlen_q,
             m_block);
         auto contexual_mask_fn = [&](auto& tSrS, int n_block) {
@@ -1672,6 +1718,17 @@ struct CollectiveMainloopFwdSm90 {
         return false;
       }
     }
+    int min_full_attn_seq_len_, max_attn_len_, contextual_seq_len_;
+    if (params.num_groups > 1) {
+      int group_id = bidb / params.batch_size_per_group;
+      min_full_attn_seq_len_ = params.min_full_attn_seq_len_tensor[group_id];
+      max_attn_len_ = params.max_attn_len_tensor[group_id];
+      contextual_seq_len_ = params.contextual_seq_len_tensor[group_id];
+    } else {
+      min_full_attn_seq_len_ = params.min_full_attn_seq_len;
+      max_attn_len_ = params.max_attn_len;
+      contextual_seq_len_ = params.contextual_seq_len;
+    }
     int n_block_min, n_block_max;
     if constexpr (Cross) {
       auto n_block_min_max = get_cross_n_block_min_max(
@@ -1683,9 +1740,9 @@ struct CollectiveMainloopFwdSm90 {
       n_block_max = get<1>(n_block_min_max);
     } else {
       auto n_block_min_max = get_n_block_min_max(
-          params.max_attn_len,
-          params.min_full_attn_seq_len,
-          params.contextual_seq_len,
+          max_attn_len_,
+          min_full_attn_seq_len_,
+          contextual_seq_len_,
           seqlen_info.uihlen_q,
           m_block);
       n_block_min = get<0>(n_block_min_max);
@@ -1772,19 +1829,13 @@ struct CollectiveMainloopFwdSm90 {
         thread_idx,
         seqlen_info.seqlen_q,
         seqlen_info.seqlen_kv,
-        params.max_attn_len,
-        params.min_full_attn_seq_len,
-        params.contextual_seq_len,
+        max_attn_len_,
+        min_full_attn_seq_len_,
+        contextual_seq_len_,
         seqlen_info.uihlen_q);
 
     auto& barrier_Q = shared_storage.pipelines.barrier_Q;
     barrier_Q.wait(work_idx % 2);
-
-    // attention scale
-    float scalar_scale_val = params.scalar_scale
-        ? (params.attn_scale == nullptr ? params.max_seq_len_inv
-                                        : params.attn_scale[0])
-        : 0;
     static constexpr int Qdim = 0;
     auto thread_mma = tiled_mma0.get_thread_slice(thread_idx);
     auto thread0_mma = tiled_mma0.get_thread_slice(_0{});
@@ -2007,11 +2058,10 @@ struct CollectiveMainloopFwdSm90 {
       if constexpr (Local) {
         if (m_idx_max <=
             cute::ceil_div(
-                seqlen_info.uihlen_q - params.min_full_attn_seq_len, kBlockM) *
+                seqlen_info.uihlen_q - min_full_attn_seq_len_, kBlockM) *
                 kBlockM) {
           n_block_min_before_local_mask = std::max(
-              n_block_min,
-              cute::ceil_div(m_idx_max - params.max_attn_len, kBlockN));
+              n_block_min, cute::ceil_div(m_idx_max - max_attn_len_, kBlockN));
         }
       }
       auto no_mask_fn = [](auto& tSrS, int n_block) {};
@@ -2067,8 +2117,8 @@ struct CollectiveMainloopFwdSm90 {
       if constexpr (Contexual_mask) {
         int contexual_n_block_max = get_contexual_n_block_max(
             n_block_min,
-            params.min_full_attn_seq_len,
-            params.contextual_seq_len,
+            min_full_attn_seq_len_,
+            contextual_seq_len_,
             seqlen_info.uihlen_q,
             m_block);
         auto contexual_mask_fn = [&](auto& tSrS, int n_block) {
