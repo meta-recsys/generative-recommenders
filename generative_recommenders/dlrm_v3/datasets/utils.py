@@ -41,5 +41,5 @@ def maybe_truncate_seq(
 ) -> List[int]:
     y_len = len(y)
     if y_len > max_seq_len:
-        y = y[:max_seq_len]
+        y = y[(y_len - max_seq_len) :]
     return y
