@@ -19,25 +19,6 @@
 from typing import Optional, Tuple
 
 import torch
-
-try:
-    from generative_recommenders.fb.ultra.ops.fp8.fp8_addmm import (
-        fp8_rowwise_quantize_addmm,
-    )
-    from generative_recommenders.fb.ultra.ops.fp8.layer_norm_quantization import (
-        triton_weighted_layer_norm_quantization_fwd,
-    )
-
-    torch.ops.load_library(
-        "//generative_recommenders/fb/ultra/ops/blackwell/hstu_attention:hstu_flash_attention"
-    )
-    torch.ops.load_library(
-        "//generative_recommenders/ops/cpp/hstu_attention:hstu_flash_attention"
-    )
-except ImportError:
-    pass
-
-
 from generative_recommenders.ops.triton.triton_addmm import (
     triton_addmm_bwd,
     triton_addmm_fwd,
@@ -47,6 +28,24 @@ from generative_recommenders.ops.triton.triton_layer_norm import (
 )
 from generative_recommenders.ops.utils import is_sm100
 from torch.nn import functional as F
+
+try:
+    from generative_recommenders.fb.ultra.ops.fp8.fp8_addmm import (
+        fp8_rowwise_quantize_addmm,
+    )
+    from generative_recommenders.fb.ultra.ops.fp8.layer_norm_quantization import (
+        triton_weighted_layer_norm_quantization_fwd,
+    )
+
+    if is_sm100():
+        torch.ops.load_library(
+            "//generative_recommenders/fb/ultra/ops/blackwell/hstu_attention:hstu_flash_attention"
+        )
+    torch.ops.load_library(
+        "//generative_recommenders/ops/cpp/hstu_attention:hstu_flash_attention"
+    )
+except ImportError:
+    pass
 
 
 class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
