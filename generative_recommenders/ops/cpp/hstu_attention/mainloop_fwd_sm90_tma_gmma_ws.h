@@ -1392,7 +1392,9 @@ struct CollectiveMainloopFwdSm90 {
       float scale = scalar_scale_val_;
       if (!params.scalar_scale) {
         int q_index = qdim_offset + int(get<Qdim>(t0ScS_rowcol(mi, _0{})));
-        if (q_index < seqlen_info.seqlen_q) {
+        // Convert global index to local sequence position for bounds checking
+        int q_local = q_index - seqlen_info.offset_q;
+        if (q_local < seqlen_info.seqlen_q) {
           scale = params.attn_scale[q_index];
         }
       }
@@ -1500,7 +1502,9 @@ struct CollectiveMainloopFwdSm90 {
         float scale = scalar_scale_val_;
         if (!params.scalar_scale) {
           int q_index = qdim_offset + int(get<Qdim>(t0ScS_rowcol(mi, _0{})));
-          if (q_index < seqlen_info.seqlen_q) {
+          // Convert global index to local sequence position for bounds checking
+          int q_local = q_index - seqlen_info.offset_q;
+          if (q_local < seqlen_info.seqlen_q) {
             scale = params.attn_scale[q_index];
           }
         }

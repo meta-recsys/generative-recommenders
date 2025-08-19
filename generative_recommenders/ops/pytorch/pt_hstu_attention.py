@@ -138,6 +138,7 @@ def pytorch_hstu_mha(
     dropout_pr: float = 0.0,
     training: bool = True,
     num_targets: Optional[torch.Tensor] = None,
+    attn_scale: Optional[torch.Tensor] = None,
     max_attn_len: int = 0,
     contextual_seq_len: int = 0,
     min_full_attn_seq_len: int = 0,
@@ -148,7 +149,21 @@ def pytorch_hstu_mha(
         q, k, v, seq_offsets, max_seq_len
     )  # [B, H, N, D) and [B, H, N, V]
     qk_attn = torch.einsum("bhxa,bhya->bhxy", q, k) * alpha
-    qk_attn = F.silu(qk_attn) / max_seq_len
+    if attn_scale is not None:
+        if attn_scale.ndim > 0:
+            attn_scale = (
+                torch.ops.fbgemm.jagged_to_padded_dense(
+                    values=attn_scale.unsqueeze(-1),
+                    offsets=[seq_offsets],
+                    max_lengths=[max_seq_len],
+                    padding_value=0.0,
+                )
+                .unsqueeze(1)
+                .to(qk_attn.dtype)
+            )
+        qk_attn = F.silu(qk_attn) * attn_scale
+    else:
+        qk_attn = F.silu(qk_attn) / max_seq_len
     valid_attn_mask = _get_valid_attn_mask(
         device=q.device,
         causal=causal,

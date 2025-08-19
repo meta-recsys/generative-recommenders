@@ -52,6 +52,7 @@ def hstu_mha(
     dropout_pr: float = 0.0,
     training: bool = True,
     num_targets: Optional[torch.Tensor] = None,
+    attn_scale: Optional[torch.Tensor] = None,
     max_attn_len: int = 0,
     contextual_seq_len: int = 0,
     min_full_attn_seq_len: int = 0,
@@ -79,6 +80,7 @@ def hstu_mha(
             torch._assert(
                 min_full_attn_seq_len == 0, "min_full_attn_seq_len not implemented"
             )
+        assert attn_scale is None, "attn_scale not implemented"
         q = switch_to_contiguous_if_needed(q)
         k = switch_to_contiguous_if_needed(k)
         v = switch_to_contiguous_if_needed(v)
@@ -122,6 +124,7 @@ def hstu_mha(
             dropout_pr=dropout_pr,
             training=training,
             num_targets=num_targets,
+            attn_scale=attn_scale,
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
             min_full_attn_seq_len=min_full_attn_seq_len,
