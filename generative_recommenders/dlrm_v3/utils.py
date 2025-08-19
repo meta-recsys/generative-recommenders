@@ -18,9 +18,11 @@ mlperf dlrm_v3 inference benchmarking tool.
 """
 
 import contextlib
+import copy
 import logging
 import os
-from typing import Callable, Dict, List, Optional
+from enum import Enum
+from typing import Callable, Dict, List, Optional, Tuple
 
 import gin
 import tensorboard  # @manual=//tensorboard:lib  # noqa: F401 - required implicit dep when using torch.utils.tensorboard
@@ -40,6 +42,7 @@ from generative_recommenders.modules.multitask_module import (
 from torch.profiler import profile, profiler, ProfilerActivity  # pyre-ignore [21]
 from torch.utils.tensorboard import SummaryWriter
 from torchrec.metrics.auc import AUCMetricComputation
+from torchrec.metrics.ctr import CTRMetricComputation
 from torchrec.metrics.mae import MAEMetricComputation
 from torchrec.metrics.mse import MSEMetricComputation
 from torchrec.metrics.ne import NEMetricComputation
@@ -87,6 +90,11 @@ def profiler_or_nullcontext(enabled: bool, with_stack: bool):
     )
 
 
+class MetricMode(Enum):
+    TRAIN = "train"
+    EVAL = "eval"
+
+
 class Profiler:
     def __init__(self, rank, active: int = 50) -> None:
         self.rank = rank
@@ -117,10 +125,13 @@ class MetricsLogger:
         self,
         multitask_configs: List[TaskConfig],
         batch_size: int,
-        window_size: int,
         device: torch.device,
         rank: int,
-        tensorboard_log_path: str = "",
+        window_size: int = 10,
+        auc_window_size: int = 100,
+        tensorboard_log_path: Optional[str] = None,
+        train_batch_log_frequency: int = 10,
+        eval_batch_log_frequency: int = 10,
     ) -> None:
         self.multitask_configs: List[TaskConfig] = multitask_configs
         all_classification_tasks: List[str] = [
@@ -128,94 +139,166 @@ class MetricsLogger:
             for task in self.multitask_configs
             if task.task_type != MultitaskTaskType.REGRESSION
         ]
+        self.all_classification_indices: List[int] = [
+            idx
+            for idx, task in enumerate(self.multitask_configs)
+            if task.task_type != MultitaskTaskType.REGRESSION
+        ]
         all_regression_tasks: List[str] = [
             task.task_name
             for task in self.multitask_configs
             if task.task_type == MultitaskTaskType.REGRESSION
         ]
-        assert all_classification_tasks + all_regression_tasks == [
-            task.task_name for task in multitask_configs
+        self.all_regression_indices: List[int] = [
+            idx
+            for idx, task in enumerate(self.multitask_configs)
+            if task.task_type == MultitaskTaskType.REGRESSION
         ]
+
         self.task_names: List[str] = all_classification_tasks + all_regression_tasks
 
-        self.class_metrics: List[RecMetricComputation] = []
-        if all_classification_tasks:
-            self.class_metrics.append(
-                NEMetricComputation(
-                    my_rank=rank,
-                    batch_size=batch_size,
-                    n_tasks=len(all_classification_tasks),
-                    window_size=window_size,
-                ).to(device)
-            )
-            self.class_metrics.append(
-                AUCMetricComputation(
-                    my_rank=rank,
-                    batch_size=batch_size,
-                    n_tasks=len(all_classification_tasks),
-                    window_size=window_size,
-                ).to(device)
-            )
+        self.all_metrics_train: List[
+            Tuple[RecMetricComputation, MultitaskTaskType]
+        ] = []
 
-        self.regression_metrics: List[RecMetricComputation] = []
+        logger.info(f"Window size = {window_size} AUC window size = {auc_window_size}")
+        if all_classification_tasks:
+            self.all_metrics_train.append(
+                (
+                    NEMetricComputation(
+                        my_rank=rank,
+                        batch_size=batch_size,
+                        n_tasks=len(all_classification_tasks),
+                        window_size=window_size,
+                    ).to(device),
+                    MultitaskTaskType.BINARY_CLASSIFICATION,
+                )
+            )
+            self.all_metrics_train.append(
+                (
+                    AUCMetricComputation(
+                        my_rank=rank,
+                        batch_size=auc_window_size,
+                        n_tasks=len(all_classification_tasks),
+                        window_size=window_size,
+                    ).to(device),
+                    MultitaskTaskType.BINARY_CLASSIFICATION,
+                )
+            )
+            self.all_metrics_train.append(
+                (
+                    CTRMetricComputation(
+                        my_rank=rank,
+                        batch_size=batch_size,
+                        n_tasks=len(all_classification_tasks),
+                        window_size=window_size,
+                    ).to(device),
+                    MultitaskTaskType.BINARY_CLASSIFICATION,
+                )
+            )
 
         if all_regression_tasks:
-            self.regression_metrics.append(
-                MSEMetricComputation(
-                    my_rank=rank,
-                    batch_size=batch_size,
-                    n_tasks=len(all_regression_tasks),
-                    window_size=window_size,
-                ).to(device)
+            self.all_metrics_train.append(
+                (
+                    MSEMetricComputation(
+                        my_rank=rank,
+                        batch_size=batch_size,
+                        n_tasks=len(all_regression_tasks),
+                        window_size=window_size,
+                    ).to(device),
+                    MultitaskTaskType.REGRESSION,
+                )
             )
-            self.regression_metrics.append(
-                MAEMetricComputation(
-                    my_rank=rank,
-                    batch_size=batch_size,
-                    n_tasks=len(all_regression_tasks),
-                    window_size=window_size,
-                ).to(device)
+            self.all_metrics_train.append(
+                (
+                    MAEMetricComputation(
+                        my_rank=rank,
+                        batch_size=batch_size,
+                        n_tasks=len(all_regression_tasks),
+                        window_size=window_size,
+                    ).to(device),
+                    MultitaskTaskType.REGRESSION,
+                ),
             )
 
+        self.all_metrics_eval: List[Tuple[RecMetricComputation, MultitaskTaskType]] = (
+            copy.deepcopy(self.all_metrics_train)
+        )
         self.global_step: int = 0
         self.tb_logger: Optional[SummaryWriter] = None
-        if tensorboard_log_path != "":
+        if tensorboard_log_path is not None:
             self.tb_logger = SummaryWriter(log_dir=tensorboard_log_path)
 
-    @property
-    def all_metrics(self) -> List[RecMetricComputation]:
-        return self.class_metrics + self.regression_metrics
+        self._train_batch_log_frequency: int = train_batch_log_frequency
+        self._eval_batch_log_frequency: int = eval_batch_log_frequency
+
+        if (
+            eval_batch_log_frequency > window_size // batch_size
+            or train_batch_log_frequency > window_size // batch_size
+        ):
+            raise Exception("Must log more frequently than window size!")
+
+    def all_metrics(
+        self, mode: MetricMode
+    ) -> List[Tuple[RecMetricComputation, MultitaskTaskType]]:
+        if mode == MetricMode.TRAIN:
+            return self.all_metrics_train
+        elif mode == MetricMode.EVAL:
+            return self.all_metrics_eval
+        else:
+            raise Exception("Invalid mode value!")
 
     def update(
-        self, predictions: torch.Tensor, weights: torch.Tensor, labels: torch.Tensor
+        self,
+        predictions: torch.Tensor,
+        weights: torch.Tensor,
+        labels: torch.Tensor,
+        mode: MetricMode,
     ) -> None:
-        for metric in self.all_metrics:
+        for metric, class_type in self.all_metrics(mode=mode):
+            if class_type == MultitaskTaskType.BINARY_CLASSIFICATION:
+                task_indices = self.all_classification_indices
+            elif class_type == MultitaskTaskType.REGRESSION:
+                task_indices = self.all_regression_indices
+            else:
+                raise Exception("Invalid task type!")
+
             metric.update(
-                predictions=predictions,
-                labels=labels,
-                weights=weights,
+                predictions=predictions[task_indices],
+                labels=labels[task_indices],
+                weights=weights[task_indices],
             )
         self.global_step += 1
 
-    def compute(self) -> Dict[str, float]:
+    def _compute(self, mode: MetricMode) -> Dict[str, float]:
         all_computed_metrics = {}
 
-        for metric in self.all_metrics:
+        for metric, _ in self.all_metrics(mode=mode):
             computed_metrics = metric.compute()
             for computed in computed_metrics:
                 all_values = computed.value.cpu()
                 for i, task_name in enumerate(self.task_names):
-                    key = f"metric/{str(computed.metric_prefix) + str(computed.name)}/{task_name}"
+                    key = f"metric/{str(computed.metric_prefix) + str(computed.name)}/{task_name}/{mode.value}"
                     all_computed_metrics[key] = all_values[i]
 
         logger.info(f"Step {self.global_step} metrics: {all_computed_metrics}")
         return all_computed_metrics
 
     def compute_and_log(
-        self, additional_logs: Optional[Dict[str, Dict[str, torch.Tensor]]] = None
+        self,
+        mode: MetricMode,
+        additional_logs: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
     ) -> Dict[str, float]:
         assert self.tb_logger is not None
-        all_computed_metrics = self.compute()
+        if mode == MetricMode.TRAIN:
+            log_interval = self._train_batch_log_frequency
+        else:
+            log_interval = self._eval_batch_log_frequency
+
+        if self.global_step == 0 or self.global_step % log_interval != 0:
+            return {}
+
+        all_computed_metrics = self._compute(mode=mode)
         for k, v in all_computed_metrics.items():
             self.tb_logger.add_scalar(  # pyre-ignore [16]
                 k,
@@ -227,7 +310,7 @@ class MetricsLogger:
             for tag, data in additional_logs.items():
                 for data_name, data_value in data.items():
                     self.tb_logger.add_scalar(
-                        f"{tag}/{data_name}",
+                        f"{tag}/{data_name}/{mode.value}",
                         data_value.detach().clone().cpu(),
                         global_step=self.global_step,
                     )
