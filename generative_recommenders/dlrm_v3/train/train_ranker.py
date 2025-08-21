@@ -32,6 +32,7 @@ from generative_recommenders.dlrm_v3.train.utils import (
     make_optimizer_and_shard,
     make_train_test_dataloaders,
     setup,
+    train_eval_loop,
     train_loop,
 )
 from generative_recommenders.dlrm_v3.utils import MetricsLogger
@@ -102,6 +103,16 @@ def _main_func(
                 metric_logger=metrics,
                 device=device,
             )
+        elif mode == "train-eval":
+            train_eval_loop(
+                rank=rank,
+                model=model,
+                train_dataloader=train_dataloader,
+                eval_dataloader=test_dataloader,
+                optimizer=optimizer,
+                metric_logger=metrics,
+                device=device,
+            )
     except Exception as e:
         logger.info(traceback.format_exc())
         cleanup()
@@ -115,7 +126,7 @@ def get_args():  # pyre-ignore [3]
         "--dataset", default="debug", choices=SUPPORTED_CONFIGS.keys(), help="dataset"
     )
     parser.add_argument(
-        "--mode", default="train", choices=["train", "eval"], help="mode"
+        "--mode", default="train", choices=["train", "eval", "train-eval"], help="mode"
     )
     args, unknown_args = parser.parse_known_args()
     logger.warning(f"unknown_args: {unknown_args}")
@@ -126,7 +137,11 @@ def main() -> None:
     args = get_args()
     logger.info(args)
     assert args.dataset in SUPPORTED_CONFIGS, f"Unsupported dataset: {args.dataset}"
-    assert args.mode in ["train", "eval"], f"Unsupported mode: {args.mode}"
+    assert args.mode in [
+        "train",
+        "eval",
+        "train-eval",
+    ], f"Unsupported mode: {args.mode}"
     WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
     MASTER_PORT = str(get_free_port())
     gin_path = f"{os.path.dirname(__file__)}/gin/{SUPPORTED_CONFIGS[args.dataset]}"

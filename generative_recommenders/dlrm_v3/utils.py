@@ -138,69 +138,84 @@ class MetricsLogger:
         ]
         self.task_names: List[str] = all_classification_tasks + all_regression_tasks
 
-        self.class_metrics: List[RecMetricComputation] = []
+        self.class_metrics: Dict[str, List[RecMetricComputation]] = {
+            "train": [],
+            "eval": [],
+        }
         if all_classification_tasks:
-            self.class_metrics.append(
-                NEMetricComputation(
-                    my_rank=rank,
-                    batch_size=batch_size,
-                    n_tasks=len(all_classification_tasks),
-                    window_size=window_size,
-                ).to(device)
-            )
-            self.class_metrics.append(
-                AUCMetricComputation(
-                    my_rank=rank,
-                    batch_size=batch_size,
-                    n_tasks=len(all_classification_tasks),
-                    window_size=window_size,
-                ).to(device)
-            )
+            for mode in ["train", "eval"]:
+                self.class_metrics[mode].append(
+                    NEMetricComputation(
+                        my_rank=rank,
+                        batch_size=batch_size,
+                        n_tasks=len(all_classification_tasks),
+                        window_size=window_size,
+                    ).to(device)
+                )
+                self.class_metrics[mode].append(
+                    AUCMetricComputation(
+                        my_rank=rank,
+                        batch_size=batch_size,
+                        n_tasks=len(all_classification_tasks),
+                        window_size=window_size,
+                    ).to(device)
+                )
 
-        self.regression_metrics: List[RecMetricComputation] = []
-
+        self.regression_metrics: Dict[str, List[RecMetricComputation]] = {
+            "train": [],
+            "eval": [],
+        }
         if all_regression_tasks:
-            self.regression_metrics.append(
-                MSEMetricComputation(
-                    my_rank=rank,
-                    batch_size=batch_size,
-                    n_tasks=len(all_regression_tasks),
-                    window_size=window_size,
-                ).to(device)
-            )
-            self.regression_metrics.append(
-                MAEMetricComputation(
-                    my_rank=rank,
-                    batch_size=batch_size,
-                    n_tasks=len(all_regression_tasks),
-                    window_size=window_size,
-                ).to(device)
-            )
+            for mode in ["train", "eval"]:
+                self.regression_metrics[mode].append(
+                    MSEMetricComputation(
+                        my_rank=rank,
+                        batch_size=batch_size,
+                        n_tasks=len(all_regression_tasks),
+                        window_size=window_size,
+                    ).to(device)
+                )
+                self.regression_metrics[mode].append(
+                    MAEMetricComputation(
+                        my_rank=rank,
+                        batch_size=batch_size,
+                        n_tasks=len(all_regression_tasks),
+                        window_size=window_size,
+                    ).to(device)
+                )
 
-        self.global_step: int = 0
+        self.global_step: Dict[str, int] = {"train": 0, "eval": 0}
         self.tb_logger: Optional[SummaryWriter] = None
         if tensorboard_log_path != "":
-            self.tb_logger = SummaryWriter(log_dir=tensorboard_log_path)
+            self.tb_logger = SummaryWriter(log_dir=tensorboard_log_path, purge_step=0)
+            self.tb_logger.flush()
 
     @property
-    def all_metrics(self) -> List[RecMetricComputation]:
-        return self.class_metrics + self.regression_metrics
+    def all_metrics(self) -> Dict[str, List[RecMetricComputation]]:
+        return {
+            "train": self.class_metrics["train"] + self.regression_metrics["train"],
+            "eval": self.class_metrics["eval"] + self.regression_metrics["eval"],
+        }
 
     def update(
-        self, predictions: torch.Tensor, weights: torch.Tensor, labels: torch.Tensor
+        self,
+        predictions: torch.Tensor,
+        weights: torch.Tensor,
+        labels: torch.Tensor,
+        mode: str = "train",
     ) -> None:
-        for metric in self.all_metrics:
+        for metric in self.all_metrics[mode]:
             metric.update(
                 predictions=predictions,
                 labels=labels,
                 weights=weights,
             )
-        self.global_step += 1
+        self.global_step[mode] += 1
 
-    def compute(self) -> Dict[str, float]:
+    def compute(self, mode: str = "train") -> Dict[str, float]:
         all_computed_metrics = {}
 
-        for metric in self.all_metrics:
+        for metric in self.all_metrics[mode]:
             computed_metrics = metric.compute()
             for computed in computed_metrics:
                 all_values = computed.value.cpu()
@@ -208,33 +223,37 @@ class MetricsLogger:
                     key = f"metric/{str(computed.metric_prefix) + str(computed.name)}/{task_name}"
                     all_computed_metrics[key] = all_values[i]
 
-        logger.info(f"Step {self.global_step} metrics: {all_computed_metrics}")
+        logger.info(
+            f"{mode} - Step {self.global_step[mode]} metrics: {all_computed_metrics}"
+        )
         return all_computed_metrics
 
     def compute_and_log(
-        self, additional_logs: Optional[Dict[str, Dict[str, torch.Tensor]]] = None
+        self,
+        mode: str = "train",
+        additional_logs: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
     ) -> Dict[str, float]:
         assert self.tb_logger is not None
-        all_computed_metrics = self.compute()
+        all_computed_metrics = self.compute(mode)
         for k, v in all_computed_metrics.items():
             self.tb_logger.add_scalar(  # pyre-ignore [16]
-                k,
+                f"{mode}_{k}",
                 v,
-                global_step=self.global_step,
+                global_step=self.global_step[mode],
             )
 
         if additional_logs is not None:
             for tag, data in additional_logs.items():
                 for data_name, data_value in data.items():
                     self.tb_logger.add_scalar(
-                        f"{tag}/{data_name}",
+                        f"{tag}/{mode}_{data_name}",
                         data_value.detach().clone().cpu(),
-                        global_step=self.global_step,
+                        global_step=self.global_step[mode],
                     )
         return all_computed_metrics
 
-    def reset(self):
-        for metric in self.all_metrics:
+    def reset(self, mode: str = "train"):
+        for metric in self.all_metrics[mode]:
             metric.reset()
 
 

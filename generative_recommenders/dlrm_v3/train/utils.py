@@ -331,7 +331,7 @@ def train_loop(
     metric_log_frequency: int = 1,
     # lr_scheduler: to-do: Add a scheduler
 ) -> None:
-    model = model.train()
+    model.train()
     batch_idx: int = 0
     profiler = Profiler(rank, active=10) if output_trace else None
 
@@ -354,15 +354,17 @@ def train_loop(
             sum(aux_losses.values()).backward()
             optimizer.step()
             metric_logger.update(
+                mode="train",
                 predictions=mt_target_preds,
                 labels=mt_target_labels,
                 weights=mt_target_weights,
             )
             if batch_idx % metric_log_frequency != 0:
                 metric_logger.compute_and_log(
+                    mode="train",
                     additional_logs={
                         "losses": aux_losses,
-                    }
+                    },
                 )
             batch_idx += 1
             if output_trace:
@@ -387,10 +389,10 @@ def eval_loop(
     output_trace: bool = False,
     # lr_scheduler: to-do: Add a scheduler
 ) -> None:
-    model = model.eval()
+    model.eval()
     batch_idx: int = 0
     profiler = Profiler(rank, active=10) if output_trace else None
-    metric_logger.reset()
+    metric_logger.reset(mode="eval")
     for sample in dataloader:
         sample.to(device)
         (
@@ -405,6 +407,7 @@ def eval_loop(
             sample.candidates_features_kjt,
         )
         metric_logger.update(
+            mode="eval",
             predictions=mt_target_preds,
             labels=mt_target_labels,
             weights=mt_target_weights,
@@ -415,6 +418,96 @@ def eval_loop(
             profiler.step()
         if num_batches is not None and batch_idx >= num_batches:
             break
-    metric_logger.compute_and_log()
-    for k, v in metric_logger.compute().items():
+    metric_logger.compute_and_log(mode="eval")
+    for k, v in metric_logger.compute(mode="eval").items():
         print(f"{k}: {v}")
+
+
+@gin.configurable
+def train_eval_loop(
+    rank: int,
+    model: torch.nn.Module,
+    optimizer: Optimizer,
+    metric_logger: MetricsLogger,
+    device: torch.device,
+    num_epochs: int,
+    train_dataloader: Optional[torch.utils.data.DataLoader] = None,
+    eval_dataloader: Optional[torch.utils.data.DataLoader] = None,
+    output_trace: bool = False,
+    metric_log_frequency: int = 1,
+    eval_frequency: int = 1,
+    # lr_scheduler: to-do: Add a scheduler
+) -> None:
+    profiler = Profiler(rank, active=10) if output_trace else None
+
+    for epoch in range(num_epochs):
+        if train_dataloader is not None:
+            model.train()
+            metric_logger.reset(mode="train")
+            train_batch_idx: int = 0
+            for sample in train_dataloader:
+                optimizer.zero_grad()
+                sample.to(device)
+                (
+                    _,
+                    _,
+                    aux_losses,
+                    mt_target_preds,
+                    mt_target_labels,
+                    mt_target_weights,
+                ) = model.forward(
+                    sample.uih_features_kjt,
+                    sample.candidates_features_kjt,
+                )
+                # pyre-ignore
+                sum(aux_losses.values()).backward()
+                optimizer.step()
+                metric_logger.update(
+                    mode="train",
+                    predictions=mt_target_preds,
+                    labels=mt_target_labels,
+                    weights=mt_target_weights,
+                )
+                if train_batch_idx % metric_log_frequency == 0:
+                    metric_logger.compute_and_log(
+                        mode="train",
+                        additional_logs={
+                            "losses": aux_losses,
+                        },
+                    )
+                train_batch_idx += 1
+                if output_trace:
+                    assert profiler is not None
+                    profiler.step()
+        if eval_dataloader is not None and epoch % eval_frequency == 0:
+            model.eval()
+            metric_logger.reset(mode="eval")
+            eval_batch_idx: int = 0
+            for sample in eval_dataloader:
+                sample.to(device)
+                (
+                    _,
+                    _,
+                    _,
+                    mt_target_preds,
+                    mt_target_labels,
+                    mt_target_weights,
+                ) = model.forward(
+                    sample.uih_features_kjt,
+                    sample.candidates_features_kjt,
+                )
+                metric_logger.update(
+                    mode="eval",
+                    predictions=mt_target_preds,
+                    labels=mt_target_labels,
+                    weights=mt_target_weights,
+                )
+                eval_batch_idx += 1
+                if output_trace:
+                    assert profiler is not None
+                    profiler.step()
+            metric_logger.compute_and_log(mode="eval")
+            for k, v in metric_logger.compute(mode="eval").items():
+                print(f"{k}: {v}")
+
+    save_dmp_checkpoint(model, optimizer, rank)
