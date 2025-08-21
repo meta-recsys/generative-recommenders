@@ -632,7 +632,7 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd(
   bool const has_attn_scale = attn_scale.has_value();
   if (has_attn_scale) {
     attn_scale_ = attn_scale.value();
-    scalar_scale = attn_scale_.numel() == 1;
+    scalar_scale = attn_scale_.numel() == num_groups;
     CHECK_DEVICE(attn_scale_);
     TORCH_CHECK(
         attn_scale_.dtype() == torch::kFloat32,
@@ -1039,7 +1039,7 @@ std::vector<at::Tensor> hstu_mha_bwd(
   bool const has_attn_scale = attn_scale.has_value();
   if (has_attn_scale) {
     attn_scale_ = attn_scale.value();
-    scalar_scale = attn_scale_.numel() == 1;
+    scalar_scale = attn_scale_.numel() == num_groups;
     CHECK_DEVICE(attn_scale_);
     TORCH_CHECK(
         attn_scale_.dtype() == torch::kFloat32,
