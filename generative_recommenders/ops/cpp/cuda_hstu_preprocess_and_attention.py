@@ -36,6 +36,10 @@ try:
     from generative_recommenders.fb.ultra.ops.fp8.layer_norm_quantization import (
         triton_weighted_layer_norm_quantization_fwd,
     )
+    from hammer.ops.triton.triton_apply_rope import (
+        triton_apply_rope_bwd,
+        triton_apply_rope_fwd,
+    )
 
     if is_sm100():
         torch.ops.load_library(
@@ -67,6 +71,9 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         alpha: float,
         invalid_attn_mask_type: str,
         num_targets: Optional[torch.Tensor],
+        rotary_weights: Optional[
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = None,
         attn_scale: Optional[torch.Tensor] = None,
         recompute_uvqk_in_backward: bool = False,
         recompute_normed_x_in_backward: bool = False,
@@ -110,6 +117,29 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             ],
             dim=1,
         )
+        if rotary_weights is not None:
+            q_cos_weights = rotary_weights[0]
+            q_sin_weights = rotary_weights[1]
+            k_cos_weights = rotary_weights[2]
+            k_sin_weights = rotary_weights[3]
+            _q = triton_apply_rope_fwd(
+                x=q.view(-1, num_heads, attn_dim),
+                N=max_seq_len,
+                seq_offsets=seq_offsets,
+                cos_rope=q_cos_weights,
+                sin_rope=q_sin_weights,
+            ).view(-1, num_heads * attn_dim)
+            _k = triton_apply_rope_fwd(
+                x=k.view(-1, num_heads, attn_dim),
+                N=max_seq_len,
+                seq_offsets=seq_offsets,
+                cos_rope=k_cos_weights,
+                sin_rope=k_sin_weights,
+            ).view(-1, num_heads * attn_dim)
+            if q.data_ptr() != _q.data_ptr():
+                q.copy_(_q)
+            if k.data_ptr() != _k.data_ptr():
+                k.copy_(_k)
         q = q.view(-1, num_heads, attn_dim)
         k = k.view(-1, num_heads, attn_dim)
         v = v.view(-1, num_heads, hidden_dim)
@@ -178,10 +208,16 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 saved_tensors.append(normed_x_fp8)  # pyre-ignore
         else:
             saved_tensors.append(uvqk)
+        if rotary_weights is not None:
+            saved_tensors.append(rotary_weights[0])
+            saved_tensors.append(rotary_weights[1])
+            saved_tensors.append(rotary_weights[2])
+            saved_tensors.append(rotary_weights[3])
         ctx.save_for_backward(*saved_tensors)
         ctx.alpha = alpha
         ctx.invalid_attn_mask_type = invalid_attn_mask_type
         ctx.has_multiple_targets = num_targets is not None
+        ctx.has_rotary_weights = rotary_weights is not None
         ctx.has_attn_scale = attn_scale is not None
         ctx.max_seq_len = max_seq_len
         ctx.max_attn_len = max_attn_len
@@ -216,6 +252,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         None,
         torch.Tensor,  # d_uvqk_weight
         torch.Tensor,  # d_uvqk_bias
+        None,
         None,
         None,
         None,
@@ -278,6 +315,18 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         else:
             uvqk = ctx.saved_tensors[idx]
             idx += 1
+        if ctx.has_rotary_weights:
+            q_cos_weights, q_sin_weights, k_cos_weights, k_sin_weights = (
+                ctx.saved_tensors[idx : idx + 4]
+            )
+            idx += 4
+        else:
+            q_cos_weights, q_sin_weights, k_cos_weights, k_sin_weights = (
+                None,
+                None,
+                None,
+                None,
+            )
 
         duvqk = torch.empty_like(uvqk)
         du, dv, dq, dk = duvqk.split(
@@ -301,6 +350,23 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         q = q.view(-1, ctx.num_heads, ctx.attn_dim)
         k = k.view(-1, ctx.num_heads, ctx.attn_dim)
         v = v.view(-1, ctx.num_heads, ctx.hidden_dim)
+        if (
+            ctx.recompute_uvqk_in_backward and ctx.has_rotary_weights
+        ):  # recompute ROPE on qk
+            q = triton_apply_rope_fwd(
+                x=q,
+                N=ctx.max_seq_len,
+                seq_offsets=seq_offsets,
+                cos_rope=q_cos_weights,
+                sin_rope=q_sin_weights,
+            )
+            k = triton_apply_rope_fwd(
+                x=k,
+                N=ctx.max_seq_len,
+                seq_offsets=seq_offsets,
+                cos_rope=k_cos_weights,
+                sin_rope=k_sin_weights,
+            )
         dq = dq.view(-1, ctx.num_heads, ctx.attn_dim)
         dk = dk.view(-1, ctx.num_heads, ctx.attn_dim)
         dv = dv.view(-1, ctx.num_heads, ctx.hidden_dim)
@@ -349,6 +415,21 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 False,  # deterministic
                 0,  # sm_margin
             )
+        if ctx.has_rotary_weights:
+            _dq = triton_apply_rope_bwd(
+                grad=_dq,
+                N=ctx.max_seq_len,
+                seq_offsets=seq_offsets,
+                cos_rope=q_cos_weights,
+                sin_rope=q_sin_weights,
+            )
+            _dk = triton_apply_rope_bwd(
+                grad=_dk,
+                N=ctx.max_seq_len,
+                seq_offsets=seq_offsets,
+                cos_rope=k_cos_weights,
+                sin_rope=k_sin_weights,
+            )
         if dq.data_ptr() != _dq.data_ptr():
             dq.copy_(_dq)
         if dk.data_ptr() != _dk.data_ptr():
@@ -388,6 +469,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             None,
             d_uvqk_weight,
             d_uvqk_bias,
+            None,
             None,
             None,
             None,
