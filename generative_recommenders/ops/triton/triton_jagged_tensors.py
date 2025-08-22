@@ -15,7 +15,7 @@
 #!/usr/bin/env python3
 
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -25,9 +25,29 @@ import triton
 # @manual=//triton:triton
 import triton.language as tl
 
-from generative_recommenders.common import switch_to_contiguous_if_needed
+from generative_recommenders.common import (
+    switch_to_contiguous_if_needed,
+    triton_autotune,
+)
 
 
+def _get_concat_split_2d_jagged_multirow_configs() -> List[triton.Config]:
+    configs = []
+    for BLOCK_N in [1, 2, 4, 8]:
+        for num_warps in [1, 2, 4]:
+            configs.append(
+                triton.Config(
+                    {"BLOCK_N": BLOCK_N},
+                    num_warps=num_warps,
+                )
+            )
+    return configs
+
+
+@triton_autotune(
+    configs=_get_concat_split_2d_jagged_multirow_configs(),
+    key=["BLOCK_D"],
+)
 @triton.jit
 def _concat_2D_jagged(
     ValuesA,
@@ -45,9 +65,11 @@ def _concat_2D_jagged(
     IS_DENSE_A: tl.constexpr,
     IS_DENSE_B: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
     off_z = tl.program_id(1)
-    off_n = tl.program_id(0)
+    block_n = tl.program_id(0)
+
     if IS_DENSE_A:
         seq_start_a = off_z * MaxLenA
         seq_len_a = MaxLenA
@@ -63,29 +85,61 @@ def _concat_2D_jagged(
         seq_end_b = tl.load(OffsetsB + off_z + 1)
         seq_len_b = seq_end_b - seq_start_b
     seq_len = seq_len_a + seq_len_b
-    if off_n >= seq_len:
-        return
+
+    start_n = block_n * BLOCK_N
+    offs_n = start_n + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_D)
-    out_seq_start = seq_start_a + seq_start_b + off_n
-    out_ptrs = Out + out_seq_start.to(tl.int64) * stride_od + offs_d
-    if off_n < n_prefix_from_B:
-        in_ptrs = ValuesB + (off_n + seq_start_b).to(tl.int64) * stride_bd + offs_d
-    elif off_n < seq_len_a + n_prefix_from_B:
-        in_ptrs = (
-            ValuesA
-            + (off_n - n_prefix_from_B + seq_start_a).to(tl.int64) * stride_ad
-            + offs_d
-        )
-    else:
-        in_ptrs = (
-            ValuesB
-            + (off_n - seq_len_a + seq_start_b).to(tl.int64) * stride_bd
-            + offs_d
-        )
-    v = tl.load(in_ptrs, mask=offs_d < D)
-    tl.store(out_ptrs, v, mask=offs_d < D)
+
+    valid_mask = offs_n < seq_len
+
+    out_seq_start = seq_start_a + seq_start_b + offs_n
+    out_ptrs = Out + out_seq_start[:, None].to(tl.int64) * stride_od + offs_d[None, :]
+
+    from_prefix_b_mask = (offs_n < n_prefix_from_B) & valid_mask
+    from_a_mask = (
+        (offs_n >= n_prefix_from_B)
+        & (offs_n < seq_len_a + n_prefix_from_B)
+        & valid_mask
+    )
+    from_suffix_b_mask = (offs_n >= seq_len_a + n_prefix_from_B) & valid_mask
+
+    in_b1_ptrs = (
+        ValuesB
+        + (offs_n[:, None] + seq_start_b).to(tl.int64) * stride_bd
+        + offs_d[None, :]
+    )
+    v_b1 = tl.load(
+        in_b1_ptrs, mask=from_prefix_b_mask[:, None] & (offs_d[None, :] < D), other=0.0
+    )
+    tl.store(out_ptrs, v_b1, mask=from_prefix_b_mask[:, None] & (offs_d[None, :] < D))
+
+    off_a = offs_n - n_prefix_from_B
+    in_a_ptrs = (
+        ValuesA
+        + (off_a[:, None] + seq_start_a).to(tl.int64) * stride_ad
+        + offs_d[None, :]
+    )
+    v_a = tl.load(
+        in_a_ptrs, mask=from_a_mask[:, None] & (offs_d[None, :] < D), other=0.0
+    )
+    tl.store(out_ptrs, v_a, mask=from_a_mask[:, None] & (offs_d[None, :] < D))
+
+    off_b = offs_n - seq_len_a
+    in_b2_ptrs = (
+        ValuesB
+        + (off_b[:, None] + seq_start_b).to(tl.int64) * stride_bd
+        + offs_d[None, :]
+    )
+    v_b2 = tl.load(
+        in_b2_ptrs, mask=from_suffix_b_mask[:, None] & (offs_d[None, :] < D), other=0.0
+    )
+    tl.store(out_ptrs, v_b2, mask=from_suffix_b_mask[:, None] & (offs_d[None, :] < D))
 
 
+@triton_autotune(
+    configs=_get_concat_split_2d_jagged_multirow_configs(),
+    key=["BLOCK_D"],
+)
 @triton.jit
 def _split_2D_jagged(
     JaggedIn,
@@ -103,9 +157,11 @@ def _split_2D_jagged(
     IS_DENSE_A: tl.constexpr,
     IS_DENSE_B: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
     off_z = tl.program_id(1)
-    off_n = tl.program_id(0)
+    block_n = tl.program_id(0)
+
     if IS_DENSE_A:
         seq_start_a = off_z * MaxLenA
         seq_len_a = MaxLenA
@@ -121,25 +177,46 @@ def _split_2D_jagged(
         seq_end_b = tl.load(OffsetsB + off_z + 1)
         seq_len_b = seq_end_b - seq_start_b
     seq_len = seq_len_a + seq_len_b
-    if off_n >= seq_len:
-        return
     seq_start = seq_start_a + seq_start_b
+
+    start_n = block_n * BLOCK_N
+    offs_n = start_n + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_D)
-    in_ptrs = JaggedIn + (seq_start + off_n).to(tl.int64) * stride_id + offs_d
-    if off_n < n_prefix_to_B:
-        out_ptrs = OutB + (off_n + seq_start_b).to(tl.int64) * stride_bd + offs_d
-    elif off_n < seq_len_a + n_prefix_to_B:
-        out_ptrs = (
-            OutA
-            + (off_n - n_prefix_to_B + seq_start_a).to(tl.int64) * stride_ad
-            + offs_d
-        )
-    else:
-        out_ptrs = (
-            OutB + (off_n - seq_len_a + seq_start_b).to(tl.int64) * stride_bd + offs_d
-        )
-    v = tl.load(in_ptrs, mask=offs_d < D)
-    tl.store(out_ptrs, v, mask=offs_d < D)
+
+    valid_mask = offs_n < seq_len
+
+    in_ptrs = (
+        JaggedIn
+        + (seq_start + offs_n[:, None]).to(tl.int64) * stride_id
+        + offs_d[None, :]
+    )
+
+    v = tl.load(in_ptrs, mask=valid_mask[:, None] & (offs_d[None, :] < D), other=0.0)
+
+    to_prefix_b_mask = (offs_n < n_prefix_to_B) & valid_mask
+    to_a_mask = (
+        (offs_n >= n_prefix_to_B) & (offs_n < seq_len_a + n_prefix_to_B) & valid_mask
+    )
+    to_suffix_b_mask = (offs_n >= seq_len_a + n_prefix_to_B) & valid_mask
+
+    out_b1_ptrs = (
+        OutB
+        + (offs_n[:, None] + seq_start_b).to(tl.int64) * stride_bd
+        + offs_d[None, :]
+    )
+    tl.store(out_b1_ptrs, v, mask=to_prefix_b_mask[:, None] & (offs_d[None, :] < D))
+
+    off_a = offs_n - n_prefix_to_B
+    out_a_ptrs = (
+        OutA + (off_a[:, None] + seq_start_a).to(tl.int64) * stride_ad + offs_d[None, :]
+    )
+    tl.store(out_a_ptrs, v, mask=to_a_mask[:, None] & (offs_d[None, :] < D))
+
+    off_b = offs_n - seq_len_a
+    out_b2_ptrs = (
+        OutB + (off_b[:, None] + seq_start_b).to(tl.int64) * stride_bd + offs_d[None, :]
+    )
+    tl.store(out_b2_ptrs, v, mask=to_suffix_b_mask[:, None] & (offs_d[None, :] < D))
 
 
 class _Concat2DJaggedFunction(torch.autograd.Function):
@@ -179,7 +256,11 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
         values_out = torch.empty(
             (total_seq_len, D), device=values_a.device, dtype=values_a.dtype
         )
-        _concat_2D_jagged[(max_seq_len, B)](
+
+        def get_grid(meta):
+            return (triton.cdiv(max_seq_len, meta["BLOCK_N"]), B)
+
+        _concat_2D_jagged[get_grid](
             ValuesA=values_a,
             ValuesB=values_b,
             OffsetsA=offsets_a,
@@ -224,7 +305,11 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
         d_values_b = torch.empty(
             (ctx.total_len_b, D), device=d_out.device, dtype=d_out.dtype
         )
-        _split_2D_jagged[(ctx.max_seq_len, ctx.B)](
+
+        def get_grid(meta):
+            return (triton.cdiv(ctx.max_seq_len, meta["BLOCK_N"]), ctx.B)
+
+        _split_2D_jagged[get_grid](
             JaggedIn=d_out,
             OffsetsA=offsets_a,
             OffsetsB=offsets_b,
@@ -295,7 +380,11 @@ class _Split2DJaggedFunction(torch.autograd.Function):
         values_b = torch.empty(
             (total_len_b, D), device=values.device, dtype=values.dtype
         )
-        _split_2D_jagged[(max_seq_len, B)](
+
+        def get_grid(meta):
+            return (triton.cdiv(max_seq_len, meta["BLOCK_N"]), B)
+
+        _split_2D_jagged[get_grid](
             JaggedIn=values,
             OffsetsA=offsets_a,
             OffsetsB=offsets_b,
@@ -338,7 +427,11 @@ class _Split2DJaggedFunction(torch.autograd.Function):
             device=d_values_a.device,
             dtype=d_values_a.dtype,
         )
-        _concat_2D_jagged[(ctx.max_seq_len, ctx.B)](
+
+        def get_grid(meta):
+            return (triton.cdiv(ctx.max_seq_len, meta["BLOCK_N"]), ctx.B)
+
+        _concat_2D_jagged[get_grid](
             ValuesA=d_values_a,
             ValuesB=d_values_b,
             OffsetsA=offsets_a,
