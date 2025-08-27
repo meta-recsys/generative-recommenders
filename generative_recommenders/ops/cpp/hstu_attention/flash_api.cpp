@@ -117,7 +117,8 @@ class HSTUFlashAttentionFunctionGPU
         max_seq_len_tensor,
         contextual_seq_len_tensor,
         max_attn_len_tensor,
-        min_full_attn_seq_len_tensor);
+        min_full_attn_seq_len_tensor,
+        num_groups);
     auto out = get<0>(fwd_out);
     auto softmax_lse = get<1>(fwd_out);
     ctx->save_for_backward(
@@ -241,6 +242,7 @@ class HSTUFlashAttentionFunctionGPU
         torch::autograd::Variable(), // contextual_seq_len_tensor
         torch::autograd::Variable(), // max_attn_len_tensor
         torch::autograd::Variable(), // min_full_attn_seq_len_tensor
+        torch::autograd::Variable(), // num_groups
     };
   }
 };
@@ -296,7 +298,12 @@ at::Tensor cuda_hstu_mha(
       max_q_len,
       seq_offsets_q,
       num_softmax_heads,
-      training);
+      training,
+      max_seq_len_tensor,
+      contextual_seq_len_tensor,
+      max_attn_len_tensor,
+      min_full_attn_seq_len_tensor,
+      num_groups);
 }
 
 at::Tensor hstu_mha_cpu(
