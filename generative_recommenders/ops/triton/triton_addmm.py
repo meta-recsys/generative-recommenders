@@ -25,12 +25,46 @@ import triton
 # @manual=//triton:triton
 import triton.language as tl
 from generative_recommenders.common import triton_autotune, triton_cc
+from generative_recommenders.ops.utils import is_sm100
+
+# @manual=//triton:triton
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 
 ENABLE_FULL_TURNING_SPACE = False
 
 
-def get_mm_configs() -> List[triton.Config]:
+def _check_tma_alignment(
+    x: torch.Tensor, w: torch.Tensor, y: torch.Tensor, min_alignment: int = 16
+) -> bool:
+    """Check if tensors meet TMA alignment requirements.
+
+    TMA (Tensor Memory Accelerator) on H100 requires:
+    1. Base addresses to be 64-byte aligned
+    2. Dimensions to be multiples of 64 for optimal performance
+    3. Contiguous inner dimensions (stride=1)
+
+    Args:
+        x: Input tensor [M, K]
+        w: Weight tensor [K, N]
+        y: Bias tensor [N] or [M, N]
+        min_alignment: Minimum alignment requirement (default: 64)
+
+    Returns:
+        True if all tensors meet TMA alignment requirements
+    """
+    _, K = x.shape
+    KB, N = w.shape
+    assert K == KB, f"incompatible dimensions {K}, {KB}"
+
+    is_y_1d = y.dim() == 1
+    NY = y.shape[0] if is_y_1d else y.shape[1]
+    assert N == NY, f"incompatible dimensions {N}, {NY}"
+
+    return (K % min_alignment == 0) and (N % min_alignment == 0)
+
+
+def get_mm_configs(pre_hook=None) -> List[triton.Config]:
     if torch.version.hip:
         if ENABLE_FULL_TURNING_SPACE:
             block_m_range = [32, 64, 128, 256]
@@ -66,6 +100,7 @@ def get_mm_configs() -> List[triton.Config]:
                 },
                 num_stages=num_stages,
                 num_warps=num_warps,
+                pre_hook=pre_hook,
             )
             for block_m in block_m_range
             for block_n in block_n_range
@@ -78,12 +113,12 @@ def get_mm_configs() -> List[triton.Config]:
             for num_warps in num_warps_range
         ]
     else:
-        block_m_range = [32, 64, 128, 256]
-        block_n_range = [32, 64, 128, 256]
+        block_m_range = [128, 256]
+        block_n_range = [128, 256]
         block_k_range = [32, 64]
-        group_m_range = [4, 8]
-        num_warps_range = [2, 4, 8]
-        num_stage_range = [2, 3, 4, 5]
+        group_m_range = [8, 16]
+        num_warps_range = [4, 8]
+        num_stage_range = [2, 3, 4]
         if ENABLE_FULL_TURNING_SPACE:
             return [
                 triton.Config(
@@ -95,6 +130,7 @@ def get_mm_configs() -> List[triton.Config]:
                     },
                     num_stages=num_stages,
                     num_warps=num_warps,
+                    pre_hook=pre_hook,
                 )
                 for block_m in block_m_range
                 for block_n in block_n_range
@@ -104,17 +140,7 @@ def get_mm_configs() -> List[triton.Config]:
                 for num_warps in num_warps_range
             ]
         else:
-            return [
-                triton.Config(
-                    {
-                        "BLOCK_M": 32,
-                        "BLOCK_N": 64,
-                        "BLOCK_K": 32,
-                        "GROUP_M": 8,
-                    },
-                    num_stages=5,
-                    num_warps=2,
-                ),
+            configs = [
                 triton.Config(
                     {
                         "BLOCK_M": 128,
@@ -124,6 +150,7 @@ def get_mm_configs() -> List[triton.Config]:
                     },
                     num_stages=3,
                     num_warps=8,
+                    pre_hook=pre_hook,
                 ),
                 triton.Config(
                     {
@@ -134,6 +161,7 @@ def get_mm_configs() -> List[triton.Config]:
                     },
                     num_stages=4,
                     num_warps=4,
+                    pre_hook=pre_hook,
                 ),
                 triton.Config(
                     {
@@ -144,6 +172,7 @@ def get_mm_configs() -> List[triton.Config]:
                     },
                     num_stages=4,
                     num_warps=4,
+                    pre_hook=pre_hook,
                 ),
                 triton.Config(
                     {
@@ -154,6 +183,7 @@ def get_mm_configs() -> List[triton.Config]:
                     },
                     num_stages=4,
                     num_warps=4,
+                    pre_hook=pre_hook,
                 ),
                 triton.Config(
                     {
@@ -164,6 +194,7 @@ def get_mm_configs() -> List[triton.Config]:
                     },
                     num_stages=4,
                     num_warps=4,
+                    pre_hook=pre_hook,
                 ),
                 triton.Config(
                     {
@@ -174,18 +205,47 @@ def get_mm_configs() -> List[triton.Config]:
                     },
                     num_stages=4,
                     num_warps=4,
-                ),
-                triton.Config(
-                    {
-                        "BLOCK_M": 64,
-                        "BLOCK_N": 32,
-                        "BLOCK_K": 32,
-                        "GROUP_M": 8,
-                    },
-                    num_stages=5,
-                    num_warps=2,
+                    pre_hook=pre_hook,
                 ),
             ]
+            if is_sm100():
+                configs += [
+                    triton.Config(
+                        {
+                            "BLOCK_M": 128,
+                            "BLOCK_N": 256,
+                            "BLOCK_K": 64,
+                            "GROUP_M": 8,
+                        },
+                        num_stages=3,
+                        num_warps=4,
+                        pre_hook=pre_hook,
+                    ),
+                ]
+            else:
+                configs += [
+                    triton.Config(
+                        {
+                            "BLOCK_M": 64,
+                            "BLOCK_N": 32,
+                            "BLOCK_K": 32,
+                            "GROUP_M": 8,
+                        },
+                        num_stages=5,
+                        num_warps=2,
+                    ),
+                    triton.Config(
+                        {
+                            "BLOCK_M": 32,
+                            "BLOCK_N": 64,
+                            "BLOCK_K": 32,
+                            "GROUP_M": 8,
+                        },
+                        num_stages=5,
+                        num_warps=2,
+                    ),
+                ]
+            return configs
 
 
 @triton_cc(
@@ -279,6 +339,143 @@ def _addmm_fwd(
     tl.store(z_ptrs, z, mask=z_mask)
 
 
+def _addmm_tma_set_block_size_hook(nargs):
+    BLOCK_M = nargs["BLOCK_M"]
+    BLOCK_N = nargs["BLOCK_N"]
+    BLOCK_K = nargs["BLOCK_K"]
+    nargs["x_desc"].block_shape = [BLOCK_M, BLOCK_K]
+    nargs["w_desc"].block_shape = [BLOCK_K, BLOCK_N]
+    nargs["z_desc"].block_shape = [BLOCK_M, BLOCK_N]
+    if nargs["BROADCAST_Y"]:
+        nargs["y_desc"].block_shape = [1, BLOCK_N]
+    else:
+        nargs["y_desc"].block_shape = [BLOCK_M, BLOCK_N]
+
+
+@triton.jit
+def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
+    group_id = tile_id // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + (tile_id % group_size_m)
+    pid_n = (tile_id % num_pid_in_group) // group_size_m
+    return pid_m, pid_n
+
+
+@triton_autotune(
+    configs=get_mm_configs(pre_hook=_addmm_tma_set_block_size_hook),
+    key=["N", "K", "WARP_SPECIALIZE"],
+)
+@triton.jit
+def _addmm_fwd_tma_persistent(
+    x_desc,
+    w_desc,
+    y_desc,
+    z_desc,
+    M,
+    N,
+    K,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
+    BROADCAST_Y: tl.constexpr,
+    WARP_SPECIALIZE: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    start_pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    k_tiles = tl.cdiv(K, BLOCK_K)
+    num_tiles = num_pid_m * num_pid_n
+
+    num_pid_in_group = GROUP_M * num_pid_n
+
+    for tile_id in tl.range(
+        start_pid, num_tiles, NUM_SMS, flatten=True, warp_specialize=WARP_SPECIALIZE
+    ):
+        pid_m, pid_n = _compute_pid(
+            tile_id, num_pid_in_group, num_pid_m, GROUP_M, NUM_SMS
+        )
+        offs_xm = pid_m * BLOCK_M
+        offs_wn = pid_n * BLOCK_N
+
+        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k in tl.range(0, k_tiles, warp_specialize=WARP_SPECIALIZE):
+            offs_k = k * BLOCK_K
+            x = x_desc.load([offs_xm, offs_k])
+            w = w_desc.load([offs_k, offs_wn])
+            accumulator = tl.dot(x, w, accumulator, allow_tf32=ALLOW_TF32)
+        if BROADCAST_Y:
+            y = y_desc.load([0, offs_wn])
+        else:
+            y = y_desc.load([offs_xm, offs_wn])
+        z = (accumulator + y.to(tl.float32)).to(z_desc.dtype)
+        z_desc.store([offs_xm, offs_wn], z)
+
+
+@torch.fx.wrap
+def triton_addmm_fwd_tma_persistent(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    y: torch.Tensor,
+    warp_specialize: bool = False,
+) -> torch.Tensor:
+    M, K = x.shape
+    _, N = w.shape
+
+    is_y_1d = y.dim() == 1
+
+    # Allocate output
+    z = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    if M == 0 or N == 0:
+        return z
+
+    # A dummy block value that will be overwritten when we have the real block size
+    dummy_block = [1, 1]
+    # pyre-ignore[6]: In call `TensorDescriptor.__init__`, for 2nd positional
+    # argument, expected `List[int]` but got `Size`
+    x_desc = TensorDescriptor(x, x.shape, x.stride(), dummy_block)
+    # pyre-ignore[6]: In call `TensorDescriptor.__init__`, for 2nd positional
+    # argument, expected `List[int]` but got `Size`
+    w_desc = TensorDescriptor(w, w.shape, w.stride(), dummy_block)
+    y = y.reshape(1, -1) if is_y_1d else y
+    # pyre-ignore[6]: In call `TensorDescriptor.__init__`, for 2nd positional
+    # argument, expected `List[int]` but got `Size`
+    y_desc = TensorDescriptor(y, y.shape, y.stride(), dummy_block)
+    # pyre-ignore[6]: In call `TensorDescriptor.__init__`, for 2nd positional
+    # argument, expected `List[int]` but got `Size`
+    z_desc = TensorDescriptor(z, z.shape, z.stride(), dummy_block)
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+
+    def grid(meta):
+        nonlocal x_desc, w_desc, z_desc
+        BLOCK_M = meta["BLOCK_M"]
+        BLOCK_N = meta["BLOCK_N"]
+        return (
+            min(
+                NUM_SMS,
+                triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
+            ),
+        )
+
+    _addmm_fwd_tma_persistent[grid](
+        x_desc,
+        w_desc,
+        y_desc,
+        z_desc,
+        M,
+        N,
+        K,
+        ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+        BROADCAST_Y=is_y_1d,
+        WARP_SPECIALIZE=warp_specialize,
+        NUM_SMS=NUM_SMS,
+    )
+    return z
+
+
 @torch.fx.wrap
 def triton_addmm_fwd(
     x: torch.Tensor,
@@ -352,7 +549,11 @@ class _AddMmFunction(torch.autograd.Function):
     ) -> torch.Tensor:
         ctx.save_for_backward(x, w)
         ctx.is_y_1d = y.dim() == 1
-        return triton_addmm_fwd(x, w, y)
+        if is_sm100() and _check_tma_alignment(x, w, y):
+            # use TMA persistent kernel on sm100
+            return triton_addmm_fwd_tma_persistent(x, w, y, warp_specialize=True)
+        else:
+            return triton_addmm_fwd(x, w, y)
 
     @staticmethod
     # pyre-ignore[14]
