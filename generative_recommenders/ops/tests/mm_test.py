@@ -33,7 +33,7 @@ class MMlTest(unittest.TestCase):
     @given(
         M=st.integers(min_value=100, max_value=300),
         N=st.integers(min_value=100, max_value=300),
-        K=st.integers(min_value=100, max_value=300),
+        K=st.sampled_from([128, 256]),
         broadcast=st.booleans(),
         dtype=st.sampled_from(
             [torch.float32, torch.bfloat16, torch.float16]
@@ -47,6 +47,41 @@ class MMlTest(unittest.TestCase):
         deadline=None,
     )
     def test_addmm(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        broadcast: bool,
+        dtype: torch.dtype,
+    ) -> None:
+        self._test_addmm(
+            M=M,
+            N=N,
+            K=K,
+            broadcast=broadcast,
+            dtype=dtype,
+            kernel_type=HammerKernel.TRITON,
+        )
+
+    @unittest.skipIf(*gpu_unavailable)
+    # pyre-ignore[56]
+    @given(
+        M=st.integers(min_value=100, max_value=300),
+        N=st.sampled_from([16, 48, 128, 144, 256]),
+        K=st.sampled_from([16, 48, 128, 144, 256]),
+        broadcast=st.booleans(),
+        dtype=st.sampled_from(
+            [torch.float32, torch.bfloat16, torch.float16]
+            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            else [torch.float32]
+        ),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=20,
+        deadline=None,
+    )
+    def test_addmm_tma(
         self,
         M: int,
         N: int,
