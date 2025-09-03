@@ -107,7 +107,13 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 is_inference=False,
             ).contiguous()
         else:
-            uvqk = triton_addmm_fwd(x=normed_x, w=uvqk_weight, y=uvqk_bias).contiguous()
+            # triton addmm is slower than torch (cublas) on AMD/Blackwell.
+            if is_sm100() or torch.version.hip is not None:
+                uvqk = torch.addmm(uvqk_bias, normed_x, uvqk_weight).contiguous()
+            else:
+                uvqk = triton_addmm_fwd(
+                    x=normed_x, w=uvqk_weight, y=uvqk_bias
+                ).contiguous()
         u, v, q, k = uvqk.split(
             [
                 hidden_dim * num_heads,
@@ -311,7 +317,10 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 )
                 idx += 2
             else:
-                uvqk = triton_addmm_fwd(x=normed_x, w=uvqk_weight, y=uvqk_bias)
+                if is_sm100() or torch.version.hip is not None:
+                    uvqk = torch.addmm(uvqk_bias, normed_x, uvqk_weight)
+                else:
+                    uvqk = triton_addmm_fwd(x=normed_x, w=uvqk_weight, y=uvqk_bias)
         else:
             uvqk = ctx.saved_tensors[idx]
             idx += 1
