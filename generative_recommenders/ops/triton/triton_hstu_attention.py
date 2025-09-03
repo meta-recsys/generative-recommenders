@@ -46,7 +46,14 @@ from triton.language.extra.libdevice import (  # @manual=//triton:triton
     fast_dividef,
     fast_expf,
 )
-from triton.tools.tensor_descriptor import TensorDescriptor
+
+try:
+    # @manual=//triton:triton
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    tensor_descriptor_tma = True
+except ImportError:
+    tensor_descriptor_tma = False
 
 try:
     from generative_recommenders.ops.triton.fb.triton_attention_utils import acc_dq
@@ -55,6 +62,9 @@ except ImportError:
 
 
 def _host_descriptor_pre_hook(nargs):
+    if not tensor_descriptor_tma:
+        return
+
     if not isinstance(nargs["Q"], TensorDescriptor):
         return
     BLOCK_M = nargs["BLOCK_M"]
@@ -2574,7 +2584,7 @@ def triton_hstu_attention_fwd(
     desc_k = k
     desc_v = v
 
-    if enable_tma:
+    if enable_tma and tensor_descriptor_tma:
         dummy_block = [1, 1]
         desc_q = TensorDescriptor(
             q,
@@ -2920,7 +2930,7 @@ def triton_cached_hstu_mha(
     desc_k = k
     desc_v = v
 
-    if enable_tma:
+    if enable_tma and tensor_descriptor_tma:
         dummy_block = [1, 1]
         desc_q = TensorDescriptor(
             delta_q,
