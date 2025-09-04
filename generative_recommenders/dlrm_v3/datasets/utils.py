@@ -18,7 +18,7 @@ from typing import List, Tuple
 
 
 def separate_uih_candidates(
-    x: str,
+    x: str | int | List[int],
     candidates_max_seq_len: int,
 ) -> Tuple[List[int], List[int]]:
     if isinstance(x, str):
