@@ -78,47 +78,62 @@ def _ln_mul_dropout_fwd(
     stride_x,
     stride_u,
     stride_y,
+    N,
     SILU_U: tl.constexpr,
     BLOCK_D: tl.constexpr,
     TRAINING: tl.constexpr,
     CONCAT_UX: tl.constexpr,
     FAST_DROPOUT: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    pid = tl.program_id(0)
+    tile_num = tl.num_programs(0)
+    rows_per_tile = N // tile_num
+    if pid < N % tile_num:
+        rows_per_tile += 1
+
+    if rows_per_tile == 0:
+        return
+
+    cols = tl.arange(0, BLOCK_D)
+    mask = cols < D
+
+    row = pid
     X += row.to(tl.int64) * stride_x
     U += row.to(tl.int64) * stride_u
     Y += row.to(tl.int64) * stride_y
-    cols = tl.arange(0, BLOCK_D)
 
-    # Compute mean
-    mean = 0.0
-    x = tl.load(X + cols, mask=cols < D, other=0.0).to(tl.float32)
-    mean = tl.sum(x, axis=0) / D
+    w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(B + cols, mask=mask, other=0.0).to(tl.float32)
+    for _ in range(0, rows_per_tile):
+        # Compute mean
+        mean = 0.0
+        x = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
+        mean = tl.sum(x, axis=0) / D
 
-    # Compute variance
-    _var = tl.zeros([BLOCK_D], dtype=tl.float32)
-    x_mean = tl.where(cols < D, x - mean, 0.0)
-    _var += x_mean * x_mean
-    var = tl.sum(_var, axis=0) / D
-    rstd = 1 / tl.sqrt(var + eps)
-    tl.store(Mean + row, mean)
-    tl.store(Rstd + row, rstd)
+        # Compute variance
+        _var = tl.zeros([BLOCK_D], dtype=tl.float32)
+        x_mean = tl.where(mask, x - mean, 0.0)
+        _var += x_mean * x_mean
+        var = tl.sum(_var, axis=0) / D
+        rstd = 1 / tl.sqrt(var + eps)
+        tl.store(Mean + row, mean)
+        tl.store(Rstd + row, rstd)
 
-    # Normalize and apply linear transformation
-    mask = cols < D
-    y = x_mean * rstd
-    w = tl.load(W + cols, mask=mask).to(tl.float32)
-    b = tl.load(B + cols, mask=mask).to(tl.float32)
-    y = y * w + b
-    u = tl.load(U + cols, mask=cols < D, other=0.0).to(tl.float32)
-    if SILU_U:
-        # pyre-fixme[16]
-        u = fast_dividef(u, 1.0 + tl.exp(-u))
-    y = y * u
-
-    if TRAINING:
-        random_offsets = row * BLOCK_D + cols
-        if CONCAT_UX:
+        # Normalize and apply linear transformation
+        y = x_mean * rstd
+        y = y * w + b
+        u_mask = mask
+        if TRAINING and not CONCAT_UX:
+            random_offsets = row * BLOCK_D + cols
+            random = tl.rand(seed, random_offsets)
+            u_mask = u_mask & (random > dropout_ratio)
+        u = tl.load(U + cols, mask=u_mask, other=0.0).to(tl.float32)
+        if SILU_U:
+            # pyre-fixme[16]
+            u = fast_dividef(u, 1.0 + tl.exp(-u))
+        y = y * u
+        if TRAINING and CONCAT_UX:
+            random_offsets = row * BLOCK_D + cols
             # apply dropout on u
             if FAST_DROPOUT:
                 random_u, random_x, random_y = rand3x(seed, random_offsets)
@@ -136,19 +151,20 @@ def _ln_mul_dropout_fwd(
                 random_y = tl.rand(seed, random_offsets + 2 * D)
             y_keep = random_y > dropout_ratio  # pyre-ignore [61]
             y = tl.where(y_keep, y / (1.0 - dropout_ratio), 0.0)
-        else:
-            random = tl.rand(seed, random_offsets)
-            y_keep = random > dropout_ratio
-            # write-back
-            y = tl.where(y_keep, y / (1.0 - dropout_ratio), 0.0)
 
-    # Write output
-    if CONCAT_UX:
-        tl.store(Y + cols, u.to(Y.dtype.element_ty), mask=mask)
-        tl.store(Y + D + cols, x.to(Y.dtype.element_ty), mask=mask)
-        tl.store(Y + 2 * D + cols, y.to(Y.dtype.element_ty), mask=mask)
-    else:
-        tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
+        # Write output
+        if CONCAT_UX:
+            tl.store(Y + cols, u.to(Y.dtype.element_ty), mask=mask)
+            tl.store(Y + D + cols, x.to(Y.dtype.element_ty), mask=mask)
+            tl.store(Y + 2 * D + cols, y.to(Y.dtype.element_ty), mask=mask)
+        else:
+            tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
+
+        # Advance pointers for next row
+        X += tile_num.to(tl.int64) * stride_x
+        U += tile_num.to(tl.int64) * stride_u
+        Y += tile_num.to(tl.int64) * stride_y
+        row += tile_num
 
 
 @triton.jit
@@ -210,7 +226,7 @@ def _ln_mul_dropout_bwd_dx_du(
     partial_db = tl.zeros((BLOCK_D,), dtype=tl.float32)
     w = tl.load(W + cols, mask=mask).to(tl.float32)
     b = tl.load(B + cols, mask=mask).to(tl.float32)
-    for idx in range(0, rows_per_tile):
+    for _ in range(0, rows_per_tile):
         # Load data to SRAM
         x = tl.load(X + cols, mask=mask, other=0).to(tl.float32)
         if CONCAT_UX:
@@ -403,8 +419,9 @@ def triton_layer_norm_mul_dropout_fwd(
     if seed is None:
         seed = torch.randint(low=0, high=2**62, size=(1,), dtype=torch.int64).item()
     num_warps: int = min(max(BLOCK_D // 256, 1), 8)
+    sms = torch.cuda.get_device_properties("cuda").multi_processor_count
     # pyre-ignore[28]
-    _ln_mul_dropout_fwd[(N,)](
+    _ln_mul_dropout_fwd[(sms * 128,)](
         x,
         u,
         y,
@@ -419,6 +436,7 @@ def triton_layer_norm_mul_dropout_fwd(
         x.stride(0),
         u.stride(0),
         y.stride(0),
+        N,
         SILU_U=silu_u,
         BLOCK_D=BLOCK_D,
         TRAINING=training,
