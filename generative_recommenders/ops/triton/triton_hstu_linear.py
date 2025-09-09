@@ -31,6 +31,7 @@ from generative_recommenders.common import (
 )
 
 from generative_recommenders.ops.triton.triton_addmm import triton_addmm_fwd
+from generative_recommenders.ops.utils import is_sm100
 
 try:
     # @manual=//triton:triton
@@ -1235,9 +1236,9 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
                 seed=seed,
             )
 
-        # NOTE: for AMD training, we go with torch.addmm instead of the triton
-        # version before Triton on AMD achieves on-par perf with NV GPU.
-        if torch.version.hip:
+        # NOTE: for AMD/Blackwell training, we go with torch.addmm instead of the triton
+        # version before Triton perf is on-par.
+        if torch.version.hip or is_sm100():
             out = torch.addmm(x, y, output_weight)
         else:
             out = triton_addmm_fwd(x=y, w=output_weight, y=x)

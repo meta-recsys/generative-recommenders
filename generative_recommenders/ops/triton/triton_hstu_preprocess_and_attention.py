@@ -31,6 +31,7 @@ from generative_recommenders.ops.triton.triton_layer_norm import (
     triton_weighted_layer_norm_bwd,
     triton_weighted_layer_norm_fwd,
 )
+from generative_recommenders.ops.utils import is_sm100
 from torch.nn import functional as F
 
 
@@ -65,7 +66,11 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             bias=norm_bias,
             eps=norm_eps,
         )
-        uvqk = triton_addmm_fwd(x=normed_x, w=uvqk_weight, y=uvqk_bias).contiguous()
+        # triton addmm is slower than torch (cublas) on AMD/Blackwell.
+        if is_sm100() or torch.version.hip is not None:
+            uvqk = torch.addmm(uvqk_bias, normed_x, uvqk_weight).contiguous()
+        else:
+            uvqk = triton_addmm_fwd(x=normed_x, w=uvqk_weight, y=uvqk_bias).contiguous()
         u, v, q, k = uvqk.split(
             [
                 hidden_dim * num_heads,
@@ -186,7 +191,11 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             idx += 1
         if ctx.recompute_uvqk_in_backward:
             uvqk_bias = ctx.saved_tensors[idx]
-            uvqk = triton_addmm_fwd(x=normed_x, w=uvqk_weight, y=uvqk_bias)
+            # triton addmm is slower than torch (cublas) on AMD/Blackwell.
+            if is_sm100() or torch.version.hip is not None:
+                uvqk = torch.addmm(uvqk_bias, normed_x, uvqk_weight)
+            else:
+                uvqk = triton_addmm_fwd(x=normed_x, w=uvqk_weight, y=uvqk_bias)
             idx += 1
         else:
             uvqk = ctx.saved_tensors[idx]
