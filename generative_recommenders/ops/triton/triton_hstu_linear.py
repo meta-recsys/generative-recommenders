@@ -122,35 +122,36 @@ def _ln_mul_dropout_fwd(
         # Normalize and apply linear transformation
         y = x_mean * rstd
         y = y * w + b
-        u_mask = mask
-        if TRAINING and not CONCAT_UX:
-            random_offsets = row * BLOCK_D + cols
-            random = tl.rand(seed, random_offsets)
-            u_mask = u_mask & (random > dropout_ratio)
-        u = tl.load(U + cols, mask=u_mask, other=0.0).to(tl.float32)
+        u = tl.load(U + cols, mask=mask, other=0.0).to(tl.float32)
         if SILU_U:
             # pyre-fixme[16]
             u = fast_dividef(u, 1.0 + tl.exp(-u))
         y = y * u
-        if TRAINING and CONCAT_UX:
+        if TRAINING:
             random_offsets = row * BLOCK_D + cols
-            # apply dropout on u
-            if FAST_DROPOUT:
-                random_u, random_x, random_y = rand3x(seed, random_offsets)
+            if CONCAT_UX:
+                # apply dropout on u
+                if FAST_DROPOUT:
+                    random_u, random_x, random_y = rand3x(seed, random_offsets)
+                else:
+                    random_u = tl.rand(seed, random_offsets)
+                u_keep = random_u > dropout_ratio
+                u = tl.where(u_keep, u / (1.0 - dropout_ratio), 0.0)
+                # apply dropout on x
+                if not FAST_DROPOUT:
+                    random_x = tl.rand(seed, random_offsets + D)
+                x_keep = random_x > dropout_ratio  # pyre-ignore [61]
+                x = tl.where(x_keep, x / (1.0 - dropout_ratio), 0.0)
+                # apply dropout on y
+                if not FAST_DROPOUT:
+                    random_y = tl.rand(seed, random_offsets + 2 * D)
+                y_keep = random_y > dropout_ratio  # pyre-ignore [61]
+                y = tl.where(y_keep, y / (1.0 - dropout_ratio), 0.0)
             else:
-                random_u = tl.rand(seed, random_offsets)
-            u_keep = random_u > dropout_ratio
-            u = tl.where(u_keep, u / (1.0 - dropout_ratio), 0.0)
-            # apply dropout on x
-            if not FAST_DROPOUT:
-                random_x = tl.rand(seed, random_offsets + D)
-            x_keep = random_x > dropout_ratio  # pyre-ignore [61]
-            x = tl.where(x_keep, x / (1.0 - dropout_ratio), 0.0)
-            # apply dropout on y
-            if not FAST_DROPOUT:
-                random_y = tl.rand(seed, random_offsets + 2 * D)
-            y_keep = random_y > dropout_ratio  # pyre-ignore [61]
-            y = tl.where(y_keep, y / (1.0 - dropout_ratio), 0.0)
+                random = tl.rand(seed, random_offsets)
+                y_keep = random > dropout_ratio
+                # write-back
+                y = tl.where(y_keep, y / (1.0 - dropout_ratio), 0.0)
 
         # Write output
         if CONCAT_UX:
