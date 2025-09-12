@@ -1357,6 +1357,7 @@ class _Split2DJaggedFunction(torch.autograd.Function):
         return dvalues, None, None, None, None, None, None, None
 
 
+@torch.jit.unused
 @torch.fx.wrap
 def triton_jagged_dense_bmm_add(
     max_seq_len: int,
@@ -1446,6 +1447,7 @@ def triton_jagged_dense_bmm(
     return _JaggedDenseBmmFunction.apply(max_seq_len, seq_offsets, jagged, dense)
 
 
+@torch.jit.unused
 def triton_split_2D_jagged(
     values: torch.Tensor,
     max_seq_len: int,
