@@ -546,6 +546,20 @@ def triton_addmm_bwd(
     return dx, dw, dy
 
 
+@torch.fx.wrap
+def maybe_triton_addmm_fwd(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    y: torch.Tensor,
+) -> torch.Tensor:
+    # triton addmm is slower than torch (cublas) on AMD/Blackwell.
+    # Default to pytorch addmm on AMD/Blackwell for now.
+    if is_sm100() or torch.version.hip is not None:
+        return torch.addmm(y, x, w)
+    else:
+        return triton_addmm_fwd(x=x, w=w, y=y)
+
+
 class _AddMmFunction(torch.autograd.Function):
     @staticmethod
     # pyre-ignore[14]

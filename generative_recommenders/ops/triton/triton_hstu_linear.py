@@ -29,8 +29,8 @@ from generative_recommenders.common import (
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
+from generative_recommenders.ops.triton.triton_addmm import maybe_triton_addmm_fwd
 
-from generative_recommenders.ops.triton.triton_addmm import triton_addmm_fwd
 
 try:
     # @manual=//triton:triton
@@ -1217,12 +1217,7 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
                 seed=seed,
             )
 
-        # NOTE: for AMD training, we go with torch.addmm instead of the triton
-        # version before Triton on AMD achieves on-par perf with NV GPU.
-        if torch.version.hip:
-            out = torch.addmm(x, y, output_weight)
-        else:
-            out = triton_addmm_fwd(x=y, w=output_weight, y=x)
+        out = maybe_triton_addmm_fwd(x=y, w=output_weight, y=x)
 
         saved_tensors = [attn, u, norm_weight, norm_bias, mean, rstd, output_weight]
         if not recompute_y_in_backward:

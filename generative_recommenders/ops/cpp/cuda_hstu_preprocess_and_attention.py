@@ -20,8 +20,8 @@ from typing import Optional, Tuple
 
 import torch
 from generative_recommenders.ops.triton.triton_addmm import (
+    maybe_triton_addmm_fwd,
     triton_addmm_bwd,
-    triton_addmm_fwd,
 )
 from generative_recommenders.ops.triton.triton_layer_norm import (
     triton_weighted_layer_norm_bwd,
@@ -107,7 +107,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 is_inference=False,
             ).contiguous()
         else:
-            uvqk = triton_addmm_fwd(x=normed_x, w=uvqk_weight, y=uvqk_bias).contiguous()
+            uvqk = maybe_triton_addmm_fwd(normed_x, uvqk_weight, uvqk_bias).contiguous()
         u, v, q, k = uvqk.split(
             [
                 hidden_dim * num_heads,
@@ -311,7 +311,9 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 )
                 idx += 2
             else:
-                uvqk = triton_addmm_fwd(x=normed_x, w=uvqk_weight, y=uvqk_bias)
+                uvqk = maybe_triton_addmm_fwd(
+                    normed_x, uvqk_weight, uvqk_bias
+                ).contiguous()
         else:
             uvqk = ctx.saved_tensors[idx]
             idx += 1
