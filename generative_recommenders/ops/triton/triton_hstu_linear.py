@@ -117,7 +117,7 @@ def _ln_mul_dropout_fwd(
     y = y * u
 
     if TRAINING:
-        random_offsets = row * BLOCK_D + cols
+        random_offsets = 3 * row * BLOCK_D + cols
         if CONCAT_UX:
             # apply dropout on u
             if FAST_DROPOUT:
@@ -222,7 +222,7 @@ def _ln_mul_dropout_bwd_dx_du(
             dx = tl.zeros([BLOCK_D], dtype=tl.float32)
             dy = tl.load(DY + cols, mask=mask, other=0).to(tl.float32)
         if TRAINING:
-            random_offsets = row * BLOCK_D + cols
+            random_offsets = 3 * row * BLOCK_D + cols
             if CONCAT_UX:
                 # apply dropout on du
                 if FAST_DROPOUT:
