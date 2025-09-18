@@ -22,9 +22,9 @@ from typing import List
 import torch
 from generative_recommenders.ops.pytorch.pt_layer_norm import (
     pytorch_layer_norm,
+    pytorch_rms_norm,
     pytorch_swish_layer_norm,
 )
-from generative_recommenders.ops.triton.triton_layer_norm import triton_rms_norm
 
 try:
     from hammer.ops.triton.cc.swish_layer_norm.triton_cc_swish_layer_norm import (
@@ -37,6 +37,7 @@ from generative_recommenders.ops.triton.triton_layer_norm import (
     triton_layer_norm,
     triton_swish_layer_norm,
 )
+from hammer.ops.triton.triton_layer_norm import triton_rms_norm_wrapper
 from torch.fx._symbolic_trace import is_fx_tracing
 
 torch.fx.wrap("triton_layer_norm")
@@ -147,15 +148,11 @@ class RMSNorm(HammerModule):
         self._eps = eps
         self.weight = torch.nn.Parameter(torch.ones(dim))
 
-    def _norm(self, x: torch.Tensor) -> torch.Tensor:
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self._eps)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.hammer_kernel() == HammerKernel.TRITON:
-            return triton_rms_norm(x, self.weight, self._eps)
+            return triton_rms_norm_wrapper(x, self.weight, self._eps)
         else:
-            output = self._norm(x.float()).type_as(x)
-            return output * self.weight
+            return pytorch_rms_norm(x, self.weight, self._eps)
 
 
 class SwishLayerNorm(HammerModule):
