@@ -96,7 +96,8 @@ class LayerNormTest(unittest.TestCase):
         skip_comparisons: bool = False,
     ) -> None:
         N = N // 4 * 4
-        set_dev_mode(True)
+        # enable auto-tuning to verify correctness of multi-row kernel
+        set_dev_mode(False)
         x = (
             torch.empty((N, D), dtype=dtype, device=torch.device("cuda"))
             .normal_(0.0, 1.0)

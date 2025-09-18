@@ -29,6 +29,7 @@ from generative_recommenders.common import (
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
+from generative_recommenders.ops.utils import is_sm100
 
 
 def _get_layer_norm_fwd_configs() -> List[triton.Config]:
@@ -250,6 +251,10 @@ def _layer_norm_bwd_dx(
     tl.store(DX + cols, dx, mask=mask)
 
 
+@triton_autotune(
+    configs=_get_layer_norm_fwd_configs(),
+    key=["BLOCK_D"],
+)
 @triton.jit
 def _weighted_layer_norm_bwd_dx(
     DX,
@@ -269,88 +274,130 @@ def _weighted_layer_norm_bwd_dx(
     IS_SWISH: tl.constexpr,
     N,
     BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
     pid = tl.program_id(0)
     tile_num = tl.num_programs(0)
-    rows_per_tile = N // tile_num
-    if pid < N % tile_num:
-        rows_per_tile += 1
+    num_blocks = tl.cdiv(N, BLOCK_N)
+    blocks_per_tile = num_blocks // tile_num
+    if pid < num_blocks % tile_num:
+        blocks_per_tile += 1
 
     cols = tl.arange(0, BLOCK_D)
-    mask = cols < D
-    row = pid
-    acc_dw = tl.zeros(
-        [
-            BLOCK_D,
-        ],
-        dtype=tl.float32,
-    )
-    acc_db = tl.zeros(
-        [
-            BLOCK_D,
-        ],
-        dtype=tl.float32,
-    )
+    col_mask = cols < D
+    w = tl.load(W + cols, mask=col_mask, other=0.0).to(tl.float32)
 
-    for idx in range(rows_per_tile):
-        x_ptrs = X + row.to(tl.int64) * stride_x
-        dy_ptrs = DY + row.to(tl.int64) * stride_dy
-        dx_ptrs = DX + row.to(tl.int64) * stride_dx
+    acc_dw = tl.zeros([BLOCK_D], dtype=tl.float32)
+    acc_db = tl.zeros([BLOCK_D], dtype=tl.float32)
 
-        # Load data to SRAM
-        x = tl.load(x_ptrs + cols, mask=mask, other=0).to(tl.float32)
-        dy = tl.load(dy_ptrs + cols, mask=mask, other=0).to(tl.float32)
-        mean = tl.load(Mean + row)
-        rstd = tl.load(Rstd + row)
+    start_block = pid
+
+    for idx in range(blocks_per_tile):
+        current_block = start_block + idx * tile_num
+        start_row = current_block * BLOCK_N
+
+        X_block_ptr = tl.make_block_ptr(
+            base=X,
+            shape=(N, D),
+            strides=(stride_x, 1),
+            offsets=(start_row, 0),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0),
+        )
+
+        DX_block_ptr = tl.make_block_ptr(
+            base=DX,
+            shape=(N, D),
+            strides=(stride_dx, 1),
+            offsets=(start_row, 0),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0),
+        )
+
+        DY_block_ptr = tl.make_block_ptr(
+            base=DY,
+            shape=(N, D),
+            strides=(stride_dy, 1),
+            offsets=(start_row, 0),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0),
+        )
+
+        # Load data blocks
+        x_block = tl.load(X_block_ptr, boundary_check=(0, 1), padding_option="zero").to(
+            tl.float32
+        )
+        dy_block = tl.load(
+            DY_block_ptr, boundary_check=(0, 1), padding_option="zero"
+        ).to(tl.float32)
+
+        # Load mean and rstd for all rows in this block
+        rows = start_row + tl.arange(0, BLOCK_N)
+        row_mask = rows < N
+        mean = tl.load(Mean + rows, row_mask, other=0.0)
+        rstd = tl.load(Rstd + rows, row_mask, other=0.0)
+
+        # Expand dimensions for broadcasting
+        mean = tl.expand_dims(mean, 1)
+        rstd = tl.expand_dims(rstd, 1)
+
+        xhat = (x_block - mean) * rstd
+
+        xhat = tl.where(row_mask[:, None] & col_mask[None, :], xhat, 0.0)
+        wdy = w[None, :] * dy_block
+        wdy = tl.where(row_mask[:, None] & col_mask[None, :], wdy, 0.0)
 
         # Compute dx
-        xhat = (x - mean) * rstd
-        w = tl.load(W + cols, mask=mask).to(tl.float32)
-        wdy = w * dy
-        xhat = tl.where(mask, xhat, 0.0)
-        wdy = tl.where(mask, wdy, 0.0)
-        sigmoid_layer_norm = None
         if IS_SWISH:
-            b = tl.load(B + cols, mask=mask).to(tl.float32)
-            sigmoid_layer_norm = tl.sigmoid(xhat * w + b)
-            sigmoid_layer_norm = tl.where(mask, sigmoid_layer_norm, 0.0)
-            x_ = wdy * x * sigmoid_layer_norm * (1 - sigmoid_layer_norm)
-            x_ = tl.where(mask, x_, 0.0)
+            b = tl.load(B + cols, mask=col_mask, other=0.0).to(tl.float32)
+            sigmoid_layer_norm = tl.sigmoid(xhat * w[None, :] + b[None, :])
+            sigmoid_layer_norm = tl.where(
+                row_mask[:, None] & col_mask[None, :], sigmoid_layer_norm, 0.0
+            )
 
-            c1 = tl.sum(xhat * x_, axis=0) / D
-            c2 = tl.sum(x_, axis=0) / D
+            sigmoid_deriv = sigmoid_layer_norm * (1 - sigmoid_layer_norm)
+            x_ = wdy * x_block * sigmoid_deriv
+            x_ = tl.where(row_mask[:, None] & col_mask[None, :], x_, 0.0)
+
+            c1 = tl.sum(xhat * x_, axis=1) / D
+            c2 = tl.sum(x_, axis=1) / D
+            c1 = tl.expand_dims(c1, 1)
+            c2 = tl.expand_dims(c2, 1)
             dx = (x_ - (xhat * c1 + c2)) * rstd
-            dx = dy * sigmoid_layer_norm + dx
+
+            dx = dy_block * sigmoid_layer_norm + dx
+            # Write dx
+            tl.store(DX_block_ptr, dx.to(DX.dtype.element_ty), boundary_check=(0, 1))
+            partial_dw = tl.sum(dy_block * x_block * xhat * sigmoid_deriv, axis=0)
+            partial_db = tl.sum(dy_block * x_block * sigmoid_deriv, axis=0)
         else:
-            c1 = tl.sum(xhat * wdy, axis=0) / D
-            c2 = tl.sum(wdy, axis=0) / D
+            c1 = tl.sum(xhat * wdy, axis=1) / D
+            c2 = tl.sum(wdy, axis=1) / D
+            c1 = tl.expand_dims(c1, 1)
+            c2 = tl.expand_dims(c2, 1)
             dx = (wdy - (xhat * c1 + c2)) * rstd
+            # Write dx
+            tl.store(DX_block_ptr, dx.to(DX.dtype.element_ty), boundary_check=(0, 1))
+            partial_dw = tl.sum(dy_block * xhat, axis=0)
+            partial_db = tl.sum(dy_block, axis=0)
 
-        # Write dx
-        tl.store(dx_ptrs + cols, dx, mask=mask)
-
-        # Accumulate partial sums for dw/db
-        if IS_SWISH:
-            partial_dw = dy * x * xhat * sigmoid_layer_norm * (1 - sigmoid_layer_norm)
-            partial_db = dy * x * sigmoid_layer_norm * (1 - sigmoid_layer_norm)
-        else:
-            partial_dw = dy * xhat
-            partial_db = dy
         # Accumulate partial sums in shared memory
         acc_dw += partial_dw
         acc_db += partial_db
-        row += tile_num
 
     # Store accumulated sums back to global memory
     dw_ptrs = DW + pid.to(tl.int64) * D + cols
     db_ptrs = DB + pid.to(tl.int64) * D + cols
-    tl.store(dw_ptrs, acc_dw, mask=mask)
-    tl.store(db_ptrs, acc_db, mask=mask)
+    tl.store(dw_ptrs, acc_dw, mask=col_mask)
+    tl.store(db_ptrs, acc_db, mask=col_mask)
 
 
 def _get_bwd_dwdb_configs() -> List[triton.Config]:
     configs = []
-    for BLOCK_N in [32, 64, 128, 256]:
+    BLOCK_N_CHOICES = [32, 64, 128, 256]
+    if is_sm100():
+        BLOCK_N_CHOICES = [128, 256, 512, 1024]
+    for BLOCK_N in BLOCK_N_CHOICES:
         for num_warps in [8, 16] + ([] if torch.ops.hip else [32]):
             configs.append(
                 triton.Config(
@@ -516,7 +563,6 @@ def triton_weighted_layer_norm_bwd(
             IS_SWISH=False,
             N=N,
             BLOCK_D=BLOCK_D,
-            num_warps=num_warps,
         )
 
         def grid(META):
@@ -931,7 +977,6 @@ class SwishLayerNormFunction(torch.autograd.Function):
             IS_SWISH=True,
             N=N,
             BLOCK_D=ctx.BLOCK_D,
-            num_warps=ctx.num_warps,
         )
 
         def grid(META):
