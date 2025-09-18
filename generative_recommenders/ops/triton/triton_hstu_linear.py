@@ -30,6 +30,22 @@ from generative_recommenders.common import (
     triton_autotune,
 )
 from generative_recommenders.ops.triton.triton_addmm import maybe_triton_addmm_fwd
+
+
+def _get_layer_norm_mul_dropout_fwd_multirow_configs() -> List[triton.Config]:
+    """Generate autotune configs for multi-row LayerNorm multiplication with dropout kernels."""
+    configs = []
+    for BLOCK_N in [1, 2, 4, 8, 16]:
+        for num_warps in [1, 2, 4]:
+            configs.append(
+                triton.Config(
+                    {"BLOCK_N": BLOCK_N},
+                    num_warps=num_warps,
+                )
+            )
+    return configs
+
+
 from generative_recommenders.ops.utils import is_sm100
 
 
@@ -112,6 +128,10 @@ def _generate_random_mask(
     )
 
 
+@triton_autotune(
+    configs=_get_layer_norm_mul_dropout_fwd_multirow_configs(),
+    key=["BLOCK_D"],
+)
 @triton.jit
 def _ln_mul_dropout_fwd_rng(
     X,
@@ -122,6 +142,7 @@ def _ln_mul_dropout_fwd_rng(
     Mean,
     Rstd,
     RANDOM_MASK,
+    N,
     D,
     eps,
     dropout_ratio,
@@ -129,91 +150,144 @@ def _ln_mul_dropout_fwd_rng(
     stride_u,
     stride_y,
     stride_mask,
-    N,
     SILU_U: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     TRAINING: tl.constexpr,
     CONCAT_UX: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    tile_num = tl.num_programs(0)
-    rows_per_tile = N // tile_num
-    if pid < N % tile_num:
-        rows_per_tile += 1
+    block_id = tl.program_id(0)
+    start_row = block_id * BLOCK_N
 
-    if rows_per_tile == 0:
-        return
+    # Create block pointers for X, U, and Y
+    X_block_ptr = tl.make_block_ptr(
+        base=X,
+        shape=(N, D),
+        strides=(stride_x, 1),
+        offsets=(start_row, 0),
+        block_shape=(BLOCK_N, BLOCK_D),
+        order=(1, 0),
+    )
+
+    U_block_ptr = tl.make_block_ptr(
+        base=U,
+        shape=(N, D),
+        strides=(stride_u, 1),
+        offsets=(start_row, 0),
+        block_shape=(BLOCK_N, BLOCK_D),
+        order=(1, 0),
+    )
+
+    # Load data blocks
+    x_block = tl.load(X_block_ptr, boundary_check=(0, 1), padding_option="zero").to(
+        tl.float32
+    )
+    u_block = tl.load(U_block_ptr, boundary_check=(0, 1), padding_option="zero").to(
+        tl.float32
+    )
 
     cols = tl.arange(0, BLOCK_D)
-    mask = cols < D
+    col_mask = cols < D
+    rows = start_row + tl.arange(0, BLOCK_N)
+    row_mask = rows < N
 
-    row = pid
-    X += row.to(tl.int64) * stride_x
-    U += row.to(tl.int64) * stride_u
-    Y += row.to(tl.int64) * stride_y
-    num_random = 1
-    if CONCAT_UX:
-        num_random = 3
-    RANDOM_MASK += row.to(tl.int64) * stride_mask * num_random
+    mean = tl.sum(x_block, axis=1) / D
+    tl.store(Mean + rows, mean, mask=row_mask)
+    mean = tl.expand_dims(mean, 1)
 
-    w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
-    b = tl.load(B + cols, mask=mask, other=0.0).to(tl.float32)
-    for _ in range(0, rows_per_tile):
-        # Compute mean
-        mean = 0.0
-        x = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
-        mean = tl.sum(x, axis=0) / D
+    x_mean = x_block - mean
+    x_mean = tl.where(row_mask[:, None] & col_mask[None, :], x_mean, 0.0)
+    _var = x_mean * x_mean
+    var = tl.sum(_var, axis=1) / D
+    rstd = 1 / tl.sqrt(var + eps)
+    tl.store(Rstd + rows, rstd, mask=row_mask)
+    rstd = tl.expand_dims(rstd, 1)
 
-        # Compute variance
-        _var = tl.zeros([BLOCK_D], dtype=tl.float32)
-        x_mean = tl.where(mask, x - mean, 0.0)
-        _var += x_mean * x_mean
-        var = tl.sum(_var, axis=0) / D
-        rstd = 1 / tl.sqrt(var + eps)
-        tl.store(Mean + row, mean)
-        tl.store(Rstd + row, rstd)
+    y = x_mean * rstd
+    w = tl.load(W + cols, mask=col_mask).to(tl.float32)
+    b = tl.load(B + cols, mask=col_mask).to(tl.float32)
+    y = y * w[None, :] + b[None, :]
 
-        # Normalize and apply linear transformation
-        y = x_mean * rstd
-        y = y * w + b
-        u_mask = mask
-        if TRAINING and not CONCAT_UX:
-            # Load dropout mask directly instead of generating random numbers
-            dropout_mask = tl.load(RANDOM_MASK + cols, mask=mask, other=True)
-            u_mask = u_mask & dropout_mask
-        u = tl.load(U + cols, mask=u_mask, other=0.0).to(tl.float32)
-        if SILU_U:
-            # pyre-fixme[16]
-            u = fast_dividef(u, 1.0 + tl.exp(-u))
-        y = y * u
-        if TRAINING and CONCAT_UX:
-            # Load dropout masks for u, x, y from pre-generated mask tensor
-            # Mask tensor has shape [N*3, D], so each row has 3 corresponding mask rows
-            u_keep = tl.load(RANDOM_MASK + cols, mask=mask, other=True)
-            x_keep = tl.load(RANDOM_MASK + stride_mask + cols, mask=mask, other=True)
-            y_keep = tl.load(
-                RANDOM_MASK + 2 * stride_mask + cols, mask=mask, other=True
-            )
-            u = tl.where(u_keep, u / (1.0 - dropout_ratio), 0.0)
-            # apply dropout on x
-            x = tl.where(x_keep, x / (1.0 - dropout_ratio), 0.0)
-            # apply dropout on y
+    if SILU_U:
+        # pyre-fixme[16]
+        u_block = fast_dividef(u_block, 1.0 + tl.exp(-u_block))
+
+    y = y * u_block
+
+    if TRAINING:
+        if CONCAT_UX:
+            row_offsets = start_row + tl.arange(0, BLOCK_N)
+            col_offsets = tl.arange(0, BLOCK_D)
+
+            # Load precomputed random masks for u, x, y
+            u_offsets = row_offsets[:, None] * stride_mask + col_offsets[None, :]
+            x_offsets = (row_offsets[:, None] + N) * stride_mask + col_offsets[None, :]
+            y_offsets = (row_offsets[:, None] + 2 * N) * stride_mask + col_offsets[
+                None, :
+            ]
+
+            mask = (row_offsets[:, None] < N) & (col_offsets[None, :] < D)
+
+            u_keep = tl.load(RANDOM_MASK + u_offsets, mask=mask, other=True)
+            x_keep = tl.load(RANDOM_MASK + x_offsets, mask=mask, other=True)
+            y_keep = tl.load(RANDOM_MASK + y_offsets, mask=mask, other=True)
+
+            u_block = tl.where(u_keep, u_block / (1.0 - dropout_ratio), 0.0)
+            x_block = tl.where(x_keep, x_block / (1.0 - dropout_ratio), 0.0)
+            y = tl.where(y_keep, y / (1.0 - dropout_ratio), 0.0)
+        else:
+            row_offsets = start_row + tl.arange(0, BLOCK_N)
+            col_offsets = tl.arange(0, BLOCK_D)
+
+            # Load precomputed random mask for y
+            y_offsets = row_offsets[:, None] * stride_mask + col_offsets[None, :]
+            mask = (row_offsets[:, None] < N) & (col_offsets[None, :] < D)
+
+            y_keep = tl.load(RANDOM_MASK + y_offsets, mask=mask, other=True)
             y = tl.where(y_keep, y / (1.0 - dropout_ratio), 0.0)
 
-        # Write output
-        if CONCAT_UX:
-            tl.store(Y + cols, u.to(Y.dtype.element_ty), mask=mask)
-            tl.store(Y + D + cols, x.to(Y.dtype.element_ty), mask=mask)
-            tl.store(Y + 2 * D + cols, y.to(Y.dtype.element_ty), mask=mask)
-        else:
-            tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
+    if CONCAT_UX:
+        Y_block_ptr_u = tl.make_block_ptr(
+            base=Y,
+            shape=(N, 3 * D),
+            strides=(stride_y, 1),
+            offsets=(start_row, 0),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0),
+        )
 
-        # Advance pointers for next row
-        X += tile_num.to(tl.int64) * stride_x
-        U += tile_num.to(tl.int64) * stride_u
-        Y += tile_num.to(tl.int64) * stride_y
-        RANDOM_MASK += tile_num.to(tl.int64) * stride_mask * num_random
-        row += tile_num
+        Y_block_ptr_x = tl.make_block_ptr(
+            base=Y,
+            shape=(N, 3 * D),
+            strides=(stride_y, 1),
+            offsets=(start_row, D),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0),
+        )
+
+        Y_block_ptr_y = tl.make_block_ptr(
+            base=Y,
+            shape=(N, 3 * D),
+            strides=(stride_y, 1),
+            offsets=(start_row, 2 * D),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0),
+        )
+
+        tl.store(Y_block_ptr_u, u_block.to(Y.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(Y_block_ptr_x, x_block.to(Y.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(Y_block_ptr_y, y.to(Y.dtype.element_ty), boundary_check=(0, 1))
+    else:
+        Y_block_ptr = tl.make_block_ptr(
+            base=Y,
+            shape=(N, D),
+            strides=(stride_y, 1),
+            offsets=(start_row, 0),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0),
+        )
+
+        tl.store(Y_block_ptr, y.to(Y.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.jit
@@ -738,8 +812,11 @@ def triton_layer_norm_mul_dropout_fwd(
             BLOCK_D,  # pyre-ignore [6]
         )
 
+        def grid(META):
+            return (triton.cdiv(N, META["BLOCK_N"]),)
+
         # pyre-ignore[28]
-        _ln_mul_dropout_fwd_rng[(sms * 128,)](
+        _ln_mul_dropout_fwd_rng[grid](
             x,
             u,
             y,
@@ -748,6 +825,7 @@ def triton_layer_norm_mul_dropout_fwd(
             mean,
             rstd,
             random_mask,
+            N,
             D,
             eps,
             dropout_ratio,
@@ -755,12 +833,10 @@ def triton_layer_norm_mul_dropout_fwd(
             u.stride(0),
             y.stride(0),
             random_mask.stride(0),
-            N,
             SILU_U=silu_u,
             BLOCK_D=BLOCK_D,
             TRAINING=training,
             CONCAT_UX=concat_ux,
-            num_warps=num_warps,
         )
 
     else:
