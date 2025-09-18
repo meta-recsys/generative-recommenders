@@ -30,6 +30,7 @@ from generative_recommenders.common import (
     triton_autotune,
 )
 from generative_recommenders.ops.triton.triton_addmm import maybe_triton_addmm_fwd
+from generative_recommenders.ops.utils import is_sm100
 
 
 try:
@@ -53,6 +54,15 @@ def set_compute_output_ln_fast_dropout(value: bool) -> None:
     COMPUTE_OUTPUT_LN_FAST_DROPOUT = value
 
 
+FUSE_OUTPUT_LN_RNG_BLACKWELL = False
+
+
+# Only impact B200 training when CONCAT_UX is False
+def set_fuse_output_ln_rng_blackwell(value: bool) -> None:
+    global FUSE_OUTPUT_LN_RNG_BLACKWELL
+    FUSE_OUTPUT_LN_RNG_BLACKWELL = value
+
+
 @triton.jit
 def rand3x(seed, offsets, n_rounds: tl.constexpr = 10):  # pyre-ignore [9]
     i1, i2, i3, _ = tl.randint4x(seed, offsets, n_rounds)
@@ -60,6 +70,150 @@ def rand3x(seed, offsets, n_rounds: tl.constexpr = 10):  # pyre-ignore [9]
     u2 = tl.uint_to_uniform_float(i2)
     u3 = tl.uint_to_uniform_float(i3)
     return u1, u2, u3
+
+
+@triton.jit
+def _generate_random_mask(
+    MASK_BUFFER,
+    N_MASK,
+    dropout_ratio,
+    seed,
+    D: tl.constexpr,
+    STRIDE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    # NOTE: This function appears to be incomplete/unused - kept for compatibility
+    pid = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_D)
+    col_mask = cols < D
+    random_offsets = pid * BLOCK_D + cols
+    rand1, rand2, rand3, rand4 = tl.rand4x(seed, random_offsets)
+    start_row = pid * 4
+    MASK_BUFFER += start_row * STRIDE
+    row_mask = start_row < N_MASK
+    mask1 = rand1 > dropout_ratio
+    tl.store(MASK_BUFFER + cols, mask1, mask=row_mask & col_mask)
+    row_mask = (start_row + 1) < N_MASK
+    mask2 = rand2 > dropout_ratio
+    tl.store(MASK_BUFFER + STRIDE + cols, mask2, mask=row_mask & col_mask)
+    row_mask = (start_row + 2) < N_MASK
+    mask3 = rand3 > dropout_ratio
+    tl.store(
+        MASK_BUFFER + 2 * STRIDE + cols,
+        mask3,
+        mask=row_mask & col_mask,
+    )
+    row_mask = (start_row + 3) < N_MASK
+    mask4 = rand4 > dropout_ratio
+    tl.store(
+        MASK_BUFFER + 3 * STRIDE + cols,
+        mask4,
+        mask=row_mask & col_mask,
+    )
+
+
+@triton.jit
+def _ln_mul_dropout_fwd_rng(
+    X,
+    U,
+    Y,
+    W,
+    B,
+    Mean,
+    Rstd,
+    RANDOM_MASK,
+    D,
+    eps,
+    dropout_ratio,
+    stride_x,
+    stride_u,
+    stride_y,
+    stride_mask,
+    N,
+    SILU_U: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    TRAINING: tl.constexpr,
+    CONCAT_UX: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    tile_num = tl.num_programs(0)
+    rows_per_tile = N // tile_num
+    if pid < N % tile_num:
+        rows_per_tile += 1
+
+    if rows_per_tile == 0:
+        return
+
+    cols = tl.arange(0, BLOCK_D)
+    mask = cols < D
+
+    row = pid
+    X += row.to(tl.int64) * stride_x
+    U += row.to(tl.int64) * stride_u
+    Y += row.to(tl.int64) * stride_y
+    num_random = 1
+    if CONCAT_UX:
+        num_random = 3
+    RANDOM_MASK += row.to(tl.int64) * stride_mask * num_random
+
+    w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(B + cols, mask=mask, other=0.0).to(tl.float32)
+    for _ in range(0, rows_per_tile):
+        # Compute mean
+        mean = 0.0
+        x = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
+        mean = tl.sum(x, axis=0) / D
+
+        # Compute variance
+        _var = tl.zeros([BLOCK_D], dtype=tl.float32)
+        x_mean = tl.where(mask, x - mean, 0.0)
+        _var += x_mean * x_mean
+        var = tl.sum(_var, axis=0) / D
+        rstd = 1 / tl.sqrt(var + eps)
+        tl.store(Mean + row, mean)
+        tl.store(Rstd + row, rstd)
+
+        # Normalize and apply linear transformation
+        y = x_mean * rstd
+        y = y * w + b
+        u_mask = mask
+        if TRAINING and not CONCAT_UX:
+            # Load dropout mask directly instead of generating random numbers
+            dropout_mask = tl.load(RANDOM_MASK + cols, mask=mask, other=True)
+            u_mask = u_mask & dropout_mask
+        u = tl.load(U + cols, mask=u_mask, other=0.0).to(tl.float32)
+        if SILU_U:
+            # pyre-fixme[16]
+            u = fast_dividef(u, 1.0 + tl.exp(-u))
+        y = y * u
+        if TRAINING and CONCAT_UX:
+            # Load dropout masks for u, x, y from pre-generated mask tensor
+            # Mask tensor has shape [N*3, D], so each row has 3 corresponding mask rows
+            u_keep = tl.load(RANDOM_MASK + cols, mask=mask, other=True)
+            x_keep = tl.load(RANDOM_MASK + stride_mask + cols, mask=mask, other=True)
+            y_keep = tl.load(
+                RANDOM_MASK + 2 * stride_mask + cols, mask=mask, other=True
+            )
+            u = tl.where(u_keep, u / (1.0 - dropout_ratio), 0.0)
+            # apply dropout on x
+            x = tl.where(x_keep, x / (1.0 - dropout_ratio), 0.0)
+            # apply dropout on y
+            y = tl.where(y_keep, y / (1.0 - dropout_ratio), 0.0)
+
+        # Write output
+        if CONCAT_UX:
+            tl.store(Y + cols, u.to(Y.dtype.element_ty), mask=mask)
+            tl.store(Y + D + cols, x.to(Y.dtype.element_ty), mask=mask)
+            tl.store(Y + 2 * D + cols, y.to(Y.dtype.element_ty), mask=mask)
+        else:
+            tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
+
+        # Advance pointers for next row
+        X += tile_num.to(tl.int64) * stride_x
+        U += tile_num.to(tl.int64) * stride_u
+        Y += tile_num.to(tl.int64) * stride_y
+        RANDOM_MASK += tile_num.to(tl.int64) * stride_mask * num_random
+        row += tile_num
 
 
 @triton.jit
@@ -152,6 +306,170 @@ def _ln_mul_dropout_fwd(
 
 
 @triton.jit
+def _ln_mul_dropout_bwd_dx_du_rng(
+    DX,
+    DU,
+    DY,
+    DW,
+    DB,
+    X,
+    U,
+    Y,
+    W,
+    B,
+    Mean,
+    Rstd,
+    RANDOM_MASK,
+    stride_dx,
+    stride_du,
+    stride_dy,
+    stride_x,
+    stride_u,
+    stride_y,
+    stride_mask,
+    D,
+    eps,
+    dropout_ratio,
+    N,
+    SILU_U: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    TRAINING: tl.constexpr,
+    CONCAT_UX: tl.constexpr,
+    COMPUTE_Y: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    tile_num = tl.num_programs(0)
+    rows_per_tile = N // tile_num
+    if pid < N % tile_num:
+        rows_per_tile += 1
+
+    if rows_per_tile == 0:
+        return
+
+    cols = tl.arange(0, BLOCK_D)
+    mask = cols < D
+
+    row = pid
+    X += row.to(tl.int64) * stride_x
+    U += row.to(tl.int64) * stride_u
+    if COMPUTE_Y:
+        Y += row.to(tl.int64) * stride_y
+    DY += row.to(tl.int64) * stride_dy
+    DX += row.to(tl.int64) * stride_dx
+    DU += row.to(tl.int64) * stride_du
+    DW = DW + pid * D + cols
+    DB = DB + pid * D + cols
+
+    num_random = 1
+    if CONCAT_UX:
+        num_random = 3
+    RANDOM_MASK += row.to(tl.int64) * stride_mask * num_random
+
+    partial_dw = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    partial_db = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    w = tl.load(W + cols, mask=mask).to(tl.float32)
+    b = tl.load(B + cols, mask=mask).to(tl.float32)
+    for _ in range(0, rows_per_tile):
+        # Load data to SRAM
+        x = tl.load(X + cols, mask=mask, other=0).to(tl.float32)
+        if CONCAT_UX:
+            du = tl.load(DY + cols, mask=mask, other=0).to(tl.float32)
+            dx = tl.load(DY + D + cols, mask=mask, other=0).to(tl.float32)
+            dy = tl.load(DY + 2 * D + cols, mask=mask, other=0).to(tl.float32)
+        else:
+            du = tl.zeros([BLOCK_D], dtype=tl.float32)
+            dx = tl.zeros([BLOCK_D], dtype=tl.float32)
+            dy = tl.load(DY + cols, mask=mask, other=0).to(tl.float32)
+        if TRAINING:
+            if CONCAT_UX:
+                # Load dropout masks for u, x, y from pre-generated mask tensor
+                du_keep = tl.load(RANDOM_MASK + cols, mask=mask, other=True)
+                dx_keep = tl.load(
+                    RANDOM_MASK + stride_mask + cols, mask=mask, other=True
+                )
+                dy_keep = tl.load(
+                    RANDOM_MASK + 2 * stride_mask + cols, mask=mask, other=True
+                )
+                du = tl.where(du_keep, du / (1.0 - dropout_ratio), 0.0)
+                dx = tl.where(dx_keep, dx / (1.0 - dropout_ratio), 0.0)
+                dy = tl.where(dy_keep, dy / (1.0 - dropout_ratio), 0.0)
+            else:
+                # Load dropout mask directly instead of generating random numbers
+                dy_keep = tl.load(RANDOM_MASK + cols, mask=mask, other=True)
+                dy = tl.where(dy_keep, dy / (1.0 - dropout_ratio), 0.0)
+
+        mean = tl.load(Mean + row)
+        rstd = tl.load(Rstd + row)
+
+        # Compute dx
+        xhat = (x - mean) * rstd
+        u = tl.load(U + cols, mask=mask, other=0).to(tl.float32)
+        ln = xhat * w + b
+        du += dy * ln
+        if SILU_U:
+            # pyre-ignore[16]
+            sig_u = fast_dividef(1.0, 1.0 + tl.exp(-u))
+            du = du * (sig_u + u * sig_u * (1.0 - sig_u))
+            u = u * sig_u
+        tl.store(DU + cols, du.to(DU.dtype.element_ty), mask=mask)
+        dy = dy * u
+        wdy = w * dy
+        if COMPUTE_Y:
+            y = ln * u
+            if TRAINING:
+                if CONCAT_UX:
+                    u = tl.where(
+                        du_keep,  # pyre-ignore [61]
+                        u / (1.0 - dropout_ratio),
+                        0.0,
+                    )
+                    x = tl.where(
+                        dx_keep,  # pyre-ignore [61]
+                        x / (1.0 - dropout_ratio),
+                        0.0,
+                    )
+                    y = tl.where(
+                        dy_keep,  # pyre-ignore [61]
+                        y / (1.0 - dropout_ratio),
+                        0.0,
+                    )
+                else:
+                    y = tl.where(
+                        dy_keep,  # pyre-ignore [61]
+                        y / (1.0 - dropout_ratio),
+                        0.0,
+                    )
+            if CONCAT_UX:
+                tl.store(Y + cols, u.to(Y.dtype.element_ty), mask=mask)
+                tl.store(Y + D + cols, x.to(Y.dtype.element_ty), mask=mask)
+                tl.store(Y + 2 * D + cols, y.to(Y.dtype.element_ty), mask=mask)
+            else:
+                tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
+            Y += tile_num.to(tl.int64) * stride_y
+
+        xhat = tl.where(mask, xhat, 0.0)
+        wdy = tl.where(mask, wdy, 0.0)
+        c1 = tl.sum(xhat * wdy, axis=0) / D
+        c2 = tl.sum(wdy, axis=0) / D
+        dx += (wdy - (xhat * c1 + c2)) * rstd
+        # Write dx
+        tl.store(DX + cols, dx, mask=mask)
+
+        # Accumulate partial sums for dw/db
+        partial_dw += dy * xhat
+        partial_db += dy
+        X += tile_num.to(tl.int64) * stride_x
+        U += tile_num.to(tl.int64) * stride_u
+        DY += tile_num.to(tl.int64) * stride_dy
+        DX += tile_num.to(tl.int64) * stride_dx
+        DU += tile_num.to(tl.int64) * stride_du
+        RANDOM_MASK += tile_num.to(tl.int64) * stride_mask * num_random
+        row += tile_num
+    tl.store(DW, partial_dw, mask=mask)
+    tl.store(DB, partial_db, mask=mask)
+
+
+@triton.jit
 def _ln_mul_dropout_bwd_dx_du(
     DX,
     DU,
@@ -210,7 +528,7 @@ def _ln_mul_dropout_bwd_dx_du(
     partial_db = tl.zeros((BLOCK_D,), dtype=tl.float32)
     w = tl.load(W + cols, mask=mask).to(tl.float32)
     b = tl.load(B + cols, mask=mask).to(tl.float32)
-    for idx in range(0, rows_per_tile):
+    for _idx in range(0, rows_per_tile):
         # Load data to SRAM
         x = tl.load(X + cols, mask=mask, other=0).to(tl.float32)
         if CONCAT_UX:
@@ -403,29 +721,72 @@ def triton_layer_norm_mul_dropout_fwd(
     if seed is None:
         seed = torch.randint(low=0, high=2**62, size=(1,), dtype=torch.int64).item()
     num_warps: int = min(max(BLOCK_D // 256, 1), 8)
-    # pyre-ignore[28]
-    _ln_mul_dropout_fwd[(N,)](
-        x,
-        u,
-        y,
-        weight,
-        bias,
-        mean,
-        rstd,
-        D,
-        eps,
-        seed,
-        dropout_ratio,
-        x.stride(0),
-        u.stride(0),
-        y.stride(0),
-        SILU_U=silu_u,
-        BLOCK_D=BLOCK_D,
-        TRAINING=training,
-        CONCAT_UX=concat_ux,
-        FAST_DROPOUT=COMPUTE_OUTPUT_LN_FAST_DROPOUT,
-        num_warps=num_warps,
-    )
+    sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+    # Benchmark shows separating RNG from ln_mul_dropout kernel only benefits on
+    # blackwell when CONCAT_UX is enabled. (fused RNG kernel can benefit from rand3x fast
+    # dropout)
+    if not FUSE_OUTPUT_LN_RNG_BLACKWELL and is_sm100() and not concat_ux and training:
+        random_mask = torch.empty([N, D], dtype=torch.bool, device=x.device)
+
+        _generate_random_mask[(triton.cdiv(N, 4),)](
+            random_mask,
+            N,
+            dropout_ratio,
+            seed,
+            D,  # pyre-ignore [6]
+            random_mask.stride(0),  # pyre-ignore [6]
+            BLOCK_D,  # pyre-ignore [6]
+        )
+
+        # pyre-ignore[28]
+        _ln_mul_dropout_fwd_rng[(sms * 128,)](
+            x,
+            u,
+            y,
+            weight,
+            bias,
+            mean,
+            rstd,
+            random_mask,
+            D,
+            eps,
+            dropout_ratio,
+            x.stride(0),
+            u.stride(0),
+            y.stride(0),
+            random_mask.stride(0),
+            N,
+            SILU_U=silu_u,
+            BLOCK_D=BLOCK_D,
+            TRAINING=training,
+            CONCAT_UX=concat_ux,
+            num_warps=num_warps,
+        )
+
+    else:
+        # pyre-ignore[28]
+        _ln_mul_dropout_fwd[(N,)](
+            x,
+            u,
+            y,
+            weight,
+            bias,
+            mean,
+            rstd,
+            D,
+            eps,
+            seed,
+            dropout_ratio,
+            x.stride(0),
+            u.stride(0),
+            y.stride(0),
+            SILU_U=silu_u,
+            BLOCK_D=BLOCK_D,
+            TRAINING=training,
+            CONCAT_UX=concat_ux,
+            FAST_DROPOUT=COMPUTE_OUTPUT_LN_FAST_DROPOUT,
+            num_warps=num_warps,
+        )
     return y, mean, rstd, BLOCK_D, num_warps, seed  # pyre-ignore [7]
 
 
@@ -472,39 +833,88 @@ def triton_layer_norm_mul_dropout_bwd(
     _dbias = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
     dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
     dbias = torch.empty((D,), dtype=weight.dtype, device=x.device)
-    # pyre-ignore[28]
-    _ln_mul_dropout_bwd_dx_du[(tile_num,)](
-        dx,
-        du,
-        dy,
-        _dweight,
-        _dbias,
-        x,
-        u,
-        y,
-        weight,
-        bias,
-        mean,
-        rstd,
-        dx.stride(0),
-        du.stride(0),
-        dy.stride(0),
-        x.stride(0),
-        u.stride(0),
-        y.stride(0) if compute_y else 0,  # pyre-ignore [16]
-        D,
-        eps,
-        seed,
-        dropout_ratio,
-        N=N,
-        SILU_U=silu_u,
-        BLOCK_D=BLOCK_D,
-        TRAINING=training,
-        CONCAT_UX=concat_ux,
-        COMPUTE_Y=compute_y,
-        FAST_DROPOUT=COMPUTE_OUTPUT_LN_FAST_DROPOUT,
-        num_warps=num_warps,
-    )
+
+    if not FUSE_OUTPUT_LN_RNG_BLACKWELL and is_sm100() and not concat_ux and training:
+        random_mask = torch.empty([N, D], dtype=torch.bool, device=x.device)
+
+        _generate_random_mask[(triton.cdiv(N, 4),)](
+            random_mask,
+            N,
+            dropout_ratio,
+            seed,
+            D,  # pyre-ignore [6]
+            random_mask.stride(0),  # pyre-ignore [6]
+            BLOCK_D,  # pyre-ignore [6]
+        )
+
+        # pyre-ignore[28]
+        _ln_mul_dropout_bwd_dx_du_rng[(tile_num,)](
+            dx,
+            du,
+            dy,
+            _dweight,
+            _dbias,
+            x,
+            u,
+            y,
+            weight,
+            bias,
+            mean,
+            rstd,
+            random_mask,
+            dx.stride(0),
+            du.stride(0),
+            dy.stride(0),
+            x.stride(0),
+            u.stride(0),
+            y.stride(0) if compute_y else 0,  # pyre-ignore [16]
+            random_mask.stride(0),
+            D,
+            eps,
+            dropout_ratio,
+            N=N,
+            SILU_U=silu_u,
+            BLOCK_D=BLOCK_D,
+            TRAINING=training,
+            CONCAT_UX=concat_ux,
+            COMPUTE_Y=compute_y,
+            num_warps=num_warps,
+        )
+
+    else:
+        # pyre-ignore[28]
+        _ln_mul_dropout_bwd_dx_du[(tile_num,)](
+            dx,
+            du,
+            dy,
+            _dweight,
+            _dbias,
+            x,
+            u,
+            y,
+            weight,
+            bias,
+            mean,
+            rstd,
+            dx.stride(0),
+            du.stride(0),
+            dy.stride(0),
+            x.stride(0),
+            u.stride(0),
+            y.stride(0) if compute_y else 0,  # pyre-ignore [16]
+            D,
+            eps,
+            seed,
+            dropout_ratio,
+            N=N,
+            SILU_U=silu_u,
+            BLOCK_D=BLOCK_D,
+            TRAINING=training,
+            CONCAT_UX=concat_ux,
+            COMPUTE_Y=compute_y,
+            FAST_DROPOUT=COMPUTE_OUTPUT_LN_FAST_DROPOUT,
+            num_warps=num_warps,
+        )
 
     def grid(META):
         return (triton.cdiv(D, META["BLOCK_D"]),)
