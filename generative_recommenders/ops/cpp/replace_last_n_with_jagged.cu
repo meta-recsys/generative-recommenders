@@ -31,39 +31,51 @@ static constexpr int32_t kMaxThreads = 1024;
 
 template <typename index_t, typename val_t>
 __global__
-__launch_bounds__(kMaxThreads) void _concat_1d_jagged_jagged_cuda_kernel(
+__launch_bounds__(kMaxThreads) void _replace_last_n_with_jagged_cuda_kernel(
     int32_t B,
+    int32_t D,
+    const at::PackedTensorAccessor32<index_t, 1, at::RestrictPtrTraits>
+        lengths_left,
     const at::PackedTensorAccessor32<index_t, 1, at::RestrictPtrTraits>
         offsets_left,
-    const at::PackedTensorAccessor32<val_t, 1, at::RestrictPtrTraits>
+    const at::PackedTensorAccessor32<val_t, 2, at::RestrictPtrTraits>
         values_left,
     const at::PackedTensorAccessor32<index_t, 1, at::RestrictPtrTraits>
+        lengths_right,
+    const at::PackedTensorAccessor32<index_t, 1, at::RestrictPtrTraits>
         offsets_right,
-    const at::PackedTensorAccessor32<val_t, 1, at::RestrictPtrTraits>
+    const at::PackedTensorAccessor32<val_t, 2, at::RestrictPtrTraits>
         values_right,
-    at::PackedTensorAccessor32<val_t, 1, at::RestrictPtrTraits>
-        combined_values) {
+    at::PackedTensorAccessor32<val_t, 2, at::RestrictPtrTraits> output) {
   for (auto b = blockIdx.x * blockDim.y + threadIdx.y;
        b < static_cast<uint32_t>(B);
        b += gridDim.x * blockDim.y) {
     auto left_start = offsets_left[b];
-    auto left_len = offsets_left[b + 1] - left_start;
+    auto left_len = lengths_left[b];
     auto right_start = offsets_right[b];
-    auto right_len = offsets_right[b + 1] - right_start;
-    auto combined_start = left_start + right_start;
-    for (auto i = threadIdx.x; i < static_cast<uint32_t>(left_len + right_len);
+    auto right_len = lengths_right[b];
+    auto output_start = offsets_left[b];
+    auto keep_len = left_len - right_len;
+
+    for (auto i = threadIdx.x; i < static_cast<uint32_t>(left_len * D);
          i += blockDim.x) {
-      if (i < static_cast<uint32_t>(left_len)) {
-        combined_values[combined_start + i] = values_left[left_start + i];
+      auto seq_pos = i / D;
+      auto dim_pos = i % D;
+      if (seq_pos < static_cast<uint32_t>(keep_len)) {
+        output[output_start + seq_pos][dim_pos] =
+            values_left[left_start + seq_pos][dim_pos];
       } else {
-        combined_values[combined_start + i] =
-            values_right[right_start + i - left_len];
+        auto right_idx = seq_pos - keep_len;
+        if (right_idx < static_cast<uint32_t>(right_len)) {
+          output[output_start + seq_pos][dim_pos] =
+              values_right[right_start + right_idx][dim_pos];
+        }
       }
     }
   }
 }
 
-at::Tensor concat_1d_jagged_jagged_cuda(
+at::Tensor replace_last_n_with_jagged_cuda(
     const at::Tensor& lengths_left,
     const at::Tensor& values_left,
     const at::Tensor& lengths_right,
@@ -71,60 +83,74 @@ at::Tensor concat_1d_jagged_jagged_cuda(
   at::cuda::OptionalCUDAGuard device_guard;
   device_guard.set_index(values_left.get_device());
   TORCH_INTERNAL_ASSERT(lengths_left.device().type() == at::DeviceType::CUDA);
-  TORCH_INTERNAL_ASSERT(values_left.device().type() == at::DeviceType::CUDA);
   TORCH_INTERNAL_ASSERT(lengths_right.device().type() == at::DeviceType::CUDA);
+  TORCH_INTERNAL_ASSERT(values_left.device().type() == at::DeviceType::CUDA);
   TORCH_INTERNAL_ASSERT(values_right.device().type() == at::DeviceType::CUDA);
-  auto L = values_left.numel() + values_right.numel();
-  TORCH_CHECK(L < std::numeric_limits<int32_t>::max());
+  TORCH_CHECK(lengths_left.size(0) == lengths_right.size(0));
+  TORCH_CHECK(values_left.size(1) == values_right.size(1));
+
+  auto B = lengths_left.size(0);
+  auto D = values_left.size(1);
+  auto L_out = lengths_left.sum().item<int64_t>();
+  TORCH_CHECK(L_out < std::numeric_limits<int32_t>::max());
   TORCH_CHECK(values_left.get_device() == lengths_left.get_device());
   TORCH_CHECK(values_left.get_device() == lengths_right.get_device());
   TORCH_CHECK(values_left.get_device() == values_right.get_device());
-  auto B = lengths_left.size(0);
-  auto combined_values = at::empty({L}, values_left.options());
-  if (L == 0) {
-    return combined_values;
+
+  auto output = at::empty({L_out, D}, values_left.options());
+
+  if (L_out == 0) {
+    return output;
   }
+
   const auto offsets_left =
       fbgemm_gpu::asynchronous_complete_cumsum_gpu(lengths_left.view({-1}));
   const auto offsets_right =
       fbgemm_gpu::asynchronous_complete_cumsum_gpu(lengths_right.view({-1}));
+
   // Optimized thread block configuration based on benchmark results
-  uint32_t B_blocks = 4;
-  dim3 threads(256, B_blocks);
+  uint32_t B_blocks, threads_x;
+  B_blocks = 4;
+  threads_x = 256;
+
+  dim3 threads(threads_x, B_blocks);
   auto blocks = div_round_up(B, B_blocks);
+
   AT_DISPATCH_INTEGRAL_TYPES(
       lengths_left.scalar_type(),
-      "concat_1d_jagged_jagged_values_cuda_kernel_input1",
+      "replace_last_n_with_jagged_cuda_kernel_input1",
       [&] {
         using index_t = scalar_t;
         AT_DISPATCH_ALL_TYPES_AND2(
             at::ScalarType::BFloat16,
             at::ScalarType::Half,
             values_left.scalar_type(),
-            "concat_1d_jagged_jagged_values_cuda_kernel_input2",
+            "replace_last_n_with_jagged_cuda_kernel_input2",
             [&] {
               using val_t = scalar_t;
-              _concat_1d_jagged_jagged_cuda_kernel<index_t, val_t>
-                  <<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
-                      B,
-                      offsets_left.packed_accessor32<
-                          index_t,
-                          1,
-                          at::RestrictPtrTraits>(),
-                      values_left
-                          .packed_accessor32<val_t, 1, at::RestrictPtrTraits>(),
-                      offsets_right.packed_accessor32<
-                          index_t,
-                          1,
-                          at::RestrictPtrTraits>(),
-                      values_right
-                          .packed_accessor32<val_t, 1, at::RestrictPtrTraits>(),
-                      combined_values.packed_accessor32<
-                          val_t,
-                          1,
-                          at::RestrictPtrTraits>());
+              _replace_last_n_with_jagged_cuda_kernel<index_t, val_t><<<
+                  blocks,
+                  threads,
+                  0,
+                  at::cuda::getCurrentCUDAStream()>>>(
+                  B,
+                  D,
+                  lengths_left
+                      .packed_accessor32<index_t, 1, at::RestrictPtrTraits>(),
+                  offsets_left
+                      .packed_accessor32<index_t, 1, at::RestrictPtrTraits>(),
+                  values_left
+                      .packed_accessor32<val_t, 2, at::RestrictPtrTraits>(),
+                  lengths_right
+                      .packed_accessor32<index_t, 1, at::RestrictPtrTraits>(),
+                  offsets_right
+                      .packed_accessor32<index_t, 1, at::RestrictPtrTraits>(),
+                  values_right
+                      .packed_accessor32<val_t, 2, at::RestrictPtrTraits>(),
+                  output.packed_accessor32<val_t, 2, at::RestrictPtrTraits>());
             });
       });
-  return combined_values;
+
+  return output;
 }
 } // namespace hstu

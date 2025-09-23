@@ -70,6 +70,39 @@ at::Tensor concat_1d_jagged_jagged_meta(
     const at::Tensor& lengths_right,
     const at::Tensor& values_right);
 
+std::tuple<at::Tensor, at::Tensor> split_1d_jagged_jagged_cpu(
+    const at::Tensor& lengths_left,
+    const at::Tensor& lengths_right,
+    const at::Tensor& combined_values);
+
+std::tuple<at::Tensor, at::Tensor> split_1d_jagged_jagged_cuda(
+    const at::Tensor& lengths_left,
+    const at::Tensor& lengths_right,
+    const at::Tensor& combined_values);
+
+std::tuple<at::Tensor, at::Tensor> split_1d_jagged_jagged_meta(
+    const at::Tensor& lengths_left,
+    const at::Tensor& lengths_right,
+    const at::Tensor& combined_values);
+
+at::Tensor replace_last_n_with_jagged_cpu(
+    const at::Tensor& lengths_left,
+    const at::Tensor& values_left,
+    const at::Tensor& lengths_right,
+    const at::Tensor& values_right);
+
+at::Tensor replace_last_n_with_jagged_cuda(
+    const at::Tensor& lengths_left,
+    const at::Tensor& values_left,
+    const at::Tensor& lengths_right,
+    const at::Tensor& values_right);
+
+at::Tensor replace_last_n_with_jagged_meta(
+    const at::Tensor& lengths_left,
+    const at::Tensor& values_left,
+    const at::Tensor& lengths_right,
+    const at::Tensor& values_right);
+
 DLL_PUBLIC std::tuple<at::Tensor, at::Tensor> sort_kv_pairs_meta(
     const at::Tensor& keys,
     const at::Tensor& values,
@@ -96,6 +129,10 @@ TORCH_LIBRARY_FRAGMENT(hstu, m) {
       "expand_1d_jagged_to_dense(Tensor values, Tensor offsets, SymInt max_len) -> Tensor");
   m.def(
       "concat_1d_jagged_jagged(Tensor lengths_left, Tensor values_left, Tensor lengths_right, Tensor values_right) -> Tensor");
+  m.def(
+      "split_1d_jagged_jagged(Tensor lengths_left, Tensor lengths_right, Tensor combined_values) -> (Tensor, Tensor)");
+  m.def(
+      "replace_last_n_with_jagged(Tensor lengths_left, Tensor values_left, Tensor lengths_right, Tensor values_right) -> Tensor");
   m.def("complete_cumsum(Tensor values) -> Tensor");
   m.def(
       "sort_kv_pairs(Tensor keys, Tensor values, int? end_bit=None, bool descending=False) -> (Tensor, Tensor)");
@@ -104,12 +141,16 @@ TORCH_LIBRARY_FRAGMENT(hstu, m) {
 TORCH_LIBRARY_IMPL(hstu, CPU, m) {
   m.impl("expand_1d_jagged_to_dense", hstu::expand_1d_jagged_to_dense_cpu);
   m.impl("concat_1d_jagged_jagged", hstu::concat_1d_jagged_jagged_cpu);
+  m.impl("split_1d_jagged_jagged", hstu::split_1d_jagged_jagged_cpu);
+  m.impl("replace_last_n_with_jagged", hstu::replace_last_n_with_jagged_cpu);
   m.impl("complete_cumsum", hstu::complete_cumsum_cpu);
 }
 
 TORCH_LIBRARY_IMPL(hstu, CUDA, m) {
   m.impl("expand_1d_jagged_to_dense", hstu::expand_1d_jagged_to_dense_cuda);
   m.impl("concat_1d_jagged_jagged", hstu::concat_1d_jagged_jagged_cuda);
+  m.impl("split_1d_jagged_jagged", hstu::split_1d_jagged_jagged_cuda);
+  m.impl("replace_last_n_with_jagged", hstu::replace_last_n_with_jagged_cuda);
   m.impl("complete_cumsum", hstu::complete_cumsum_cuda);
   m.impl(
       "sort_kv_pairs",
@@ -120,6 +161,8 @@ TORCH_LIBRARY_IMPL(hstu, CUDA, m) {
 TORCH_LIBRARY_IMPL(hstu, Meta, m) {
   m.impl("expand_1d_jagged_to_dense", hstu::expand_1d_jagged_to_dense_meta);
   m.impl("concat_1d_jagged_jagged", hstu::concat_1d_jagged_jagged_meta);
+  m.impl("split_1d_jagged_jagged", hstu::split_1d_jagged_jagged_meta);
+  m.impl("replace_last_n_with_jagged", hstu::replace_last_n_with_jagged_meta);
   m.impl("complete_cumsum", hstu::complete_cumsum_meta);
   m.impl(
       "sort_kv_pairs",
