@@ -87,7 +87,7 @@ def jagged_dense_bmm_broadcast_add_kernel(
     """
 
     off_n = tl.program_id(0)
-    off_m = tl.program_id(1)
+    off_m = tl.program_id(1).to(tl.int64)
     off_b = tl.program_id(2)
 
     seq_start = tl.load(seq_offsets + off_b).to(tl.int64)
@@ -98,11 +98,11 @@ def jagged_dense_bmm_broadcast_add_kernel(
     if start_m >= seq_len:
         return
 
-    Jagged += seq_start * stride_jm
+    Jagged += (seq_start + start_m) * stride_jm
     Dense += off_b.to(tl.int64) * stride_db
     Out += seq_start * stride_om
 
-    offs_m = start_m + tl.arange(0, BLOCK_M)
+    offs_m = tl.arange(0, BLOCK_M)
     offs_n = start_n + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
     jg_ptrs = Jagged + offs_m[:, None] * stride_jm + offs_k[None, :]
@@ -113,7 +113,7 @@ def jagged_dense_bmm_broadcast_add_kernel(
         jg = tl.load(
             jg_ptrs,
             # pyre-fixme[16]: `int` has no attribute `__getitem__`.
-            mask=(offs_m[:, None] < seq_len) and ((k + offs_k)[None, :] < K),
+            mask=(offs_m[:, None] < (seq_len - start_m)) & ((k + offs_k)[None, :] < K),
             other=0.0,
         )
         dn = tl.load(
@@ -127,25 +127,30 @@ def jagged_dense_bmm_broadcast_add_kernel(
 
     if HAS_BIAS:
         if ELEMENTWISE:
-            Bias += seq_start * stride_bias_b
+            Bias += (seq_start + start_m) * stride_bias_b
             bias_ptrs = Bias + offs_m[:, None] * stride_bias_b + offs_n[None, :]
             bias = tl.load(
                 bias_ptrs,
-                mask=(offs_m[:, None] < seq_len) & (offs_n[None, :] < N),
+                mask=(offs_m[:, None] < (seq_len - start_m)) & (offs_n[None, :] < N),
                 other=0.0,
             )
             accumulator += bias.to(tl.float32)
         else:
-            bias_ptrs = Bias + off_b * stride_bias_b + offs_n
+            bias_ptrs = Bias + off_b.to(tl.int64) * stride_bias_b + offs_n
             bias = tl.load(bias_ptrs, mask=offs_n < N)
             accumulator += bias[None, :].to(tl.float32)
 
     out = accumulator.to(Out.dtype.element_ty)
 
-    offs_m = start_m + tl.arange(0, BLOCK_M)
+    offs_m = tl.arange(0, BLOCK_M)
     offs_n = start_n + tl.arange(0, BLOCK_N)
+    Out += start_m * stride_om
     out_ptrs = Out + offs_m[:, None] * stride_om + offs_n[None, :]
-    tl.store(out_ptrs, out, mask=(offs_m[:, None] < seq_len) & (offs_n[None, :] < N))
+    tl.store(
+        out_ptrs,
+        out,
+        mask=(offs_m[:, None] < (seq_len - start_m)) & (offs_n[None, :] < N),
+    )
 
 
 def _get_bmm_reduce_sum_configs() -> List[triton.Config]:
@@ -202,7 +207,7 @@ def _jagged_jagged_bmm_reduce_sum(
     JaggedA has shape (sum_B(K_i), M), JaggedB has shape (sum_B(K_i), N), and Out has shape (B, M, N)
     """
 
-    off_m = tl.program_id(0)
+    off_m = tl.program_id(0).to(tl.int64)
     off_n = tl.program_id(1)
     off_b = tl.program_id(2)
 
@@ -215,15 +220,22 @@ def _jagged_jagged_bmm_reduce_sum(
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     Out += off_b.to(tl.int64) * stride_ob
-    offs_m = start_m + tl.arange(0, BLOCK_M)
+    offs_m = tl.arange(0, BLOCK_M)
     offs_n = start_n + tl.arange(0, BLOCK_N)
+    Out += start_m * stride_om
     out_ptrs = Out + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
     if REDUCE_JAGGEDB:
-        out_reduce_ptrs = ReduceOut + off_b * stride_orb + offs_n * stride_orn
+        out_reduce_ptrs = (
+            ReduceOut + off_b.to(tl.int64) * stride_orb + offs_n * stride_orn
+        )
         acc_reduce = tl.zeros((BLOCK_N,), dtype=tl.float32)
     if seq_len == 0:
         out = accumulator.to(Out.dtype.element_ty)
-        tl.store(out_ptrs, out, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+        tl.store(
+            out_ptrs,
+            out,
+            mask=(offs_m[:, None] < (M - start_m)) & (offs_n[None, :] < N),
+        )
         if REDUCE_JAGGEDB:
             if off_m == 0:
                 tl.store(
@@ -236,14 +248,14 @@ def _jagged_jagged_bmm_reduce_sum(
     JaggedA += seq_start * stride_ak
     JaggedB += seq_start * stride_bk
     offs_k = tl.arange(0, BLOCK_K)
-    jg_a_ptrs = JaggedA + offs_k[None, :] * stride_ak + offs_m[:, None]
+    jg_a_ptrs = JaggedA + offs_k[None, :] * stride_ak + (start_m + offs_m)[:, None]
     jg_b_ptrs = JaggedB + offs_k[:, None] * stride_bk + offs_n[None, :]
 
     for k in range(0, seq_len, BLOCK_K):
         jg_a = tl.load(
             jg_a_ptrs,
             # pyre-fixme[16]: `int` has no attribute `__getitem__`.
-            mask=(offs_m[:, None] < M) and ((k + offs_k)[None, :] < seq_len),
+            mask=(offs_m[:, None] < (M - start_m)) & ((k + offs_k)[None, :] < seq_len),
             other=0.0,
         )
         jg_b = tl.load(
@@ -261,7 +273,11 @@ def _jagged_jagged_bmm_reduce_sum(
         jg_b_ptrs += BLOCK_K * stride_bk
 
     out = accumulator.to(Out.dtype.element_ty)
-    tl.store(out_ptrs, out, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+    tl.store(
+        out_ptrs,
+        out,
+        mask=(offs_m[:, None] < (M - start_m)) & (offs_n[None, :] < N),
+    )
     if REDUCE_JAGGEDB:
         if off_m == 0:
             tl.store(
