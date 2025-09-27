@@ -213,6 +213,14 @@ def pytorch_jagged_remove_first_or_last_1D(
     return values_no_first.squeeze(), values_no_last.squeeze()
 
 
+@torch.fx.wrap
+def fx_apply_mask(
+    tensor: torch.Tensor, mask: torch.Tensor, fill_value: torch.Tensor
+) -> torch.Tensor:
+    tensor[mask] = fill_value
+    return tensor
+
+
 def pytorch_replace_last_n_with_jagged(
     max_seq_len_left: int,
     offsets_left: torch.Tensor,
@@ -236,7 +244,7 @@ def pytorch_replace_last_n_with_jagged(
         raw_mask >= (lengths_a - lengths_b).unsqueeze(1),
         raw_mask < lengths_a.unsqueeze(1),
     )
-    dense_a[mask] = values_right
+    dense_a = fx_apply_mask(dense_a, mask, values_right)
     jagged_a = torch.ops.fbgemm.dense_to_jagged(
         dense_a,
         [offsets_left],
