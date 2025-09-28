@@ -229,7 +229,7 @@ class ModelFamilyDenseDist:
             table_device="cpu",
             max_hash_size=100,
             is_dense=True,
-        )
+        ).to(torch.bfloat16)
         load_nonsparse_checkpoint(model=model, optimizer=None, path=model_path)
 
         device = torch.device(f"cuda:{rank}")
@@ -377,12 +377,16 @@ class ModelFamilyDenseSingleWorker:
 
     def load(self, model_path: str) -> None:
         print(f"Loading dense module from {model_path}")
-        self.model = get_hstu_model(
-            table_config=self.table_config,
-            hstu_config=self.hstu_config,
-            table_device="cpu",
-            is_dense=True,
-        ).to(self.device)
+        self.model = (
+            get_hstu_model(
+                table_config=self.table_config,
+                hstu_config=self.hstu_config,
+                table_device="cpu",
+                is_dense=True,
+            )
+            .to(self.device)
+            .to(torch.bfloat16)
+        )
         load_nonsparse_checkpoint(model=self.model, optimizer=None, path=model_path)
         assert self.model is not None
         self.model.eval()

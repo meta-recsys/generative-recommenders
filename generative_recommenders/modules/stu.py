@@ -52,6 +52,7 @@ class STU(HammerModule, abc.ABC):
     def forward(
         self,
         x: torch.Tensor,
+        x_lengths: torch.Tensor,
         x_offsets: torch.Tensor,
         max_seq_len: int,
         num_targets: torch.Tensor,
@@ -457,7 +458,7 @@ class STUStack(STU):
         kv_caching_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         for layer in self._stu_layers:
-            delta_x = layer.cached_forward(
+            delta_x = layer.cached_forward(  # pyre-ignore [29]
                 delta_x=delta_x,
                 num_targets=num_targets,
                 max_kv_caching_len=max_kv_caching_len,

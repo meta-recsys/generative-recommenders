@@ -31,11 +31,11 @@ def get_hstu_configs(dataset: str = "debug") -> DlrmHSTUConfig:
         hstu_num_heads=4,
         hstu_attn_linear_dim=128,
         hstu_attn_qk_dim=128,
-        hstu_attn_num_layers=3,
+        hstu_attn_num_layers=5,
         hstu_embedding_table_dim=HSTU_EMBEDDING_DIM,
         hstu_preprocessor_hidden_dim=256,
         hstu_transducer_embedding_dim=512,
-        hstu_group_norm=True,
+        hstu_group_norm=False,
         hstu_input_dropout_ratio=0.2,
         hstu_linear_dropout_rate=0.1,
         causal_multitask_weights=0.2,
@@ -126,6 +126,10 @@ def get_hstu_configs(dataset: str = "debug") -> DlrmHSTUConfig:
             "item_dummy_weights",
             "item_dummy_watchtime",
         ]
+        hstu_config.max_num_candidates = 10 if dataset != "movielens-13b" else 128
+        hstu_config.max_num_candidates_inference = (
+            5 if dataset != "movielens-13b" else 2048
+        )
         hstu_config.multitask_configs = [
             TaskConfig(
                 task_name="rating",
@@ -342,14 +346,14 @@ def get_embedding_table_config(dataset: str = "debug") -> Dict[str, EmbeddingCon
             if dataset == "movielens-1m"
             else {
                 "movie_id": EmbeddingConfig(
-                    num_embeddings=HASH_SIZE,
+                    num_embeddings=500_000_000,
                     embedding_dim=HSTU_EMBEDDING_DIM,
                     name="movie_id",
                     data_type=DataType.FP16,
                     feature_names=["movie_id", "item_movie_id"],
                 ),
                 "user_id": EmbeddingConfig(
-                    num_embeddings=HASH_SIZE,
+                    num_embeddings=3_000_000,
                     embedding_dim=HSTU_EMBEDDING_DIM,
                     name="user_id",
                     data_type=DataType.FP16,

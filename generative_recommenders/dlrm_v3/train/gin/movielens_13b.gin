@@ -1,4 +1,4 @@
-batch_size = 16
+batch_size = 128
 dataset = "movielens-13b"
 
 # model parameters
@@ -35,3 +35,4 @@ train_loop.metric_log_frequency = 10
 
 # logger variables
 MetricsLogger.tensorboard_log_path = "/tmp/tensorboard_log_path.log"
+save_dmp_checkpoint.path = "/home/linjianma/ckpts/movielens_13b"

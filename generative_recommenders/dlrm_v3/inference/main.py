@@ -68,6 +68,7 @@ USER_CONF = f"{os.path.dirname(__file__)}/user.conf"
 SUPPORTED_CONFIGS = {
     "debug": "debug.gin",
     "kuairand-1k": "kuairand_1k.gin",
+    "movielens-13b": "movielens_13b.gin",
 }
 
 
@@ -126,6 +127,7 @@ class Runner:
 
     def run_one_item(self, qitem: QueryItem) -> None:
         try:
+            t0 = time.time()
             prediction_output = self.model.predict(qitem.samples)
             assert prediction_output is not None
             mt_target_preds, mt_target_labels, mt_target_weights = prediction_output
@@ -138,7 +140,7 @@ class Runner:
                     labels=mt_target_labels.t(),
                     weights=mt_target_weights.t(),
                 )
-            self.result_timing.append(time.time() - qitem.start)
+            self.result_timing.append(time.time() - t0)
             self.result_batches.append(len(qitem.query_ids))
         except Exception as ex:  # pylint: disable=broad-except
             logger.error("thread: failed, %s", ex)
@@ -221,6 +223,7 @@ def run(
     max_num_samples: int = 2048,
     numpy_rand_seed: int = 123,
     dev_mode: bool = False,
+    dataset_percentage: float = 1.0,
 ) -> None:
     set_dev_mode(dev_mode)
     if scenario_name not in SCENARIO_MAP:
@@ -275,7 +278,7 @@ def run(
         h.flush()
     logger.info("warmup done")
 
-    count = ds.get_item_count()
+    count = int(ds.get_item_count() * dataset_percentage)
     train_size: int = round(train_split_percentage * count)
 
     settings = lg.TestSettings()

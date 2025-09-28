@@ -63,7 +63,7 @@ class SequenceEmbedding(NamedTuple):
 
 @dataclass
 class DlrmHSTUConfig:
-    max_seq_len: int = 2056
+    max_seq_len: int = 16384
     max_num_candidates: int = 10
     max_num_candidates_inference: int = 5
     hstu_num_heads: int = 1
@@ -124,10 +124,12 @@ class DlrmHSTU(HammerModule):
         embedding_tables: Dict[str, EmbeddingConfig],
         is_inference: bool,
         is_dense: bool = False,
+        bf16_training: bool = True,
     ) -> None:
         super().__init__(is_inference=is_inference)
         logger.info(f"Initialize HSTU module with configs {hstu_configs}")
         self._hstu_configs = hstu_configs
+        self._bf16_training: bool = bf16_training
         set_static_max_seq_lens([self._hstu_configs.max_seq_len])
 
         if not is_dense:
@@ -305,22 +307,32 @@ class DlrmHSTU(HammerModule):
             kernel=self.hammer_kernel(),
         ).squeeze(-1)
         total_targets = int(num_candidates.sum().item())
-        candidates_user_embeddings, _ = self._hstu_transducer(
-            max_uih_len=max_uih_len,
-            max_targets=max_candidates,
-            total_uih_len=source_timestamps.numel() - total_targets,
-            total_targets=total_targets,
-            seq_embeddings=seq_embeddings[
-                self._hstu_configs.uih_post_id_feature_name
-            ].embedding,
-            seq_lengths=source_lengths,
-            seq_timestamps=source_timestamps,
-            seq_payloads=self._construct_payload(
-                payload_features=payload_features,
-                seq_embeddings=seq_embeddings,
-            ),
-            num_targets=num_candidates,
-        )
+        embedding = seq_embeddings[
+            self._hstu_configs.uih_post_id_feature_name
+        ].embedding
+        dtype = embedding.dtype
+        if (not self.is_inference) and self._bf16_training:
+            embedding = embedding.to(torch.bfloat16)
+        with torch.autocast(
+            "cuda",
+            dtype=torch.bfloat16,
+            enabled=(not self.is_inference) and self._bf16_training,
+        ):
+            candidates_user_embeddings, _ = self._hstu_transducer(
+                max_uih_len=max_uih_len,
+                max_targets=max_candidates,
+                total_uih_len=source_timestamps.numel() - total_targets,
+                total_targets=total_targets,
+                seq_embeddings=embedding,
+                seq_lengths=source_lengths,
+                seq_timestamps=source_timestamps,
+                seq_payloads=self._construct_payload(
+                    payload_features=payload_features,
+                    seq_embeddings=seq_embeddings,
+                ),
+                num_targets=num_candidates,
+            )
+        candidates_user_embeddings = candidates_user_embeddings.to(dtype)
 
         return candidates_user_embeddings
 

@@ -131,7 +131,6 @@ def make_model(
         embedding_tables=table_config,
         is_inference=False,
     )
-    model.recursive_setattr("_hammer_kernel", HammerKernel.PYTORCH)
 
     return (
         model,
