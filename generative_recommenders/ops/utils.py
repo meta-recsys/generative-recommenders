@@ -24,3 +24,10 @@ def is_sm100() -> bool:
         return False
     props = torch.cuda.get_device_properties(0)
     return props.major == 10 and props.minor == 0
+
+
+def is_sm90() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    props = torch.cuda.get_device_properties(0)
+    return props.major == 9 and props.minor == 0
