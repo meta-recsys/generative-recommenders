@@ -59,3 +59,14 @@ def pytorch_swish_layer_norm(
             )
         )
     ).to(dtype)
+
+
+def pytorch_rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    x = x.float()
+    output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+    output = output.type_as(x)
+    return output * weight
