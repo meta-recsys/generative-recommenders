@@ -28,6 +28,12 @@ from generative_recommenders.common import (
     HammerKernel,
     set_dev_mode,
 )
+from generative_recommenders.ops.jagged_tensors import (
+    concat_2D_jagged,
+    concat_2D_jagged_multirow,
+    split_2D_jagged,
+    split_2D_jagged_multirow,
+)
 
 from hypothesis import given, settings, strategies as st, Verbosity
 
@@ -718,3 +724,243 @@ class JaggedTensorsTest(unittest.TestCase):
                 atol=atol,
                 rtol=rtol,
             )
+
+    @unittest.skipIf(*gpu_unavailable)
+    # pyre-ignore
+    @given(
+        batch_size=st.integers(2, 8),
+        max_len_a=st.integers(20, 100),
+        max_len_b=st.integers(20, 100),
+        D=st.integers(10, 30),
+        is_dense_a=st.sampled_from([True, False]),
+        is_dense_b=st.sampled_from([True, False]),
+        dtype=st.sampled_from(
+            [torch.bfloat16, torch.float32]
+            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            else [torch.float32]
+        ),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=20,
+        deadline=None,
+    )
+    # pyre-ignore[2]
+    def test_concat_2D_jagged_multirow_triton(self, *args, **kwargs) -> None:
+        self._test_concat_2D_jagged_multirow(
+            *args,
+            **kwargs,
+            test_backward=True,
+            ref_kernel=HammerKernel.PYTORCH,
+            real_kernel=HammerKernel.TRITON,
+        )
+
+    def _test_concat_2D_jagged_multirow(
+        self,
+        batch_size: int,
+        max_len_a: int,
+        max_len_b: int,
+        D: int,
+        is_dense_a: bool,
+        is_dense_b: bool,
+        test_backward: bool,
+        ref_kernel: HammerKernel,
+        real_kernel: HammerKernel,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        set_dev_mode(True)
+
+        if not is_dense_a:
+            lengths_a = torch.randint(
+                1, max_len_a + 1, size=(batch_size,), device=torch.device("cuda")
+            )
+            offsets_a = torch.zeros(
+                (batch_size + 1,), dtype=torch.int64, device=torch.device("cuda")
+            )
+            offsets_a[1:] = torch.cumsum(lengths_a, dim=0)
+            total_len_a = int(offsets_a[-1].item())
+        else:
+            offsets_a = None
+            total_len_a = batch_size * max_len_a
+        values_a = (
+            torch.empty(
+                (total_len_a, D),
+                dtype=dtype,
+                device=torch.device("cuda"),
+            )
+            .uniform_(-1.0, 1.0)
+            .requires_grad_()
+        )
+
+        if not is_dense_b:
+            lengths_b = torch.randint(
+                1, max_len_b + 1, size=(batch_size,), device=torch.device("cuda")
+            )
+            offsets_b = torch.zeros(
+                (batch_size + 1,), dtype=torch.int64, device=torch.device("cuda")
+            )
+            offsets_b[1:] = torch.cumsum(lengths_b, dim=0)
+            total_len_b = int(offsets_b[-1].item())
+        else:
+            offsets_b = None
+            total_len_b = batch_size * max_len_b
+        values_b = (
+            torch.empty(
+                (total_len_b, D),
+                dtype=dtype,
+                device=torch.device("cuda"),
+            )
+            .uniform_(-1.0, 1.0)
+            .requires_grad_()
+        )
+
+        ref_values = concat_2D_jagged(
+            max_seq_len=max_len_a + max_len_b,
+            values_left=values_a,
+            values_right=values_b,
+            max_len_left=max_len_a,
+            max_len_right=max_len_b,
+            offsets_left=offsets_a,
+            offsets_right=offsets_b,
+            kernel=ref_kernel,
+        )
+        dout = torch.randn_like(ref_values) * 0.1
+        ref_values.backward(dout)
+        assert values_a.grad is not None
+        ref_d_a, values_a.grad = values_a.grad.clone(), None
+        assert values_b.grad is not None
+        ref_d_b, values_b.grad = values_b.grad.clone(), None
+
+        values_a = values_a.detach().clone().requires_grad_()
+        values_b = values_b.detach().clone().requires_grad_()
+        dout = dout.detach().clone()
+
+        real_values = concat_2D_jagged_multirow(
+            max_seq_len=max_len_a + max_len_b,
+            values_left=values_a,
+            values_right=values_b,
+            offsets_left=offsets_a,
+            offsets_right=offsets_b,
+            max_len_left=max_len_a,
+            max_len_right=max_len_b,
+            kernel=real_kernel,
+        )
+        torch.testing.assert_close(ref_values, real_values)
+        if test_backward:
+            real_values.backward(dout)
+            real_d_a = values_a.grad.clone()
+            real_d_b = values_b.grad.clone()
+            torch.testing.assert_close(ref_d_a, real_d_a)
+            torch.testing.assert_close(ref_d_b, real_d_b)
+
+    @unittest.skipIf(*gpu_unavailable)
+    # pyre-ignore
+    @given(
+        batch_size=st.integers(2, 8),
+        max_len_a=st.integers(20, 100),
+        max_len_b=st.integers(20, 100),
+        D=st.integers(10, 30),
+        dtype=st.sampled_from(
+            [torch.bfloat16, torch.float32]
+            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            else [torch.float32]
+        ),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=20,
+        deadline=None,
+    )
+    # pyre-ignore[2]
+    def test_split_2D_jagged_multirow_triton(self, *args, **kwargs) -> None:
+        self._test_split_2D_jagged_multirow(
+            *args,
+            **kwargs,
+            test_backward=True,
+            ref_kernel=HammerKernel.PYTORCH,
+            real_kernel=HammerKernel.TRITON,
+        )
+
+    def _test_split_2D_jagged_multirow(
+        self,
+        batch_size: int,
+        max_len_a: int,
+        max_len_b: int,
+        D: int,
+        test_backward: bool,
+        ref_kernel: HammerKernel,
+        real_kernel: HammerKernel,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        set_dev_mode(True)
+
+        lengths_a = torch.randint(
+            1, max_len_a + 1, size=(batch_size,), device=torch.device("cuda")
+        )
+        offsets_a = torch.zeros(
+            (batch_size + 1,), dtype=torch.int64, device=torch.device("cuda")
+        )
+        offsets_a[1:] = torch.cumsum(lengths_a, dim=0)
+
+        lengths_b = torch.randint(
+            1, max_len_b + 1, size=(batch_size,), device=torch.device("cuda")
+        )
+        offsets_b = torch.zeros(
+            (batch_size + 1,), dtype=torch.int64, device=torch.device("cuda")
+        )
+        offsets_b[1:] = torch.cumsum(lengths_b, dim=0)
+
+        total_len = int(offsets_a[-1].item()) + int(offsets_b[-1].item())
+        values = (
+            torch.empty(
+                (total_len, D),
+                dtype=dtype,
+                device=torch.device("cuda"),
+            )
+            .uniform_(-1.0, 1.0)
+            .requires_grad_()
+        )
+
+        ref_values_a, ref_values_b = split_2D_jagged(
+            max_seq_len=max_len_a + max_len_b,
+            values=values,
+            total_len_left=int(offsets_a[-1].item()),
+            total_len_right=int(offsets_b[-1].item()),
+            max_len_left=max_len_a,
+            max_len_right=max_len_b,
+            offsets_left=offsets_a,
+            offsets_right=offsets_b,
+            kernel=ref_kernel,
+        )
+        d_values_a = torch.randn_like(ref_values_a) * 0.1
+        d_values_b = torch.randn_like(ref_values_b) * 0.1
+        ref_values_a.backward(d_values_a, retain_graph=True)
+        ref_values_b.backward(d_values_b)
+        assert values.grad is not None
+        ref_d_values, values.grad = values.grad.clone(), None
+
+        values = values.detach().clone().requires_grad_()
+        d_values_a = d_values_a.detach().clone()
+        d_values_b = d_values_b.detach().clone()
+
+        max_len_a_actual = int((offsets_a[1:] - offsets_a[:-1]).max().item())
+        max_len_b_actual = int((offsets_b[1:] - offsets_b[:-1]).max().item())
+
+        real_values_a, real_values_b = split_2D_jagged_multirow(
+            max_seq_len=max_len_a + max_len_b,
+            values=values,
+            total_len_left=int(offsets_a[-1].item()),
+            total_len_right=int(offsets_b[-1].item()),
+            max_len_left=max_len_a_actual,
+            max_len_right=max_len_b_actual,
+            offsets_left=offsets_a,
+            offsets_right=offsets_b,
+            kernel=real_kernel,
+        )
+        torch.testing.assert_close(ref_values_a, real_values_a)
+        torch.testing.assert_close(ref_values_b, real_values_b)
+        if test_backward:
+            real_values_a.backward(d_values_a, retain_graph=True)
+            real_values_b.backward(d_values_b)
+            real_d_values = values.grad.clone()
+            torch.testing.assert_close(ref_d_values, real_d_values)
