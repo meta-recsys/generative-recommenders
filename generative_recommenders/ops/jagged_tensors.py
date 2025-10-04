@@ -32,7 +32,9 @@ from generative_recommenders.ops.pytorch.pt_jagged_tensors import (
 from generative_recommenders.ops.triton.triton_jagged import triton_jagged_dense_bmm_add
 from generative_recommenders.ops.triton.triton_jagged_tensors import (
     triton_concat_2D_jagged,
+    triton_concat_2D_jagged_multirow,
     triton_split_2D_jagged,
+    triton_split_2D_jagged_multirow,
 )
 from torch.fx._symbolic_trace import is_fx_tracing
 
@@ -247,4 +249,108 @@ def jagged_dense_bmm_broadcast_add(
             jagged=jagged,
             dense=dense,
             bias=bias,
+        )
+
+
+def concat_2D_jagged_multirow(
+    max_seq_len: int,
+    values_left: torch.Tensor,
+    values_right: torch.Tensor,
+    offsets_left: Optional[torch.Tensor],
+    offsets_right: Optional[torch.Tensor],
+    max_len_left: int,
+    max_len_right: int,
+    kernel: HammerKernel = HammerKernel.TRITON,
+) -> torch.Tensor:
+    if not is_fx_tracing():
+        torch._assert(values_left.dim() == 2, "values_left must be 2D")
+        torch._assert(values_right.dim() == 2, "values_right must be 2D")
+        torch._assert(
+            values_right.shape[1] == values_left.shape[1],
+            f"values_left shape[1] must be equal to values_right shape[1] {values_left.shape[1]} vs {values_right.shape[1]}",
+        )
+        if offsets_left is not None and offsets_right is not None:
+            torch._assert(
+                offsets_left.shape[0] == offsets_right.shape[0],
+                "offsets_left and offsets_right must have the same batch dimension",
+            )
+
+    if kernel == HammerKernel.TRITON:
+        return triton_concat_2D_jagged_multirow(
+            max_seq_len=max_seq_len,
+            values_a=values_left,
+            values_b=values_right,
+            offsets_a=offsets_left,
+            offsets_b=offsets_right,
+            max_len_a=max_len_left,
+            max_len_b=max_len_right,
+        )
+    else:
+        return concat_2D_jagged(
+            max_seq_len=max_seq_len,
+            values_left=values_left,
+            values_right=values_right,
+            max_len_left=max_len_left,
+            max_len_right=max_len_right,
+            offsets_left=offsets_left,
+            offsets_right=offsets_right,
+            kernel=kernel,
+        )
+
+
+def split_2D_jagged_multirow(
+    max_seq_len: int,
+    values: torch.Tensor,
+    total_len_left: Optional[int] = None,
+    total_len_right: Optional[int] = None,
+    max_len_left: Optional[int] = None,
+    max_len_right: Optional[int] = None,
+    offsets_left: Optional[torch.Tensor] = None,
+    offsets_right: Optional[torch.Tensor] = None,
+    kernel: HammerKernel = HammerKernel.TRITON,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if not is_fx_tracing():
+        torch._assert(values.dim() == 2, "values must be 2D")
+        torch._assert(
+            offsets_left is not None or offsets_right is not None,
+            "offsets_left and offsets_right cannot be None at the same time",
+        )
+        if offsets_left is None:
+            torch._assert(
+                max_len_left is not None,
+                "max_len_left must be provided when offsets_left is None",
+            )
+        if offsets_right is None:
+            torch._assert(
+                max_len_right is not None,
+                "max_len_right must be provided when offsets_right is None",
+            )
+        if offsets_left is not None and offsets_right is not None:
+            torch._assert(
+                offsets_left.shape[0] == offsets_right.shape[0],
+                "offsets_left and offsets_right must have the same batch dimension",
+            )
+
+    if kernel == HammerKernel.TRITON:
+        return triton_split_2D_jagged_multirow(
+            max_seq_len=max_seq_len,
+            values=values,
+            total_len_left=total_len_left,
+            total_len_right=total_len_right,
+            max_len_left=max_len_left,
+            max_len_right=max_len_right,
+            offsets_left=offsets_left,
+            offsets_right=offsets_right,
+        )
+    else:
+        return split_2D_jagged(
+            max_seq_len=max_seq_len,
+            values=values,
+            total_len_left=total_len_left,
+            total_len_right=total_len_right,
+            max_len_left=max_len_left,
+            max_len_right=max_len_right,
+            offsets_left=offsets_left,
+            offsets_right=offsets_right,
+            kernel=kernel,
         )
