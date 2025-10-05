@@ -78,6 +78,7 @@ def cuda_hstu_mha(
             seq_offsets,
             causal,
             num_targets,
+            attn_scale,
             max_attn_len,
             min_full_attn_seq_len,
             contextual_seq_len,
@@ -87,6 +88,11 @@ def cuda_hstu_mha(
             sort_by_length,
             deterministic,
             sm_margin,
+            max_seq_len_tensor,
+            contextual_seq_len_tensor,
+            max_attn_len_tensor,
+            min_full_attn_seq_len_tensor,
+            num_groups,
         )
     else:
         return torch.ops.hstu.hstu_mha(
