@@ -157,6 +157,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 seq_offsets,
                 True,  # causal
                 num_targets,
+                attn_scale,
                 max_attn_len,
                 full_attn_size,
                 contextual_seq_len,
@@ -392,6 +393,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 seq_offsets,
                 True,  # causal
                 num_targets,
+                attn_scale,
                 ctx.max_attn_len,
                 ctx.full_attn_size,
                 ctx.contextual_seq_len,
