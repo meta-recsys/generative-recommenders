@@ -164,6 +164,11 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 None,  # k_descale
                 None,  # v_descale
                 0,  # sm_margin
+                None,  # max_seq_len_tensor,
+                None,  # contextual_seq_len_tensor,
+                None,  # max_attn_len_tensor,
+                None,  # min_full_attn_seq_len_tensor,
+                1,  # num_groups
             )
         else:
             out, _ = torch.ops.hstu.hstu_mha_fwd(
@@ -393,6 +398,11 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 ctx.sort_by_length,
                 False,  # deterministic
                 0,  # sm_margin
+                None,  # max_seq_len_tensor,
+                None,  # contextual_seq_len_tensor,
+                None,  # max_attn_len_tensor,
+                None,  # min_full_attn_seq_len_tensor,
+                1,  # num_groups
             )
         else:
             _dq, _dk, _dv = torch.ops.hstu.hstu_mha_bwd(

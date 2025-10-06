@@ -87,6 +87,11 @@ def cuda_hstu_mha(
             sort_by_length,
             deterministic,
             sm_margin,
+            max_seq_len_tensor,
+            contextual_seq_len_tensor,
+            max_attn_len_tensor,
+            min_full_attn_seq_len_tensor,
+            num_groups,
         )
     else:
         return torch.ops.hstu.hstu_mha(
