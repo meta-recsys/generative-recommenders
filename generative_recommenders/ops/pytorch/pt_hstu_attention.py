@@ -161,6 +161,10 @@ def pytorch_hstu_mha(
                 .unsqueeze(1)
                 .to(qk_attn.dtype)
             )
+        else:
+            # pyre-ignore[9]
+            attn_scale = attn_scale.item()
+
         qk_attn = F.silu(qk_attn) * attn_scale
     else:
         qk_attn = F.silu(qk_attn) / max_seq_len
