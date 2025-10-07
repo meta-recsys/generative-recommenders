@@ -120,7 +120,8 @@ template <typename T>
 struct SiluScaleOp {
   cutlass::epilogue::thread::SiLu<T> silu;
   __device__ __forceinline__ T operator()(T const& t, T const& scale) {
-    return silu(t) *
+    float t2 = t / 2;
+    return t2 * (1 + cutlass::fast_tanh(t2)) *
         scale; // __fdividef(t, 1.0f + cutlass::fast_exp(-t)) * scale
   }
 };
