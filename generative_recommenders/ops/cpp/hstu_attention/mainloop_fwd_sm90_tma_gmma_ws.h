@@ -764,15 +764,17 @@ struct CollectiveMainloopFwdSm90 {
       }
     }
     int min_full_attn_seq_len_, max_attn_len_, contextual_seq_len_;
-    if (params.num_groups > 1) {
-      int group_id = bidb / params.batch_size_per_group;
-      min_full_attn_seq_len_ = params.min_full_attn_seq_len_tensor[group_id];
-      max_attn_len_ = params.max_attn_len_tensor[group_id];
-      contextual_seq_len_ = params.contextual_seq_len_tensor[group_id];
-    } else {
-      min_full_attn_seq_len_ = params.min_full_attn_seq_len;
-      max_attn_len_ = params.max_attn_len;
-      contextual_seq_len_ = params.contextual_seq_len;
+    if constexpr (!Cross) {
+      if (params.num_groups > 1) {
+        int group_id = bidb / params.batch_size_per_group;
+        min_full_attn_seq_len_ = params.min_full_attn_seq_len_tensor[group_id];
+        max_attn_len_ = params.max_attn_len_tensor[group_id];
+        contextual_seq_len_ = params.contextual_seq_len_tensor[group_id];
+      } else {
+        min_full_attn_seq_len_ = params.min_full_attn_seq_len;
+        max_attn_len_ = params.max_attn_len;
+        contextual_seq_len_ = params.contextual_seq_len;
+      }
     }
     int n_block_min, n_block_max;
     if constexpr (Cross) {
@@ -1220,11 +1222,20 @@ struct CollectiveMainloopFwdSm90 {
     }
     int min_full_attn_seq_len_, max_attn_len_, contextual_seq_len_;
     float scalar_scale_val_;
+    if constexpr (!Cross) {
+      if (params.num_groups > 1) {
+        int group_id = bidb / params.batch_size_per_group;
+        min_full_attn_seq_len_ = params.min_full_attn_seq_len_tensor[group_id];
+        max_attn_len_ = params.max_attn_len_tensor[group_id];
+        contextual_seq_len_ = params.contextual_seq_len_tensor[group_id];
+      } else {
+        min_full_attn_seq_len_ = params.min_full_attn_seq_len;
+        max_attn_len_ = params.max_attn_len;
+        contextual_seq_len_ = params.contextual_seq_len;
+      }
+    }
     if (params.num_groups > 1) {
       int group_id = bidb / params.batch_size_per_group;
-      min_full_attn_seq_len_ = params.min_full_attn_seq_len_tensor[group_id];
-      max_attn_len_ = params.max_attn_len_tensor[group_id];
-      contextual_seq_len_ = params.contextual_seq_len_tensor[group_id];
       int max_seq_len_per_group = params.max_seq_len_tensor[group_id];
       // attention scale
       scalar_scale_val_ = params.scalar_scale
@@ -1232,9 +1243,6 @@ struct CollectiveMainloopFwdSm90 {
                                           : params.attn_scale[group_id])
           : 0;
     } else {
-      min_full_attn_seq_len_ = params.min_full_attn_seq_len;
-      max_attn_len_ = params.max_attn_len;
-      contextual_seq_len_ = params.contextual_seq_len;
       // attention scale
       scalar_scale_val_ = params.scalar_scale
           ? (params.attn_scale == nullptr ? params.max_seq_len_inv
@@ -1723,15 +1731,17 @@ struct CollectiveMainloopFwdSm90 {
       }
     }
     int min_full_attn_seq_len_, max_attn_len_, contextual_seq_len_;
-    if (params.num_groups > 1) {
-      int group_id = bidb / params.batch_size_per_group;
-      min_full_attn_seq_len_ = params.min_full_attn_seq_len_tensor[group_id];
-      max_attn_len_ = params.max_attn_len_tensor[group_id];
-      contextual_seq_len_ = params.contextual_seq_len_tensor[group_id];
-    } else {
-      min_full_attn_seq_len_ = params.min_full_attn_seq_len;
-      max_attn_len_ = params.max_attn_len;
-      contextual_seq_len_ = params.contextual_seq_len;
+    if constexpr (!Cross) {
+      if (params.num_groups > 1) {
+        int group_id = bidb / params.batch_size_per_group;
+        min_full_attn_seq_len_ = params.min_full_attn_seq_len_tensor[group_id];
+        max_attn_len_ = params.max_attn_len_tensor[group_id];
+        contextual_seq_len_ = params.contextual_seq_len_tensor[group_id];
+      } else {
+        min_full_attn_seq_len_ = params.min_full_attn_seq_len;
+        max_attn_len_ = params.max_attn_len;
+        contextual_seq_len_ = params.contextual_seq_len;
+      }
     }
     int n_block_min, n_block_max;
     if constexpr (Cross) {

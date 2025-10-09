@@ -646,27 +646,29 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd(
     TORCH_CHECK(
         max_seq_len_tensor.has_value(),
         "max_seq_len_tensor cannot be empty for num_groups > 1.");
-    TORCH_CHECK(
-        contextual_seq_len_tensor.has_value(),
-        "contextual_seq_len_tensor cannot be empty for num_groups > 1.");
-    TORCH_CHECK(
-        max_attn_len_tensor.has_value(),
-        "max_attn_len_tensor cannot be empty for num_groups > 1.");
-    TORCH_CHECK(
-        min_full_attn_seq_len_tensor.has_value(),
-        "min_full_attn_seq_len_tensor cannot be empty for num_groups > 1.");
     max_seq_len_tensor_ = max_seq_len_tensor.value();
-    contextual_seq_len_tensor_ = contextual_seq_len_tensor.value();
-    max_attn_len_tensor_ = max_attn_len_tensor.value();
-    min_full_attn_seq_len_tensor_ = min_full_attn_seq_len_tensor.value();
     CHECK_DEVICE(max_seq_len_tensor_);
-    CHECK_DEVICE(contextual_seq_len_tensor_);
-    CHECK_DEVICE(max_attn_len_tensor_);
-    CHECK_DEVICE(min_full_attn_seq_len_tensor_);
     TORCH_CHECK(max_seq_len_tensor_.dtype() == torch::kInt32);
-    TORCH_CHECK(contextual_seq_len_tensor_.dtype() == torch::kInt32);
-    TORCH_CHECK(max_attn_len_tensor_.dtype() == torch::kInt32);
-    TORCH_CHECK(min_full_attn_seq_len_tensor_.dtype() == torch::kInt32);
+    if (!is_cross_attn) {
+      TORCH_CHECK(
+          contextual_seq_len_tensor.has_value(),
+          "contextual_seq_len_tensor cannot be empty for num_groups > 1 and not cross_attn.");
+      TORCH_CHECK(
+          max_attn_len_tensor.has_value(),
+          "max_attn_len_tensor cannot be empty for num_groups > 1 and not cross_attn.");
+      TORCH_CHECK(
+          min_full_attn_seq_len_tensor.has_value(),
+          "min_full_attn_seq_len_tensor cannot be empty for num_groups > 1 and not cross_attn.");
+      contextual_seq_len_tensor_ = contextual_seq_len_tensor.value();
+      max_attn_len_tensor_ = max_attn_len_tensor.value();
+      min_full_attn_seq_len_tensor_ = min_full_attn_seq_len_tensor.value();
+      CHECK_DEVICE(contextual_seq_len_tensor_);
+      CHECK_DEVICE(max_attn_len_tensor_);
+      CHECK_DEVICE(min_full_attn_seq_len_tensor_);
+      TORCH_CHECK(contextual_seq_len_tensor_.dtype() == torch::kInt32);
+      TORCH_CHECK(max_attn_len_tensor_.dtype() == torch::kInt32);
+      TORCH_CHECK(min_full_attn_seq_len_tensor_.dtype() == torch::kInt32);
+    }
   }
 #ifdef HSTU_FLASH_ATTN_DEBUG_INFO
   if (is_jagged && has_multiple_targets) {
@@ -782,9 +784,14 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd(
       !is_cross_attn ? nullptr : seq_offsets_q_.data_ptr(),
       (num_softmax_heads == 0) ? nullptr : softmax_lse.value().data_ptr(),
       num_groups > 1 ? max_seq_len_tensor_.data_ptr() : nullptr,
-      num_groups > 1 ? contextual_seq_len_tensor_.data_ptr() : nullptr,
-      num_groups > 1 ? max_attn_len_tensor_.data_ptr() : nullptr,
-      num_groups > 1 ? min_full_attn_seq_len_tensor_.data_ptr() : nullptr,
+      ((num_groups > 1) && (!is_cross_attn))
+          ? contextual_seq_len_tensor_.data_ptr()
+          : nullptr,
+      ((num_groups > 1) && (!is_cross_attn)) ? max_attn_len_tensor_.data_ptr()
+                                             : nullptr,
+      ((num_groups > 1) && (!is_cross_attn))
+          ? min_full_attn_seq_len_tensor_.data_ptr()
+          : nullptr,
       num_groups,
       causal,
       alpha,
@@ -1065,27 +1072,29 @@ std::vector<at::Tensor> hstu_mha_bwd(
     TORCH_CHECK(
         max_seq_len_tensor.has_value(),
         "max_seq_len_tensor cannot be empty for num_groups > 1.");
-    TORCH_CHECK(
-        contextual_seq_len_tensor.has_value(),
-        "contextual_seq_len_tensor cannot be empty for num_groups > 1.");
-    TORCH_CHECK(
-        max_attn_len_tensor.has_value(),
-        "max_attn_len_tensor cannot be empty for num_groups > 1.");
-    TORCH_CHECK(
-        min_full_attn_seq_len_tensor.has_value(),
-        "min_full_attn_seq_len_tensor cannot be empty for num_groups > 1.");
     max_seq_len_tensor_ = max_seq_len_tensor.value();
-    contextual_seq_len_tensor_ = contextual_seq_len_tensor.value();
-    max_attn_len_tensor_ = max_attn_len_tensor.value();
-    min_full_attn_seq_len_tensor_ = min_full_attn_seq_len_tensor.value();
     CHECK_DEVICE(max_seq_len_tensor_);
-    CHECK_DEVICE(contextual_seq_len_tensor_);
-    CHECK_DEVICE(max_attn_len_tensor_);
-    CHECK_DEVICE(min_full_attn_seq_len_tensor_);
     TORCH_CHECK(max_seq_len_tensor_.dtype() == torch::kInt32);
-    TORCH_CHECK(contextual_seq_len_tensor_.dtype() == torch::kInt32);
-    TORCH_CHECK(max_attn_len_tensor_.dtype() == torch::kInt32);
-    TORCH_CHECK(min_full_attn_seq_len_tensor_.dtype() == torch::kInt32);
+    if (!is_cross_attn) {
+      TORCH_CHECK(
+          contextual_seq_len_tensor.has_value(),
+          "contextual_seq_len_tensor cannot be empty for num_groups > 1 and not cross_attn.");
+      TORCH_CHECK(
+          max_attn_len_tensor.has_value(),
+          "max_attn_len_tensor cannot be empty for num_groups > 1 and not cross_attn.");
+      TORCH_CHECK(
+          min_full_attn_seq_len_tensor.has_value(),
+          "min_full_attn_seq_len_tensor cannot be empty for num_groups > 1 and not cross_attn.");
+      contextual_seq_len_tensor_ = contextual_seq_len_tensor.value();
+      max_attn_len_tensor_ = max_attn_len_tensor.value();
+      min_full_attn_seq_len_tensor_ = min_full_attn_seq_len_tensor.value();
+      CHECK_DEVICE(contextual_seq_len_tensor_);
+      CHECK_DEVICE(max_attn_len_tensor_);
+      CHECK_DEVICE(min_full_attn_seq_len_tensor_);
+      TORCH_CHECK(contextual_seq_len_tensor_.dtype() == torch::kInt32);
+      TORCH_CHECK(max_attn_len_tensor_.dtype() == torch::kInt32);
+      TORCH_CHECK(min_full_attn_seq_len_tensor_.dtype() == torch::kInt32);
+    }
   }
   auto const sizes_q = q.sizes();
   auto const sizes_kv = k.sizes();
@@ -1242,9 +1251,14 @@ std::vector<at::Tensor> hstu_mha_bwd(
       num_softmax_heads == 0 ? nullptr : softmax_d.data_ptr(),
       num_softmax_heads == 0 ? nullptr : softmax_lse_log2.data_ptr(),
       num_groups > 1 ? max_seq_len_tensor_.data_ptr() : nullptr,
-      num_groups > 1 ? contextual_seq_len_tensor_.data_ptr() : nullptr,
-      num_groups > 1 ? max_attn_len_tensor_.data_ptr() : nullptr,
-      num_groups > 1 ? min_full_attn_seq_len_tensor_.data_ptr() : nullptr,
+      ((num_groups > 1) && (!is_cross_attn))
+          ? contextual_seq_len_tensor_.data_ptr()
+          : nullptr,
+      ((num_groups > 1) && (!is_cross_attn)) ? max_attn_len_tensor_.data_ptr()
+                                             : nullptr,
+      ((num_groups > 1) && (!is_cross_attn))
+          ? min_full_attn_seq_len_tensor_.data_ptr()
+          : nullptr,
       num_groups,
       scalar_scale,
       causal,
