@@ -63,12 +63,13 @@ def cuda_hstu_mha(
     max_attn_len_tensor: Optional[torch.Tensor] = None,
     min_full_attn_seq_len_tensor: Optional[torch.Tensor] = None,
     num_groups: int = 1,
+    is_inference: bool = False,
 ) -> torch.Tensor:
     """
     Arguments:
         q, k, v: (batch_size, seqlen, nheads, headdim) or (total_seqlen, nheads, headdim)
     """
-    if is_sm100():
+    if is_sm100() and not is_inference:
         return torch.ops.bw_hstu.bw_hstu_mha(
             max_seq_len,
             alpha,
