@@ -162,7 +162,7 @@ def _get_bmm_configs() -> List[triton.Config]:
 
 @triton_autotune(
     configs=_get_bmm_configs(),
-    key=["AUTOTUNE_MAX_SEQ_LEN", "N", "K"],
+    key=["AUTOTUNE_MAX_SEQ_LEN", "N", "K", "ELEMENTWISE", "HAS_BIAS"],
 )
 @triton.jit
 def jagged_dense_bmm_broadcast_add_kernel(
