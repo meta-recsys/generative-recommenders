@@ -89,6 +89,8 @@ def cuda_hstu_mha(
             sort_by_length,
             deterministic,
             sm_margin,
+            max_q_len,
+            seq_offsets_q,
             max_seq_len_tensor,
             contextual_seq_len_tensor,
             max_attn_len_tensor,
