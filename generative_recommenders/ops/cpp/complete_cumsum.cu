@@ -24,23 +24,25 @@ DLL_PUBLIC at::Tensor complete_cumsum_cuda(const at::Tensor& values) {
       "complete_cumsum_cuda",
       [&] {
         size_t temp_storage_bytes = 0;
-        AT_CUDA_CHECK(cub::DeviceScan::InclusiveSum(
-            nullptr,
-            temp_storage_bytes,
-            values_contig.data_ptr<scalar_t>(),
-            cumsum.data_ptr<scalar_t>() + 1,
-            values_contig.numel(),
-            at::cuda::getCurrentCUDAStream()));
+        AT_CUDA_CHECK(
+            cub::DeviceScan::InclusiveSum(
+                nullptr,
+                temp_storage_bytes,
+                values_contig.data_ptr<scalar_t>(),
+                cumsum.data_ptr<scalar_t>() + 1,
+                values_contig.numel(),
+                at::cuda::getCurrentCUDAStream()));
         auto temp_storage = at::empty(
             {static_cast<int64_t>(temp_storage_bytes)},
             values_contig.options().dtype(at::kByte));
-        AT_CUDA_CHECK(cub::DeviceScan::InclusiveSum(
-            temp_storage.data_ptr(),
-            temp_storage_bytes,
-            values_contig.data_ptr<scalar_t>(),
-            cumsum.data_ptr<scalar_t>() + 1,
-            values_contig.numel(),
-            at::cuda::getCurrentCUDAStream()));
+        AT_CUDA_CHECK(
+            cub::DeviceScan::InclusiveSum(
+                temp_storage.data_ptr(),
+                temp_storage_bytes,
+                values_contig.data_ptr<scalar_t>(),
+                cumsum.data_ptr<scalar_t>() + 1,
+                values_contig.numel(),
+                at::cuda::getCurrentCUDAStream()));
       });
 
   return cumsum;

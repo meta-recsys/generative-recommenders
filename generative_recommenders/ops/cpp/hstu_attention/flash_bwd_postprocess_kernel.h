@@ -273,8 +273,7 @@ class FlashAttnBwdPostprocessConvertdQ {
     TiledMma tiled_mma_dQ;
     Tensor taccdQrdQaccum = partition_fragment_C(
         tiled_mma_dQ,
-        select < !dQ_swapAB ? 0 : 1,
-        !dQ_swapAB ? 1 : 0 > (TileShape_MK{}));
+        select<!dQ_swapAB ? 0 : 1, !dQ_swapAB ? 1 : 0>(TileShape_MK{}));
     // if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 1) {
     // print(tiled_mma_dQ); printf("\n"); } if (blockIdx.x == 0 && blockIdx.y ==
     // 0 && threadIdx.x == 1) { print(tdQsdQaccum); } if (blockIdx.x == 0 &&
@@ -294,8 +293,8 @@ class FlashAttnBwdPostprocessConvertdQ {
     // if (cute::thread0()) { print(smem_tiled_copy_dQ); }
     // if (cute::thread0()) { print(smem_thr_copy_dQ); }
     // if (cute::thread0()) { print(sdQ); }
-    Tensor taccdQsdQ =
-        smem_thr_copy_dQ.partition_D(cute::conditional_return<!dQ_swapAB>(
+    Tensor taccdQsdQ = smem_thr_copy_dQ.partition_D(
+        cute::conditional_return<!dQ_swapAB>(
             sdQ, sdQt)); // ((Atom,AtomNum),PIPE_M,PIPE_N)
     cute::copy(smem_tiled_copy_dQ, taccdQrdQ, taccdQsdQ);
     __syncthreads();

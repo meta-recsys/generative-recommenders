@@ -170,7 +170,13 @@ struct CollectiveMainloopBwdSm90 {
                    TileShapeAtomdKV,
                    GMMA::Major::K,
                    GMMA::Major::MN>()),
-          decltype(cute::GMMA::ss_op_selector < Element, Element, ElementAccum, TileShapeAtomdKV, !dKV_swapAB ? PdSt_Major : GMMA::Major::MN, !dKV_swapAB ? GMMA::Major::MN : PdSt_Major > ())>{},
+          decltype(cute::GMMA::ss_op_selector<
+                   Element,
+                   Element,
+                   ElementAccum,
+                   TileShapeAtomdKV,
+                   !dKV_swapAB ? PdSt_Major : GMMA::Major::MN,
+                   !dKV_swapAB ? GMMA::Major::MN : PdSt_Major>())>{},
       AtomLayoutdKV{}));
 
   static constexpr bool dQacc_use_TMA = kHeadDim < 256;
@@ -218,7 +224,13 @@ struct CollectiveMainloopBwdSm90 {
                    TileShapeAtomdQ,
                    GMMA::Major::K,
                    GMMA::Major::MN>()),
-          decltype(cute::GMMA::ss_op_selector < Element, Element, ElementAccum, TileShapeAtomdQ, !dQ_swapAB ? PdS_Major : GMMA::Major::MN, !dQ_swapAB ? GMMA::Major::MN : PdS_Major > ())>{},
+          decltype(cute::GMMA::ss_op_selector<
+                   Element,
+                   Element,
+                   ElementAccum,
+                   TileShapeAtomdQ,
+                   !dQ_swapAB ? PdS_Major : GMMA::Major::MN,
+                   !dQ_swapAB ? GMMA::Major::MN : PdS_Major>())>{},
       AtomLayoutdQ{}));
 
   // We need to accommodate both Q and Q^T (and dO and dO^T) in shared memory.
@@ -1523,11 +1535,11 @@ struct CollectiveMainloopBwdSm90 {
     Tensor tdQrdS = mma_partition_fragment_AB</*A=*/!dQ_swapAB>(wg_mma_dQ, sdS);
     Tensor tdQrK = mma_partition_fragment_AB</*A=*/dQ_swapAB>(wg_mma_dQ, sKt);
 
-    Tensor tPsP =
-        smem_thr_copy_PdS.partition_D(cute::conditional_return<!SdP_swapAB>(
+    Tensor tPsP = smem_thr_copy_PdS.partition_D(
+        cute::conditional_return<!SdP_swapAB>(
             sP_pi, sPt_pi)); // ((Atom,AtomNum),PIPE_M,PIPE_N)
-    Tensor tdSsdS =
-        smem_thr_copy_PdS.partition_D(cute::conditional_return<!SdP_swapAB>(
+    Tensor tdSsdS = smem_thr_copy_PdS.partition_D(
+        cute::conditional_return<!SdP_swapAB>(
             sdS_pi, sdSt_pi)); // ((Atom,AtomNum),PIPE_M,PIPE_N)
     // if (blockIdx.x == 0 && threadIdx.x == 128) { print(smem_thr_copy_PdS);
     // print(sP_pi); printf("\n"); print(sPt_pi); printf("\n"); print(tPsP);
@@ -1591,10 +1603,10 @@ struct CollectiveMainloopBwdSm90 {
     }
     static constexpr int Qdim = !SdP_swapAB ? 0 : 1;
     auto thread0_mma_SdP = tiled_mma_SdP.get_thread_slice(_0{});
-    Tensor cS =
-        cute::make_identity_tensor(Shape<
-                                   Int<!SdP_swapAB ? kBlockM : kBlockN>,
-                                   Int<!SdP_swapAB ? kBlockN : kBlockM>>{});
+    Tensor cS = cute::make_identity_tensor(
+        Shape<
+            Int<!SdP_swapAB ? kBlockM : kBlockN>,
+            Int<!SdP_swapAB ? kBlockN : kBlockM>>{});
     Tensor tScS = thread_mma_SdP.partition_C(cS);
     Tensor tScS_rowcol = make_tensor(
         tScS.data(),
@@ -1610,15 +1622,13 @@ struct CollectiveMainloopBwdSm90 {
     auto bwd_step = [&](int m_block, auto mask_fn) {
       Tensor tSrS = partition_fragment_C(
           tiled_mma_SdP,
-          select < !SdP_swapAB ? 0 : 1,
-          !SdP_swapAB ? 1 : 0 > (TileShape_MNK{}));
+          select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
       consumer_wait(pipeline_q, smem_pipe_read);
       hstu::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/SdP_swapAB>(
           tiled_mma_SdP, tSrQ(_, _, _, smem_pipe_read.index()), tSrK, tSrS);
       Tensor tdPrdP = partition_fragment_C(
           tiled_mma_SdP,
-          select < !SdP_swapAB ? 0 : 1,
-          !SdP_swapAB ? 1 : 0 > (TileShape_MNK{}));
+          select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
       PipelineState_dO smem_pipe_read_do_cur =
           cute::conditional_return<Q_dO_same_stages>(
               smem_pipe_read, smem_pipe_read_do);
@@ -1775,8 +1785,7 @@ struct CollectiveMainloopBwdSm90 {
             NumMmaThreads, static_cast<uint32_t>(BwdNamedBarriers::PdS) /*id*/);
         Tensor tdQrdQ = partition_fragment_C(
             tiled_mma_dQ,
-            select < !dQ_swapAB ? 0 : 2,
-            !dQ_swapAB ? 2 : 0 > (TileShape_MNK{}));
+            select<!dQ_swapAB ? 0 : 2, !dQ_swapAB ? 2 : 0>(TileShape_MNK{}));
         Tensor tdQrdS_cur = tdQrdS(
             _,
             _,
@@ -1866,8 +1875,7 @@ struct CollectiveMainloopBwdSm90 {
             NumMmaThreads, static_cast<uint32_t>(BwdNamedBarriers::PdS) /*id*/);
         Tensor tdQrdQ = partition_fragment_C(
             tiled_mma_dQ,
-            select < !dQ_swapAB ? 0 : 2,
-            !dQ_swapAB ? 2 : 0 > (TileShape_MNK{}));
+            select<!dQ_swapAB ? 0 : 2, !dQ_swapAB ? 2 : 0>(TileShape_MNK{}));
         Tensor tdQrdS_cur = tdQrdS(
             _,
             _,
@@ -2420,11 +2428,11 @@ struct CollectiveMainloopBwdSm90 {
     Tensor tdQrdS = mma_partition_fragment_AB</*A=*/!dQ_swapAB>(wg_mma_dQ, sdS);
     Tensor tdQrK = mma_partition_fragment_AB</*A=*/dQ_swapAB>(wg_mma_dQ, sKt);
 
-    Tensor tPsP =
-        smem_thr_copy_PdS.partition_D(cute::conditional_return<!SdP_swapAB>(
+    Tensor tPsP = smem_thr_copy_PdS.partition_D(
+        cute::conditional_return<!SdP_swapAB>(
             sP_pi, sPt_pi)); // ((Atom,AtomNum),PIPE_M,PIPE_N)
-    Tensor tdSsdS =
-        smem_thr_copy_PdS.partition_D(cute::conditional_return<!SdP_swapAB>(
+    Tensor tdSsdS = smem_thr_copy_PdS.partition_D(
+        cute::conditional_return<!SdP_swapAB>(
             sdS_pi, sdSt_pi)); // ((Atom,AtomNum),PIPE_M,PIPE_N)
     // if (blockIdx.x == 0 && threadIdx.x == 128) { print(smem_thr_copy_PdS);
     // print(sP_pi); printf("\n"); print(sPt_pi); printf("\n"); print(tPsP);
@@ -2507,10 +2515,10 @@ struct CollectiveMainloopBwdSm90 {
     }
     static constexpr int Qdim = !SdP_swapAB ? 0 : 1;
     auto thread0_mma_SdP = tiled_mma_SdP.get_thread_slice(_0{});
-    Tensor cS =
-        cute::make_identity_tensor(Shape<
-                                   Int<!SdP_swapAB ? kBlockM : kBlockN>,
-                                   Int<!SdP_swapAB ? kBlockN : kBlockM>>{});
+    Tensor cS = cute::make_identity_tensor(
+        Shape<
+            Int<!SdP_swapAB ? kBlockM : kBlockN>,
+            Int<!SdP_swapAB ? kBlockN : kBlockM>>{});
     Tensor tScS = thread_mma_SdP.partition_C(cS);
     Tensor tScS_rowcol = make_tensor(
         tScS.data(),
@@ -2526,8 +2534,7 @@ struct CollectiveMainloopBwdSm90 {
     auto bwd_step = [&](int m_block, auto mask_fn) {
       Tensor tSrS = partition_fragment_C(
           tiled_mma_SdP,
-          select < !SdP_swapAB ? 0 : 1,
-          !SdP_swapAB ? 1 : 0 > (TileShape_MNK{}));
+          select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
       consumer_wait(pipeline_q, smem_pipe_read);
       hstu::gemm</*zero_init=*/true, /*wg_wait=*/-1, /*SwapAB=*/SdP_swapAB>(
           tiled_mma_SdP, tSrQ(_, _, _, smem_pipe_read.index()), tSrK, tSrS);
@@ -2547,8 +2554,7 @@ struct CollectiveMainloopBwdSm90 {
       }
       Tensor tdPrdP = partition_fragment_C(
           tiled_mma_SdP,
-          select < !SdP_swapAB ? 0 : 1,
-          !SdP_swapAB ? 1 : 0 > (TileShape_MNK{}));
+          select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
       PipelineState_dO smem_pipe_read_do_cur =
           cute::conditional_return<Q_dO_same_stages>(
               smem_pipe_read, smem_pipe_read_do);
@@ -2698,8 +2704,7 @@ struct CollectiveMainloopBwdSm90 {
             NumMmaThreads, static_cast<uint32_t>(BwdNamedBarriers::PdS) /*id*/);
         Tensor tdQrdQ = partition_fragment_C(
             tiled_mma_dQ,
-            select < !dQ_swapAB ? 0 : 2,
-            !dQ_swapAB ? 2 : 0 > (TileShape_MNK{}));
+            select<!dQ_swapAB ? 0 : 2, !dQ_swapAB ? 2 : 0>(TileShape_MNK{}));
         Tensor tdQrdS_cur = tdQrdS(
             _,
             _,
@@ -2789,8 +2794,7 @@ struct CollectiveMainloopBwdSm90 {
             NumMmaThreads, static_cast<uint32_t>(BwdNamedBarriers::PdS) /*id*/);
         Tensor tdQrdQ = partition_fragment_C(
             tiled_mma_dQ,
-            select < !dQ_swapAB ? 0 : 2,
-            !dQ_swapAB ? 2 : 0 > (TileShape_MNK{}));
+            select<!dQ_swapAB ? 0 : 2, !dQ_swapAB ? 2 : 0>(TileShape_MNK{}));
         Tensor tdQrdS_cur = tdQrdS(
             _,
             _,

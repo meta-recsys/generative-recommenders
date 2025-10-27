@@ -182,7 +182,7 @@ class StaticPersistentTileScheduler {
   };
 
   CUTLASS_DEVICE
-  StaticPersistentTileScheduler(SharedStorage* const smem_scheduler){};
+  StaticPersistentTileScheduler(SharedStorage* const smem_scheduler) {};
 
   template <bool IsProducerWarp = false>
   CUTLASS_DEVICE WorkTileInfo get_initial_work(Params const& params) const {
@@ -306,7 +306,7 @@ class DynamicPersistentTileScheduler {
 
   CUTLASS_DEVICE
   DynamicPersistentTileScheduler(SharedStorage* const smem_scheduler)
-      : tile_count_smem(smem_scheduler){};
+      : tile_count_smem(smem_scheduler) {};
 
   template <bool IsProducerWarp = false>
   CUTLASS_DEVICE WorkTileInfo get_initial_work(Params const& params) const {
@@ -430,7 +430,7 @@ class VarlenDynamicPersistentTileScheduler {
 
   CUTLASS_DEVICE
   VarlenDynamicPersistentTileScheduler(SharedStorage* const smem_scheduler)
-      : work_info_smem(smem_scheduler){};
+      : work_info_smem(smem_scheduler) {};
 
   CUTLASS_DEVICE
   WorkTileInfo tile_idx_to_work_tile(

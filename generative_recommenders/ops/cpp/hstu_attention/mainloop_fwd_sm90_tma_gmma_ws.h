@@ -464,8 +464,8 @@ struct CollectiveMainloopFwdSm90 {
   // These are tuned for speed. They don't affect correctness.
   static constexpr bool UseSchedulerBarrier =
       (NumMmaWarpGroups >= 2) && (!Is_FP8 ? kHeadDim <= 128 : kHeadDim >= 128);
-  static constexpr bool RescaleOBeforeGemm = kHeadDim > 128 &&
-      (!Is_FP8 || V_colmajor);
+  static constexpr bool RescaleOBeforeGemm =
+      kHeadDim > 128 && (!Is_FP8 || V_colmajor);
 
   // Host side kernel arguments
   struct Arguments {

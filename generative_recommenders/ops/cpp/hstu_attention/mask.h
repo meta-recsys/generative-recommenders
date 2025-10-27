@@ -53,7 +53,7 @@ struct Mask {
         max_attn_len(max_attn_len),
         min_full_attn_seq_len(min_full_attn_seq_len),
         contextual_seq_len(contextual_seq_len),
-        max_uih_len(max_uih_len){};
+        max_uih_len(max_uih_len) {};
 
   template <
       bool Seqlenq_mask = false,
@@ -88,9 +88,10 @@ struct Mask {
 
     static constexpr int Qdim = !SwapAB ? 0 : 1, Kdim = !SwapAB ? 1 : 0;
 
-    Tensor cS = cute::make_identity_tensor(Shape<
-                                           Int<!SwapAB ? BlockM : BlockN>,
-                                           Int<!SwapAB ? BlockN : BlockM>>{});
+    Tensor cS = cute::make_identity_tensor(
+        Shape<
+            Int<!SwapAB ? BlockM : BlockN>,
+            Int<!SwapAB ? BlockN : BlockM>>{});
     Tensor tScS = thread_mma.partition_C(cS);
     Tensor tSrS_rowcol = make_tensor(
         tSrS.data(),

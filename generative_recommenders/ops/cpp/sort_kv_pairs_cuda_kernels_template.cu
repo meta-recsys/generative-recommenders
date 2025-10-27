@@ -19,61 +19,65 @@ sort_kv_pairs_cuda_dispatched<SUB_KEY_T, SUB_VALUE_T>(
   auto sorted_values = at::empty_like(values_contig);
 
   if (descending) {
-    AT_CUDA_CHECK(cub::DeviceRadixSort::SortPairsDescending(
-        nullptr,
-        temp_storage_bytes,
-        keys_contig.data_ptr<SUB_KEY_T>(),
-        sorted_keys.data_ptr<SUB_KEY_T>(),
-        values_contig.data_ptr<SUB_VALUE_T>(),
-        sorted_values.data_ptr<SUB_VALUE_T>(),
-        keys_contig.numel(),
-        0,
-        end_bit.has_value() ? end_bit.value() : sizeof(SUB_KEY_T) * 8,
-        at::cuda::getCurrentCUDAStream(),
-        false));
+    AT_CUDA_CHECK(
+        cub::DeviceRadixSort::SortPairsDescending(
+            nullptr,
+            temp_storage_bytes,
+            keys_contig.data_ptr<SUB_KEY_T>(),
+            sorted_keys.data_ptr<SUB_KEY_T>(),
+            values_contig.data_ptr<SUB_VALUE_T>(),
+            sorted_values.data_ptr<SUB_VALUE_T>(),
+            keys_contig.numel(),
+            0,
+            end_bit.has_value() ? end_bit.value() : sizeof(SUB_KEY_T) * 8,
+            at::cuda::getCurrentCUDAStream(),
+            false));
     auto temp_storage = at::empty(
         {static_cast<int64_t>(temp_storage_bytes)},
         keys_contig.options().dtype(at::kByte));
-    AT_CUDA_CHECK(cub::DeviceRadixSort::SortPairsDescending(
-        temp_storage.data_ptr(),
-        temp_storage_bytes,
-        keys_contig.data_ptr<SUB_KEY_T>(),
-        sorted_keys.data_ptr<SUB_KEY_T>(),
-        values_contig.data_ptr<SUB_VALUE_T>(),
-        sorted_values.data_ptr<SUB_VALUE_T>(),
-        keys_contig.numel(),
-        0,
-        end_bit.has_value() ? end_bit.value() : sizeof(SUB_KEY_T) * 8,
-        at::cuda::getCurrentCUDAStream(),
-        false));
+    AT_CUDA_CHECK(
+        cub::DeviceRadixSort::SortPairsDescending(
+            temp_storage.data_ptr(),
+            temp_storage_bytes,
+            keys_contig.data_ptr<SUB_KEY_T>(),
+            sorted_keys.data_ptr<SUB_KEY_T>(),
+            values_contig.data_ptr<SUB_VALUE_T>(),
+            sorted_values.data_ptr<SUB_VALUE_T>(),
+            keys_contig.numel(),
+            0,
+            end_bit.has_value() ? end_bit.value() : sizeof(SUB_KEY_T) * 8,
+            at::cuda::getCurrentCUDAStream(),
+            false));
   } else {
-    AT_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        nullptr,
-        temp_storage_bytes,
-        keys_contig.data_ptr<SUB_KEY_T>(),
-        sorted_keys.data_ptr<SUB_KEY_T>(),
-        values_contig.data_ptr<SUB_VALUE_T>(),
-        sorted_values.data_ptr<SUB_VALUE_T>(),
-        keys_contig.numel(),
-        0,
-        end_bit.has_value() ? end_bit.value() : sizeof(SUB_KEY_T) * 8,
-        at::cuda::getCurrentCUDAStream(),
-        false));
+    AT_CUDA_CHECK(
+        cub::DeviceRadixSort::SortPairs(
+            nullptr,
+            temp_storage_bytes,
+            keys_contig.data_ptr<SUB_KEY_T>(),
+            sorted_keys.data_ptr<SUB_KEY_T>(),
+            values_contig.data_ptr<SUB_VALUE_T>(),
+            sorted_values.data_ptr<SUB_VALUE_T>(),
+            keys_contig.numel(),
+            0,
+            end_bit.has_value() ? end_bit.value() : sizeof(SUB_KEY_T) * 8,
+            at::cuda::getCurrentCUDAStream(),
+            false));
     auto temp_storage = at::empty(
         {static_cast<int64_t>(temp_storage_bytes)},
         keys_contig.options().dtype(at::kByte));
-    AT_CUDA_CHECK(cub::DeviceRadixSort::SortPairs(
-        temp_storage.data_ptr(),
-        temp_storage_bytes,
-        keys_contig.data_ptr<SUB_KEY_T>(),
-        sorted_keys.data_ptr<SUB_KEY_T>(),
-        values_contig.data_ptr<SUB_VALUE_T>(),
-        sorted_values.data_ptr<SUB_VALUE_T>(),
-        keys_contig.numel(),
-        0,
-        end_bit.has_value() ? end_bit.value() : sizeof(SUB_KEY_T) * 8,
-        at::cuda::getCurrentCUDAStream(),
-        false));
+    AT_CUDA_CHECK(
+        cub::DeviceRadixSort::SortPairs(
+            temp_storage.data_ptr(),
+            temp_storage_bytes,
+            keys_contig.data_ptr<SUB_KEY_T>(),
+            sorted_keys.data_ptr<SUB_KEY_T>(),
+            values_contig.data_ptr<SUB_VALUE_T>(),
+            sorted_values.data_ptr<SUB_VALUE_T>(),
+            keys_contig.numel(),
+            0,
+            end_bit.has_value() ? end_bit.value() : sizeof(SUB_KEY_T) * 8,
+            at::cuda::getCurrentCUDAStream(),
+            false));
   }
 
   return {std::move(sorted_keys), std::move(sorted_values)};
