@@ -13,6 +13,7 @@ from generative_recommenders.common import HammerKernel
 from generative_recommenders.ops.triton.triton_addmm import (
     triton_addmm_fwd,
     triton_addmm_fwd_tma_persistent,
+    triton_addmm_fwd_tma_ws_tlx,
 )
 
 
@@ -60,18 +61,21 @@ def main(
         "triton",
         "triton_tma_persistent",
         "triton_tma_persistent_ws",
+        "triton_tma_ws_tlx",
     ]
     line_names = [
         "PyTorch",
         "Triton",
         "Triton TMA Persistent",
         "Triton TMA Persistent WS",
+        "Triton TMA WS TLX",
     ]
     styles = [
         ("red", "-"),
         ("green", "-"),
         ("orange", "-"),
         ("purple", "-"),
+        ("magenta", "-"),
     ]
     configs: List[triton.testing.Benchmark] = [
         triton.testing.Benchmark(
@@ -132,6 +136,8 @@ def main(
             fn = lambda: triton_addmm_fwd_tma_persistent(
                 x, weight_t_contiguous, y, warp_specialize=True
             )  # noqa E731
+        elif provider == "triton_tma_ws_tlx":
+            fn = lambda: triton_addmm_fwd_tma_ws_tlx(x, weight_t_contiguous, y)  # noqa E731
         elif provider == "triton":
             fn = lambda: triton_addmm_fwd(x, weight_t_contiguous, y)  # noqa E731
         else:
