@@ -775,7 +775,7 @@ class _AddMmFunction(torch.autograd.Function):
         ctx.save_for_backward(x, w)
         ctx.is_y_1d = y.dim() == 1
         if is_sm100() and TMA_AVAILABLE and _check_tma_alignment(x, w, y):
-            if x.dtype == torch.float32:
+            if x.dtype == torch.float32 or HAS_TLX == False:
                 # use TMA persistent kernel on sm100
                 return triton_addmm_fwd_tma_persistent(x, w, y, warp_specialize=True)
             else:
