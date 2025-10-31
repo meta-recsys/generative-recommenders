@@ -16,6 +16,15 @@ from generative_recommenders.ops.triton.triton_addmm import (
     triton_addmm_fwd_tma_ws_tlx,
 )
 
+try:
+    # @manual=//triton:triton
+    import triton.language.extra.tlx as tlx  # type: ignore
+
+    HAS_TLX = True
+except ImportError:
+    tlx = None
+    HAS_TLX = False
+
 
 def get_kernel(provider: str) -> HammerKernel:
     if provider == "triton":
@@ -61,22 +70,23 @@ def main(
         "triton",
         "triton_tma_persistent",
         "triton_tma_persistent_ws",
-        "triton_tma_ws_tlx",
     ]
     line_names = [
         "PyTorch",
         "Triton",
         "Triton TMA Persistent",
         "Triton TMA Persistent WS",
-        "Triton TMA WS TLX",
     ]
     styles = [
         ("red", "-"),
         ("green", "-"),
         ("orange", "-"),
         ("purple", "-"),
-        ("magenta", "-"),
     ]
+    if HAS_TLX == True:
+        line_vals.append("triton_tma_ws_tlx")
+        line_names.append("Triton TMA WS TLX")
+        styles.append(("magenta", "-"))
     configs: List[triton.testing.Benchmark] = [
         triton.testing.Benchmark(
             x_names=["batch_size"],
