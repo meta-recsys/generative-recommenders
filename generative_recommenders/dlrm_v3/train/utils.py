@@ -392,34 +392,35 @@ def eval_loop(
     batch_idx: int = 0
     profiler = Profiler(rank, active=10) if output_trace else None
     metric_logger.reset(mode="eval")
-    for sample in dataloader:
-        sample.to(device)
-        (
-            _,
-            _,
-            _,
-            mt_target_preds,
-            mt_target_labels,
-            mt_target_weights,
-        ) = model.forward(
-            sample.uih_features_kjt,
-            sample.candidates_features_kjt,
-        )
-        metric_logger.update(
-            mode="eval",
-            predictions=mt_target_preds,
-            labels=mt_target_labels,
-            weights=mt_target_weights,
-        )
-        batch_idx += 1
-        if output_trace:
-            assert profiler is not None
-            profiler.step()
-        if num_batches is not None and batch_idx >= num_batches:
-            break
-    metric_logger.compute_and_log(mode="eval")
-    for k, v in metric_logger.compute(mode="eval").items():
-        print(f"{k}: {v}")
+    with torch.no_grad():
+        for sample in dataloader:
+            sample.to(device)
+            (
+                _,
+                _,
+                _,
+                mt_target_preds,
+                mt_target_labels,
+                mt_target_weights,
+            ) = model.forward(
+                sample.uih_features_kjt,
+                sample.candidates_features_kjt,
+            )
+            metric_logger.update(
+                mode="eval",
+                predictions=mt_target_preds,
+                labels=mt_target_labels,
+                weights=mt_target_weights,
+            )
+            batch_idx += 1
+            if output_trace:
+                assert profiler is not None
+                profiler.step()
+            if num_batches is not None and batch_idx >= num_batches:
+                break
+        metric_logger.compute_and_log(mode="eval")
+        for k, v in metric_logger.compute(mode="eval").items():
+            print(f"{k}: {v}")
 
 
 @gin.configurable
@@ -482,31 +483,32 @@ def train_eval_loop(
             model.eval()
             metric_logger.reset(mode="eval")
             eval_batch_idx: int = 0
-            for sample in eval_dataloader:
-                sample.to(device)
-                (
-                    _,
-                    _,
-                    _,
-                    mt_target_preds,
-                    mt_target_labels,
-                    mt_target_weights,
-                ) = model.forward(
-                    sample.uih_features_kjt,
-                    sample.candidates_features_kjt,
-                )
-                metric_logger.update(
-                    mode="eval",
-                    predictions=mt_target_preds,
-                    labels=mt_target_labels,
-                    weights=mt_target_weights,
-                )
-                eval_batch_idx += 1
-                if output_trace:
-                    assert profiler is not None
-                    profiler.step()
-            metric_logger.compute_and_log(mode="eval")
-            for k, v in metric_logger.compute(mode="eval").items():
-                print(f"{k}: {v}")
+            with torch.no_grad():
+                for sample in eval_dataloader:
+                    sample.to(device)
+                    (
+                        _,
+                        _,
+                        _,
+                        mt_target_preds,
+                        mt_target_labels,
+                        mt_target_weights,
+                    ) = model.forward(
+                        sample.uih_features_kjt,
+                        sample.candidates_features_kjt,
+                    )
+                    metric_logger.update(
+                        mode="eval",
+                        predictions=mt_target_preds,
+                        labels=mt_target_labels,
+                        weights=mt_target_weights,
+                    )
+                    eval_batch_idx += 1
+                    if output_trace:
+                        assert profiler is not None
+                        profiler.step()
+                metric_logger.compute_and_log(mode="eval")
+                for k, v in metric_logger.compute(mode="eval").items():
+                    print(f"{k}: {v}")
 
     save_dmp_checkpoint(model, optimizer, rank)
