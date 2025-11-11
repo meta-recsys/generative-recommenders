@@ -50,12 +50,14 @@ class HSTUModelFamily:
         hstu_config: DlrmHSTUConfig,
         table_config: Dict[str, EmbeddingConfig],
         output_trace: bool = False,
+        sparse_quant: bool = False,
     ) -> None:
         self.hstu_config = hstu_config
         self.table_config = table_config
         self.sparse: ModelFamilySparseDist = ModelFamilySparseDist(
             hstu_config=hstu_config,
             table_config=table_config,
+            quant=sparse_quant,
         )
 
         assert torch.cuda.is_available(), "CUDA is required for this benchmark."
@@ -88,24 +90,25 @@ class HSTUModelFamily:
     def predict(
         self, samples: Optional[Samples]
     ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]]:
-        if samples is None:
-            return self.dense.predict(None, None, 0, None, 0, None)
-        (
-            seq_embeddings,
-            payload_features,
-            max_uih_len,
-            uih_seq_lengths,
-            max_num_candidates,
-            num_candidates,
-        ) = self.sparse.predict(samples)
-        return self.dense.predict(
-            seq_embeddings,
-            payload_features,
-            max_uih_len,
-            uih_seq_lengths,
-            max_num_candidates,
-            num_candidates,
-        )
+        with torch.no_grad():
+            if samples is None:
+                return self.dense.predict(None, None, 0, None, 0, None)
+            (
+                seq_embeddings,
+                payload_features,
+                max_uih_len,
+                uih_seq_lengths,
+                max_num_candidates,
+                num_candidates,
+            ) = self.sparse.predict(samples)
+            return self.dense.predict(
+                seq_embeddings,
+                payload_features,
+                max_uih_len,
+                uih_seq_lengths,
+                max_num_candidates,
+                num_candidates,
+            )
 
 
 class ModelFamilySparseDist:
@@ -113,11 +116,13 @@ class ModelFamilySparseDist:
         self,
         hstu_config: DlrmHSTUConfig,
         table_config: Dict[str, EmbeddingConfig],
+        quant: bool = False,
     ) -> None:
         super(ModelFamilySparseDist, self).__init__()
         self.hstu_config = hstu_config
         self.table_config = table_config
         self.module: Optional[torch.nn.Module] = None
+        self.quant: bool = quant
 
     def load(self, model_path: str) -> None:
         print(f"Loading sparse module from {model_path}")
@@ -128,19 +133,24 @@ class ModelFamilySparseDist:
         )
         load_sparse_checkpoint(model=sparse_arch._hstu_model, path=model_path)
         sparse_arch.eval()
-        self.module = quant.quantize_dynamic(
-            sparse_arch,
-            qconfig_spec={
-                torchrec.EmbeddingCollection: QuantConfig(
-                    activation=quant.PlaceholderObserver.with_args(dtype=torch.float),
-                    weight=quant.PlaceholderObserver.with_args(dtype=torch.int8),
-                ),
-            },
-            mapping={
-                torchrec.EmbeddingCollection: QuantEmbeddingCollection,
-            },
-            inplace=False,
-        )
+        if self.quant:
+            self.module = quant.quantize_dynamic(
+                sparse_arch,
+                qconfig_spec={
+                    torchrec.EmbeddingCollection: QuantConfig(
+                        activation=quant.PlaceholderObserver.with_args(
+                            dtype=torch.float
+                        ),
+                        weight=quant.PlaceholderObserver.with_args(dtype=torch.int8),
+                    ),
+                },
+                mapping={
+                    torchrec.EmbeddingCollection: QuantEmbeddingCollection,
+                },
+                inplace=False,
+            )
+        else:
+            self.module = sparse_arch
         print(f"sparse module is {self.module}")
 
     def predict(
@@ -230,69 +240,71 @@ class ModelFamilyDenseDist:
             max_hash_size=100,
             is_dense=True,
         ).to(torch.bfloat16)
-        load_nonsparse_checkpoint(model=model, optimizer=None, path=model_path)
-
         device = torch.device(f"cuda:{rank}")
         torch.cuda.set_device(f"cuda:{rank}")
+        load_nonsparse_checkpoint(
+            model=model, device=device, optimizer=None, path=model_path
+        )
         self.main_lock.set()
         model = model.to(device)
         model.eval()
         profiler = Profiler(rank) if self.output_trace else None
 
-        while True:
-            if self.samples_q[rank].empty():
-                time.sleep(0.001)
-                continue
-            item = self.samples_q[rank].get()
-            # If -1 is received terminate all subprocesses
-            if item == -1:
-                break
-            (
-                id,
-                seq_embeddings,
-                payload_features,
-                max_uih_len,
-                uih_seq_lengths,
-                max_num_candidates,
-                num_candidates,
-            ) = item
-            assert seq_embeddings is not None
-            if self.output_trace:
-                assert profiler is not None
-                profiler.step()
-            with torch.profiler.record_function("dense forward"):
+        with torch.no_grad():
+            while True:
+                if self.samples_q[rank].empty():
+                    time.sleep(0.001)
+                    continue
+                item = self.samples_q[rank].get()
+                # If -1 is received terminate all subprocesses
+                if item == -1:
+                    break
                 (
-                    _,
-                    _,
-                    _,
-                    mt_target_preds,
-                    mt_target_labels,
-                    mt_target_weights,
-                ) = model.main_forward(
-                    seq_embeddings=seq_embeddings,
-                    payload_features=payload_features,
-                    max_uih_len=max_uih_len,
-                    uih_seq_lengths=uih_seq_lengths,
-                    max_num_candidates=max_num_candidates,
-                    num_candidates=num_candidates,
-                )
-                assert mt_target_preds is not None
-                mt_target_preds = mt_target_preds.detach().to(
-                    device="cpu", non_blocking=True
-                )
-                if mt_target_labels is not None:
-                    mt_target_labels = mt_target_labels.detach().to(
+                    id,
+                    seq_embeddings,
+                    payload_features,
+                    max_uih_len,
+                    uih_seq_lengths,
+                    max_num_candidates,
+                    num_candidates,
+                ) = item
+                assert seq_embeddings is not None
+                if self.output_trace:
+                    assert profiler is not None
+                    profiler.step()
+                with torch.profiler.record_function("dense forward"):
+                    (
+                        _,
+                        _,
+                        _,
+                        mt_target_preds,
+                        mt_target_labels,
+                        mt_target_weights,
+                    ) = model.main_forward(
+                        seq_embeddings=seq_embeddings,
+                        payload_features=payload_features,
+                        max_uih_len=max_uih_len,
+                        uih_seq_lengths=uih_seq_lengths,
+                        max_num_candidates=max_num_candidates,
+                        num_candidates=num_candidates,
+                    )
+                    assert mt_target_preds is not None
+                    mt_target_preds = mt_target_preds.detach().to(
                         device="cpu", non_blocking=True
                     )
-                if mt_target_weights is not None:
-                    mt_target_weights = mt_target_weights.detach().to(
-                        device="cpu", non_blocking=True
+                    if mt_target_labels is not None:
+                        mt_target_labels = mt_target_labels.detach().to(
+                            device="cpu", non_blocking=True
+                        )
+                    if mt_target_weights is not None:
+                        mt_target_weights = mt_target_weights.detach().to(
+                            device="cpu", non_blocking=True
+                        )
+                    self.predictions_cache[rank][id] = (
+                        mt_target_preds,
+                        mt_target_labels,
+                        mt_target_weights,
                     )
-                self.predictions_cache[rank][id] = (
-                    mt_target_preds,
-                    mt_target_labels,
-                    mt_target_weights,
-                )
 
     def capture_output(
         self, id: uuid.UUID, rank: int
@@ -387,7 +399,9 @@ class ModelFamilyDenseSingleWorker:
             .to(self.device)
             .to(torch.bfloat16)
         )
-        load_nonsparse_checkpoint(model=self.model, optimizer=None, path=model_path)
+        load_nonsparse_checkpoint(
+            model=self.model, device=self.device, optimizer=None, path=model_path
+        )
         assert self.model is not None
         self.model.eval()
 

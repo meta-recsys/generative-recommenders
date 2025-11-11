@@ -32,6 +32,7 @@ from generative_recommenders.dlrm_v3.train.utils import (
     make_optimizer_and_shard,
     make_train_test_dataloaders,
     setup,
+    streaming_train_eval_loop,
     train_eval_loop,
     train_loop,
 )
@@ -48,6 +49,10 @@ SUPPORTED_CONFIGS = {
     "movielens-1m": "movielens_1m.gin",
     "movielens-20m": "movielens_20m.gin",
     "movielens-13b": "movielens_13b.gin",
+    "movielens-18b": "movielens_18b.gin",
+    "streaming-400m": "streaming_400m.gin",
+    "streaming-200b": "streaming_200b.gin",
+    "streaming-100b": "streaming_100b.gin",
 }
 
 
@@ -71,7 +76,6 @@ def _main_func(
 
     model, model_configs, embedding_table_configs = make_model()
     model, optimizer = make_optimizer_and_shard(model=model, device=device)
-    load_dmp_checkpoint(model, optimizer)
     train_dataloader, test_dataloader = make_train_test_dataloaders(
         hstu_config=model_configs,
         embedding_table_configs=embedding_table_configs,
@@ -79,9 +83,12 @@ def _main_func(
     metrics = MetricsLogger(
         multitask_configs=model_configs.multitask_configs,
         batch_size=train_dataloader.batch_size,
-        window_size=1000 if mode == "train" else sys.maxsize,
+        window_size=2500,
         device=device,
         rank=rank,
+    )
+    load_dmp_checkpoint(
+        model=model, optimizer=optimizer, metric_logger=metrics, device=device
     )
 
     # train loop
@@ -96,6 +103,14 @@ def _main_func(
                 device=device,
             )
         elif mode == "eval":
+            # reinit metrics logger for eval
+            metrics = MetricsLogger(
+                multitask_configs=model_configs.multitask_configs,
+                batch_size=train_dataloader.batch_size,
+                window_size=1000,
+                device=device,
+                rank=rank,
+            )
             eval_loop(
                 rank=rank,
                 model=model,
@@ -113,6 +128,16 @@ def _main_func(
                 metric_logger=metrics,
                 device=device,
             )
+        elif mode == "streaming-train-eval":
+            streaming_train_eval_loop(
+                rank=rank,
+                model=model,
+                optimizer=optimizer,
+                metric_logger=metrics,
+                device=device,
+                hstu_config=model_configs,
+                embedding_table_configs=embedding_table_configs,
+            )
     except Exception as e:
         logger.info(traceback.format_exc())
         cleanup()
@@ -126,7 +151,10 @@ def get_args():  # pyre-ignore [3]
         "--dataset", default="debug", choices=SUPPORTED_CONFIGS.keys(), help="dataset"
     )
     parser.add_argument(
-        "--mode", default="train", choices=["train", "eval", "train-eval"], help="mode"
+        "--mode",
+        default="train",
+        choices=["train", "eval", "train-eval", "streaming-train-eval"],
+        help="mode",
     )
     args, unknown_args = parser.parse_known_args()
     logger.warning(f"unknown_args: {unknown_args}")
@@ -141,6 +169,7 @@ def main() -> None:
         "train",
         "eval",
         "train-eval",
+        "streaming-train-eval",
     ], f"Unsupported mode: {args.mode}"
     WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
     MASTER_PORT = str(get_free_port())

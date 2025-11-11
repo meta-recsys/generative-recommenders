@@ -22,7 +22,7 @@ from generative_recommenders.modules.multitask_module import (
 )
 from torchrec.modules.embedding_configs import DataType, EmbeddingConfig
 
-HSTU_EMBEDDING_DIM = 256
+HSTU_EMBEDDING_DIM = 256  # TODO: change to 512 for the final DLRMv3 model
 HASH_SIZE = 10_000_000
 
 
@@ -41,7 +41,12 @@ def get_hstu_configs(dataset: str = "debug") -> DlrmHSTUConfig:
         causal_multitask_weights=0.2,
     )
     if "movielens" in dataset:
-        assert dataset in ["movielens-1m", "movielens-20m", "movielens-13b"]
+        assert dataset in [
+            "movielens-1m",
+            "movielens-20m",
+            "movielens-13b",
+            "movielens-18b",
+        ]
         hstu_config.user_embedding_feature_names = (
             [
                 "movie_id",
@@ -63,8 +68,10 @@ def get_hstu_configs(dataset: str = "debug") -> DlrmHSTUConfig:
         hstu_config.uih_post_id_feature_name = "movie_id"
         hstu_config.uih_action_time_feature_name = "action_timestamp"
         hstu_config.candidates_querytime_feature_name = "item_query_time"
-        hstu_config.candidates_weight_feature_name = "item_dummy_weights"
-        hstu_config.candidates_watchtime_feature_name = "item_dummy_watchtime"
+        hstu_config.candidates_weight_feature_name = "item_action_weights"
+        hstu_config.uih_weight_feature_name = "item_weights"
+        hstu_config.candidates_watchtime_feature_name = "item_movie_rating"
+        hstu_config.action_weights = [1, 2, 4, 8, 16]
         hstu_config.contextual_feature_to_max_length = (
             {
                 "user_id": 1,
@@ -93,8 +100,9 @@ def get_hstu_configs(dataset: str = "debug") -> DlrmHSTUConfig:
         )
         hstu_config.merge_uih_candidate_feature_mapping = [
             ("movie_id", "item_movie_id"),
+            ("movie_rating", "item_movie_rating"),
             ("action_timestamp", "item_query_time"),
-            ("dummy_weights", "item_dummy_weights"),
+            ("item_weights", "item_action_weights"),
             ("dummy_watch_time", "item_dummy_watchtime"),
         ]
         hstu_config.hstu_uih_feature_names = (
@@ -107,7 +115,7 @@ def get_hstu_configs(dataset: str = "debug") -> DlrmHSTUConfig:
                 "movie_id",
                 "movie_rating",
                 "action_timestamp",
-                "dummy_weights",
+                "item_weights",
                 "dummy_watch_time",
             ]
             if dataset == "movielens-1m"
@@ -116,25 +124,80 @@ def get_hstu_configs(dataset: str = "debug") -> DlrmHSTUConfig:
                 "movie_id",
                 "movie_rating",
                 "action_timestamp",
-                "dummy_weights",
+                "item_weights",
                 "dummy_watch_time",
             ]
         )
         hstu_config.hstu_candidate_feature_names = [
             "item_movie_id",
+            "item_movie_rating",
             "item_query_time",
-            "item_dummy_weights",
+            "item_action_weights",
             "item_dummy_watchtime",
         ]
-        hstu_config.max_num_candidates = 10 if dataset != "movielens-13b" else 128
+        hstu_config.max_num_candidates = 10
         hstu_config.max_num_candidates_inference = (
-            5 if dataset != "movielens-13b" else 2048
+            5 if dataset not in ["movielens-13b", "movielens-18b"] else 2048
         )
         hstu_config.multitask_configs = [
             TaskConfig(
                 task_name="rating",
                 task_weight=1,
-                task_type=MultitaskTaskType.REGRESSION,
+                task_type=MultitaskTaskType.BINARY_CLASSIFICATION,
+            )
+        ]
+    elif "streaming" in dataset:
+        hstu_config.user_embedding_feature_names = [
+            "item_id",
+            "user_id",
+            "item_category_id",
+        ]
+        hstu_config.item_embedding_feature_names = [
+            "item_candidate_id",
+            "item_candidate_category_id",
+        ]
+        hstu_config.uih_post_id_feature_name = "item_id"
+        hstu_config.uih_action_time_feature_name = "action_timestamp"
+        hstu_config.candidates_querytime_feature_name = "item_query_time"
+        hstu_config.candidates_weight_feature_name = "item_action_weights"
+        hstu_config.uih_weight_feature_name = "item_weights"
+        hstu_config.candidates_watchtime_feature_name = "item_rating"
+        hstu_config.action_weights = [1, 2, 4, 8, 16]
+        hstu_config.action_embedding_init_std = 5.0
+        hstu_config.contextual_feature_to_max_length = {"user_id": 1}
+        hstu_config.contextual_feature_to_min_uih_length = {"user_id": 20}
+        hstu_config.merge_uih_candidate_feature_mapping = [
+            ("item_id", "item_candidate_id"),
+            ("item_rating", "item_candidate_rating"),
+            ("action_timestamp", "item_query_time"),
+            ("item_weights", "item_action_weights"),
+            ("dummy_watch_time", "item_dummy_watchtime"),
+            ("item_category_id", "item_candidate_category_id"),
+        ]
+        hstu_config.hstu_uih_feature_names = [
+            "user_id",
+            "item_id",
+            "item_rating",
+            "action_timestamp",
+            "item_weights",
+            "dummy_watch_time",
+            "item_category_id",
+        ]
+        hstu_config.hstu_candidate_feature_names = [
+            "item_candidate_id",
+            "item_candidate_rating",
+            "item_query_time",
+            "item_action_weights",
+            "item_dummy_watchtime",
+            "item_candidate_category_id",
+        ]
+        hstu_config.max_num_candidates = 32
+        hstu_config.max_num_candidates_inference = 2048
+        hstu_config.multitask_configs = [
+            TaskConfig(
+                task_name="rating",
+                task_weight=1,
+                task_type=MultitaskTaskType.BINARY_CLASSIFICATION,
             )
         ]
     elif "kuairand" in dataset:
@@ -297,7 +360,12 @@ def get_hstu_configs(dataset: str = "debug") -> DlrmHSTUConfig:
 
 def get_embedding_table_config(dataset: str = "debug") -> Dict[str, EmbeddingConfig]:
     if "movielens" in dataset:
-        assert dataset in ["movielens-1m", "movielens-20m", "movielens-13b"]
+        assert dataset in [
+            "movielens-1m",
+            "movielens-20m",
+            "movielens-13b",
+            "movielens-18b",
+        ]
         return (
             {
                 "movie_id": EmbeddingConfig(
@@ -346,7 +414,7 @@ def get_embedding_table_config(dataset: str = "debug") -> Dict[str, EmbeddingCon
             if dataset == "movielens-1m"
             else {
                 "movie_id": EmbeddingConfig(
-                    num_embeddings=500_000_000,
+                    num_embeddings=1_000_000_000,
                     embedding_dim=HSTU_EMBEDDING_DIM,
                     name="movie_id",
                     data_type=DataType.FP16,
@@ -361,6 +429,32 @@ def get_embedding_table_config(dataset: str = "debug") -> Dict[str, EmbeddingCon
                 ),
             }
         )
+    elif "streaming" in dataset:
+        return {
+            "item_id": EmbeddingConfig(
+                num_embeddings=1_000_000_000,
+                embedding_dim=HSTU_EMBEDDING_DIM,
+                name="item_id",
+                data_type=DataType.FP16,
+                feature_names=["item_id", "item_candidate_id"],
+            ),
+            "item_category_id": EmbeddingConfig(
+                num_embeddings=128,
+                embedding_dim=HSTU_EMBEDDING_DIM,
+                name="item_category_id",
+                data_type=DataType.FP16,
+                weight_init_max=1.0,
+                weight_init_min=-1.0,
+                feature_names=["item_category_id", "item_candidate_category_id"],
+            ),
+            "user_id": EmbeddingConfig(
+                num_embeddings=10_000_000,
+                embedding_dim=HSTU_EMBEDDING_DIM,
+                name="user_id",
+                data_type=DataType.FP16,
+                feature_names=["user_id"],
+            ),
+        }
     elif "kuairand" in dataset:
         return {
             "video_id": EmbeddingConfig(

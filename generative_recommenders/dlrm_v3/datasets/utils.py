@@ -17,6 +17,19 @@ import json
 from typing import List, Tuple
 
 
+def json_loads(
+    x: str | int | List[int],
+) -> List[int]:
+    if isinstance(x, str):
+        if x[0] != "[" and x[-1] != "]":
+            x = "[" + x + "]"
+        y = json.loads(x)
+    else:
+        y = x
+    y_list = [y] if type(y) == int else list(y)
+    return y_list
+
+
 def separate_uih_candidates(
     x: str | int | List[int],
     candidates_max_seq_len: int,

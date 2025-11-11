@@ -29,9 +29,12 @@ make_train_test_dataloaders.num_workers = 2
 make_train_test_dataloaders.prefetch_factor = 4
 
 # train loop variables
-train_loop.num_epochs = 5
+train_loop.num_epochs = 1
 train_loop.output_trace = True
 train_loop.metric_log_frequency = 10
+train_eval_loop.num_epochs = 1
+train_eval_loop.output_trace = True
+train_eval_loop.metric_log_frequency = 10
 
 # logger variables
 MetricsLogger.tensorboard_log_path = "/tmp/tensorboard_log_path.log"

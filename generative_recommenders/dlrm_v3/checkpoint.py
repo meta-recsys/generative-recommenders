@@ -21,6 +21,7 @@ from typing import Any, Dict, Optional, Set
 import gin
 
 import torch
+from generative_recommenders.dlrm_v3.utils import MetricsLogger
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.optim.optimizer import Optimizer
 from torchrec.distributed.types import ShardedTensor
@@ -72,14 +73,16 @@ def load_dense_state_dict(model: torch.nn.Module, state_dict: Dict[str, Any]) ->
 def save_dmp_checkpoint(
     model: torch.nn.Module,
     optimizer: Optimizer,
+    metric_logger: MetricsLogger,
     rank: int,
+    batch_idx: int,
     path: str = "",
 ) -> None:
     if path == "":
         return
     now = datetime.now()
     formatted_datetime = now.strftime("%Y_%m_%d_%H_%M_%S")
-    path = f"{path}/{formatted_datetime}"
+    path = f"{path}/{batch_idx}"
     if not os.path.exists(path) and rank == 0:
         os.makedirs(path)
     sparse_path = f"{path}/sparse/"
@@ -90,25 +93,40 @@ def save_dmp_checkpoint(
     sparse_tensor_keys = {
         k for k, v in model.state_dict().items() if isinstance(v, ShardedTensor)
     }
-    sparse_dict = {"sparse_dict": SparseState(model, sparse_tensor_keys)}
-    torch.distributed.checkpoint.save(
-        sparse_dict,
-        storage_writer=torch.distributed.checkpoint.FileSystemWriter(sparse_path),
-    )
     if rank == 0:
         dense_state_dict = {
             k: v
             for k, v in model.state_dict().items()
             if not isinstance(v, ShardedTensor)
         }
+        class_metric_state_dict = {
+            "train": [m.state_dict() for m in metric_logger.class_metrics["train"]],
+            "eval": [m.state_dict() for m in metric_logger.class_metrics["eval"]],
+        }
+        regression_metric_state_dict = {
+            "train": [
+                m.state_dict() for m in metric_logger.regression_metrics["train"]
+            ],
+            "eval": [m.state_dict() for m in metric_logger.regression_metrics["eval"]],
+        }
         torch.save(
             {
                 "dense_dict": dense_state_dict,
                 "optimizer_dict": optimizer.state_dict(),
+                "class_metrics": class_metric_state_dict,
+                "reg_metrics": regression_metric_state_dict,
+                "global_step": metric_logger.global_step,
                 "sparse_tensor_keys": sparse_tensor_keys,
             },
             non_sparse_ckpt,
         )
+    torch.distributed.barrier()
+    sparse_dict = {"sparse_dict": SparseState(model, sparse_tensor_keys)}
+    torch.distributed.checkpoint.save(
+        sparse_dict,
+        storage_writer=torch.distributed.checkpoint.FileSystemWriter(sparse_path),
+    )
+    torch.distributed.barrier()
     print("checkpoint successfully saved")
 
 
@@ -135,26 +153,48 @@ def load_sparse_checkpoint(
 @gin.configurable
 def load_nonsparse_checkpoint(
     model: torch.nn.Module,
+    device: torch.device,
     optimizer: Optional[Optimizer] = None,
+    metric_logger: Optional[MetricsLogger] = None,
     path: str = "",
 ) -> None:
     if path == "":
         return
     non_sparse_ckpt = f"{path}/non_sparse.ckpt"
 
-    non_sparse_state_dict = torch.load(non_sparse_ckpt)
+    non_sparse_state_dict = torch.load(non_sparse_ckpt, map_location=device)
     load_dense_state_dict(model, non_sparse_state_dict["dense_dict"])
     print("dense checkpoint successfully loaded")
     if optimizer is not None:
         optimizer.load_state_dict(non_sparse_state_dict["optimizer_dict"])
         print("optimizer checkpoint successfully loaded")
+    if metric_logger is not None:
+        metric_logger.global_step = non_sparse_state_dict["global_step"]
+        class_metric_state_dict = non_sparse_state_dict["class_metrics"]
+        regression_metric_state_dict = non_sparse_state_dict["reg_metrics"]
+        for i, m in enumerate(metric_logger.class_metrics["train"]):
+            m.load_state_dict(class_metric_state_dict["train"][i])
+        for i, m in enumerate(metric_logger.class_metrics["eval"]):
+            m.load_state_dict(class_metric_state_dict["eval"][i])
+        for i, m in enumerate(metric_logger.regression_metrics["train"]):
+            m.load_state_dict(regression_metric_state_dict["train"][i])
+        for i, m in enumerate(metric_logger.regression_metrics["eval"]):
+            m.load_state_dict(regression_metric_state_dict["eval"][i])
 
 
 @gin.configurable
 def load_dmp_checkpoint(
     model: torch.nn.Module,
     optimizer: Optimizer,
+    metric_logger: MetricsLogger,
+    device: torch.device,
     path: str = "",
 ) -> None:
     load_sparse_checkpoint(model=model, path=path)
-    load_nonsparse_checkpoint(model=model, optimizer=optimizer, path=path)
+    load_nonsparse_checkpoint(
+        model=model,
+        optimizer=optimizer,
+        metric_logger=metric_logger,
+        path=path,
+        device=device,
+    )
