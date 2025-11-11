@@ -34,6 +34,7 @@ class ActionEncoder(HammerModule):
         watchtime_to_action_thresholds_and_weights: Optional[
             List[Tuple[int, int]]
         ] = None,
+        embedding_init_std: float = 0.1,
         is_inference: bool = False,
     ) -> None:
         super().__init__(is_inference=is_inference)
@@ -57,12 +58,12 @@ class ActionEncoder(HammerModule):
         self._action_embedding_dim = action_embedding_dim
         self._action_embedding_table: torch.nn.Parameter = torch.nn.Parameter(
             torch.empty((self._num_action_types, action_embedding_dim)).normal_(
-                mean=0, std=0.1
+                mean=0, std=embedding_init_std
             ),
         )
         self._target_action_embedding_table: torch.nn.Parameter = torch.nn.Parameter(
             torch.empty((1, self._num_action_types * action_embedding_dim)).normal_(
-                mean=0, std=0.1
+                mean=0, std=embedding_init_std
             ),
         )
 

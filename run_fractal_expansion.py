@@ -21,11 +21,14 @@ Implementation adapted from the scripts used to generate MovieLens-1B
 """
 
 # Generate a 3B dataset (takes around 50 minutes):
-# python run_fractal_expansion.py --input-csv-file tmp/ml-20m/ratings.csv --write-dataset True --output-prefix tmp/ml-3b/
-# Generate a 13B dataset with customized sparse ratio:
-# python run_fractal_expansion.py --input-csv-file tmp/ml-20m/ratings.csv --write-dataset True --output-prefix tmp/ml-13b/ --num-row-multiplier 16 --num-col-multiplier 16384 --element-sample-rate 0.2 --block-sample-rate 0.05
+# python run_fractal_expansion.py --input-csv-file ~/data/ml-20m/ratings.csv --write-dataset True --output-prefix ~/data/ml-3b/
+# Generate a 13B dataset with 440M item size:
+# python run_fractal_expansion.py --input-csv-file ~/data/ml-20m/ratings.csv --write-dataset True --output-prefix ~/data/ml-13b/ --num-row-multiplier 16 --num-col-multiplier 16384 --element-sample-rate 0.2 --block-sample-rate 0.05
+# Generate a 18B dataset with 1B item size:
+# python run_fractal_expansion.py --input-csv-file ~/data/ml-20m/ratings.csv --write-dataset True --output-prefix ~/data/ml-18b/ --num-row-multiplier 20 --num-col-multiplier 36864 --element-sample-rate 0.08 --block-sample-rate 0.05
 
 import csv
+import linecache
 import logging
 import os
 import pickle
@@ -192,6 +195,38 @@ def _compute_row_block(
     return (num_removed_rows, metadata)
 
 
+def visualize_samples(
+    right_matrix,
+    visualize_num_samples,
+    expanded_file_name,
+    output_prefix,
+):
+    # Note: only the rows of the first Kronecker block are visualized.
+    logger.info("visualize dataset row by row.")
+    fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+    axs[0].set_title("Original data Histogram")
+    axs[0].set_xlabel("Value")
+    axs[0].set_ylabel("Frequency")
+    axs[1].set_title("Expended Row Histogram")
+    axs[1].set_xlabel("Value")
+    axs[1].set_ylabel("Frequency")
+    for k in range(visualize_num_samples):
+        original_row = right_matrix.getrow(k).data
+        line = linecache.getline(expanded_file_name, k + 1)
+        reader = csv.reader([line])
+        parsed_line = next(reader)
+        expended_row = eval(parsed_line[2])
+        original_hist_counts, original_bin_edges = np.histogram(original_row, bins=9)
+        expended_hist_counts, expended_bin_edges = np.histogram(expended_row, bins=9)
+        axs[0].plot(original_bin_edges[:-1], original_hist_counts, alpha=0.2)
+        axs[1].plot(expended_bin_edges[:-1], expended_hist_counts, alpha=0.2)
+        axs[0].fill_between(original_bin_edges[:-1], original_hist_counts, alpha=0.2)
+        axs[1].fill_between(expended_bin_edges[:-1], expended_hist_counts, alpha=0.2)
+    plt.tight_layout()
+    plt.savefig(f"{output_prefix}_sample_distribution.png")
+    logger.info("Sample visualization finished.")
+
+
 def build_randomized_kronecker(
     left_matrix,
     right_matrix,
@@ -270,10 +305,16 @@ def _preprocess_movie_lens(ratings_df, binary=False):
 
 def normalize(matrix):
     norm_matrix = matrix.copy()
-    norm_matrix.data -= norm_matrix.mean()
+    if isinstance(norm_matrix, np.ndarray):
+        norm_matrix -= norm_matrix.mean()
+    else:
+        norm_matrix.data -= norm_matrix.mean()
     max_val = norm_matrix.max()
     min_val = norm_matrix.min()
-    norm_matrix.data /= max(abs(max_val), abs(min_val))
+    if isinstance(norm_matrix, np.ndarray):
+        norm_matrix /= max(abs(max_val), abs(min_val))
+    else:
+        norm_matrix.data /= max(abs(max_val), abs(min_val))
     return norm_matrix
 
 
@@ -310,16 +351,20 @@ def plot_distribution(user_wise_sum, item_wise_sum, s, title_prefix, normalized=
     ax3.set_ylabel("Magnitude")
     ax3.grid(True)
     plt.tight_layout()
-    plt.show()
+    plt.savefig(f"{title_prefix}_distribution.png")
 
 
-def visualize_distribution(mat, reduced_mat, s, reduced_s, normalized=False):
+def visualize_distribution(mat, reduced_mat, s, reduced_s, normalized=False, title=""):
     user_wise_sum = np.asarray(mat.sum(axis=1)).flatten()
     item_wise_sum = np.asarray(mat.sum(axis=0)).flatten()
     assert len(user_wise_sum) == mat.shape[0]
     assert len(item_wise_sum) == mat.shape[1]
     plot_distribution(
-        user_wise_sum, item_wise_sum, s, title_prefix="Original", normalized=normalized
+        user_wise_sum,
+        item_wise_sum,
+        s,
+        title_prefix=f"{title}_Original",
+        normalized=normalized,
     )
 
     reduced_user_wise_sum = np.asarray(reduced_mat.sum(axis=1)).flatten()
@@ -330,7 +375,7 @@ def visualize_distribution(mat, reduced_mat, s, reduced_s, normalized=False):
         reduced_user_wise_sum,
         reduced_item_wise_sum,
         reduced_s,
-        title_prefix="Reduced",
+        title_prefix=f"{title}_Reduced",
         normalized=normalized,
     )
 
@@ -343,7 +388,7 @@ def visualize_distribution(mat, reduced_mat, s, reduced_s, normalized=False):
         expanded_user_wise_sum,
         expanded_item_wise_sum,
         expanded_s,
-        title_prefix="Expanded",
+        title_prefix=f"{title}_Expanded",
         normalized=normalized,
     )
 
@@ -395,10 +440,20 @@ def expand_dataset(
             norm_rating_matrix, k=20 * k, maxiter=None, return_singular_vectors=False
         )
         visualize_distribution(
-            norm_rating_matrix, norm_reduced_matrix, s, s_reduce, normalized=True
+            norm_rating_matrix,
+            norm_reduced_matrix,
+            s,
+            s_reduce,
+            normalized=True,
+            title="Normalized",
         )
         visualize_distribution(
-            binary_ratings_matrix, reduced_matrix, s, s_reduce, normalized=False
+            binary_ratings_matrix,
+            reduced_matrix,
+            s,
+            s_reduce,
+            normalized=False,
+            title="Binary",
         )
     if write_dataset:
         output_file = (
@@ -462,6 +517,11 @@ def expand_dataset(
     type=bool,
     default=False,
 )
+@click.option(
+    "--visualize-num-samples",
+    type=int,
+    default=0,
+)
 def main(
     random_seed: int,
     input_csv_file: str,
@@ -472,6 +532,7 @@ def main(
     block_sample_rate: float,
     visualize: bool,
     write_dataset: bool,
+    visualize_num_samples: int,
 ):
     np.random.seed(random_seed)
 
@@ -500,20 +561,29 @@ def main(
         ),
         shape=(num_users, num_items),
     )
-    expand_dataset(
-        ratings_matrix=ratings_matrix,
-        binary_ratings_matrix=binary_ratings_matrix,
-        num_users=num_users,
-        num_items=num_items,
-        reduced_num_rows=num_row_multiplier,
-        reduced_num_cols=num_col_multiplier,
-        rescale_w_abs=False,
-        element_sample_rate=element_sample_rate,
-        block_sample_rate=block_sample_rate,
-        visualize=visualize,
-        write_dataset=write_dataset,
-        output_prefix=output_prefix,
-    )
+    if write_dataset or visualize:
+        expand_dataset(
+            ratings_matrix=ratings_matrix,
+            binary_ratings_matrix=binary_ratings_matrix,
+            num_users=num_users,
+            num_items=num_items,
+            reduced_num_rows=num_row_multiplier,
+            reduced_num_cols=num_col_multiplier,
+            rescale_w_abs=False,
+            element_sample_rate=element_sample_rate,
+            block_sample_rate=block_sample_rate,
+            visualize=visualize,
+            write_dataset=write_dataset,
+            output_prefix=output_prefix,
+        )
+    if visualize_num_samples > 0:
+        logger.info(f"Visualizing {visualize_num_samples} samples.")
+        visualize_samples(
+            right_matrix=ratings_matrix.tocoo(),
+            visualize_num_samples=visualize_num_samples,
+            expanded_file_name=f"{output_prefix}{num_row_multiplier}x{num_col_multiplier}_0.csv",
+            output_prefix="Sample_Histogram",
+        )
 
 
 if __name__ == "__main__":

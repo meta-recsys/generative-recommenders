@@ -66,7 +66,7 @@ class Dataset:
         self.image_list = []
         self.label_list = []
         self.image_list_inmemory = {}
-        self.last_loaded = -1
+        self.last_loaded = -1.0
 
     def preprocess(self, use_cache=True):
         raise NotImplementedError("Dataset:preprocess")
@@ -210,15 +210,7 @@ class DLRMv3RandomDataset(Dataset):
         self.num_aggregated_samples = num_aggregated_samples
         self.items_in_memory = {}
 
-    def get_sample(
-        self, id: int
-    ) -> Tuple[
-        KeyedJaggedTensor,
-        KeyedJaggedTensor,
-        List[float],
-        List[List[float]],
-        torch.Tensor,
-    ]:
+    def get_sample(self, id: int) -> Tuple[KeyedJaggedTensor, KeyedJaggedTensor]:
         return self.items_in_memory[id]
 
     def get_item_count(self):

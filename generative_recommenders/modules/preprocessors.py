@@ -116,6 +116,8 @@ class ContextualPreprocessor(InputPreprocessor):
         action_embedding_dim: int = 8,
         action_feature_name: str = "",
         action_weights: Optional[List[int]] = None,
+        additional_embedding_features: List[str] = [],
+        action_embedding_init_std: float = 0.1,
         is_inference: bool = True,
     ) -> None:
         super().__init__(is_inference=is_inference)
@@ -165,6 +167,20 @@ class ContextualPreprocessor(InputPreprocessor):
             ),
             LayerNorm(self._output_embedding_dim),
         ).apply(init_mlp_weights_optional_bias)
+        self._additional_embedding_features: List[str] = additional_embedding_features
+        self._additional_embedding_mlp: torch.nn.Module = torch.nn.Sequential(
+            torch.nn.Linear(
+                in_features=self._input_embedding_dim
+                * len(additional_embedding_features),
+                out_features=self._hidden_dim,
+            ),
+            SwishLayerNorm(self._hidden_dim),
+            torch.nn.Linear(
+                in_features=self._hidden_dim,
+                out_features=self._output_embedding_dim,
+            ),
+            LayerNorm(self._output_embedding_dim),
+        ).apply(init_mlp_weights_optional_bias)
         self._action_feature_name: str = action_feature_name
         self._action_weights: Optional[List[int]] = action_weights
         if self._action_weights is not None:
@@ -172,6 +188,7 @@ class ContextualPreprocessor(InputPreprocessor):
                 action_feature_name=action_feature_name,
                 action_weights=self._action_weights,
                 action_embedding_dim=action_embedding_dim,
+                embedding_init_std=action_embedding_init_std,
                 is_inference=is_inference,
             )
             self._action_embedding_mlp: torch.nn.Module = torch.nn.Sequential(
@@ -210,6 +227,18 @@ class ContextualPreprocessor(InputPreprocessor):
         Dict[str, torch.Tensor],
     ]:
         output_seq_embeddings = self._content_embedding_mlp(seq_embeddings)
+        if len(self._additional_embedding_features) > 0:
+            additional_embeddings = torch.cat(
+                [
+                    seq_payloads[feature]
+                    for feature in self._additional_embedding_features
+                ],
+                dim=1,
+            )
+            output_seq_embeddings = (
+                output_seq_embeddings
+                + self._additional_embedding_mlp(additional_embeddings)
+            )
         max_seq_len = max_uih_len + max_targets
         target_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(num_targets)
         seq_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(seq_lengths)

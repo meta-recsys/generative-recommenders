@@ -94,6 +94,7 @@ class DlrmHSTUConfig:
         default_factory=list
     )
     action_weights: Optional[List[int]] = None
+    action_embedding_init_std: float = 0.1
     enable_postprocessor: bool = True
     use_layer_norm_postprocessor: bool = False
 
@@ -152,6 +153,19 @@ class DlrmHSTU(HammerModule):
             causal_multitask_weights=hstu_configs.causal_multitask_weights,
             is_inference=self._is_inference,
         )
+        self._additional_embedding_features: List[str] = [
+            uih_feature_name
+            for (
+                uih_feature_name,
+                candidate_feature_name,
+            ) in self._hstu_configs.merge_uih_candidate_feature_mapping
+            if (
+                candidate_feature_name
+                in self._hstu_configs.item_embedding_feature_names
+            )
+            and (uih_feature_name in self._hstu_configs.user_embedding_feature_names)
+            and (uih_feature_name is not self._hstu_configs.uih_post_id_feature_name)
+        ]
 
         # preprocessor setup
         preprocessor = ContextualPreprocessor(
@@ -163,6 +177,8 @@ class DlrmHSTU(HammerModule):
             action_embedding_dim=8,
             action_feature_name=self._hstu_configs.uih_weight_feature_name,
             action_weights=self._hstu_configs.action_weights,
+            action_embedding_init_std=self._hstu_configs.action_embedding_init_std,
+            additional_embedding_features=self._additional_embedding_features,
             is_inference=is_inference,
         )
 
@@ -279,6 +295,10 @@ class DlrmHSTU(HammerModule):
                     list(self._hstu_configs.contextual_feature_to_max_length.keys())
                 )
             },
+            **{
+                x: seq_embeddings[x].embedding
+                for x in self._additional_embedding_features
+            },
         }
 
     def _user_forward(
@@ -340,16 +360,14 @@ class DlrmHSTU(HammerModule):
         self,
         seq_embeddings: Dict[str, SequenceEmbedding],
     ) -> torch.Tensor:  # [L, D]
-        all_embeddings = [
-            torch.cat(
-                [
-                    seq_embeddings[name].embedding
-                    for name in self._hstu_configs.item_embedding_feature_names
-                ],
-                dim=-1,
-            )
-        ]
-        item_embeddings = self._item_embedding_mlp(torch.cat(all_embeddings, dim=-1))
+        all_embeddings = torch.cat(
+            [
+                seq_embeddings[name].embedding
+                for name in self._hstu_configs.item_embedding_feature_names
+            ],
+            dim=-1,
+        )
+        item_embeddings = self._item_embedding_mlp(all_embeddings)
         return item_embeddings
 
     def preprocess(

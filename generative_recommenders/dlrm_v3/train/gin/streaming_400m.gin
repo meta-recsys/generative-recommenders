@@ -1,5 +1,7 @@
 batch_size = 64
-dataset = "movielens-20m"
+num_workers = 2
+prefetch_factor = 4
+dataset = "streaming-400m"
 
 # model parameters
 make_model.dataset = %dataset
@@ -25,9 +27,16 @@ make_train_test_dataloaders.batch_size = %batch_size
 make_train_test_dataloaders.dataset_type = %dataset
 make_train_test_dataloaders.train_split_percentage = 0.80
 make_train_test_dataloaders.new_path_prefix = "/home/linjianma"
-make_train_test_dataloaders.num_workers = 2
-make_train_test_dataloaders.prefetch_factor = 4
-make_train_test_dataloaders.num_blocks = 1
+make_train_test_dataloaders.num_workers = %num_workers
+make_train_test_dataloaders.prefetch_factor = %prefetch_factor
+make_train_test_dataloaders.num_blocks = 20
+
+get_dataset.name = %dataset
+get_dataset.new_path_prefix = "/home/linjianma"
+
+make_streaming_dataloader.batch_size = %batch_size
+make_streaming_dataloader.num_workers = %num_workers
+make_streaming_dataloader.prefetch_factor = %prefetch_factor
 
 # train loop variables
 train_loop.num_epochs = 200
@@ -37,20 +46,16 @@ train_loop.checkpoint_frequency = 4000
 train_loop.start_batch_idx = 0
 
 # eval loop variables
-eval_loop.metric_log_frequency = 10
+eval_loop.metric_log_frequency = 40
 
 # train eval loop variables
-train_eval_loop.num_epochs = 20
-train_eval_loop.output_trace = False
-train_eval_loop.start_train_batch_idx = 0
-train_eval_loop.start_eval_batch_idx = 0
-train_eval_loop.num_eval_batches = 100
-train_eval_loop.metric_log_frequency = 40
-train_eval_loop.checkpoint_frequency = 2000
-train_eval_loop.eval_frequency = 200
+streaming_train_eval_loop.num_train_ts = 8
+streaming_train_eval_loop.output_trace = False
+streaming_train_eval_loop.metric_log_frequency = 40
+streaming_train_eval_loop.checkpoint_frequency = 2000
 
 
 # logger variables
-MetricsLogger.tensorboard_log_path = "/home/linjianma/tensorboard/movielens_20m/"
-# save_dmp_checkpoint.path = "/home/linjianma/ckpts/movielens_18b/0.5T"
-# load_dmp_checkpoint.path = "/home/linjianma/ckpts/movielens_18b/20000/"
+MetricsLogger.tensorboard_log_path = "/home/linjianma/tensorboard/streaming_400m/"
+# save_dmp_checkpoint.path = "/home/linjianma/ckpts/streaming_400m/"
+# load_dmp_checkpoint.path = "/home/linjianma/ckpts/streaming_400m/20000/"
