@@ -17,6 +17,7 @@
 # pyre-strict
 
 import abc
+import logging
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Callable, Dict, List, Optional, Tuple
@@ -25,6 +26,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from generative_recommenders.common import HammerModule
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 class MultitaskTaskType(IntEnum):
@@ -79,23 +82,15 @@ def _compute_pred_and_logits(
     )
     mt_preds_list: List[torch.Tensor] = []
     for task_type in MultitaskTaskType:
+        logits = mt_logits[
+            task_offsets[task_type] : task_offsets[task_type + 1],
+            :,
+        ]
         if task_offsets[task_type + 1] - task_offsets[task_type] > 0:
             if task_type == MultitaskTaskType.REGRESSION:
-                mt_preds_list.append(
-                    mt_logits[
-                        task_offsets[task_type] : task_offsets[task_type + 1],
-                        :,
-                    ]
-                )
+                mt_preds_list.append(logits)
             else:
-                mt_preds_list.append(
-                    F.sigmoid(
-                        mt_logits[
-                            task_offsets[task_type] : task_offsets[task_type + 1],
-                            :,
-                        ]
-                    )
-                )
+                mt_preds_list.append(F.sigmoid(logits))
     if has_multiple_task_types:
         mt_preds: torch.Tensor = torch.concat(mt_preds_list, dim=0)
     else:
@@ -144,41 +139,28 @@ def _compute_loss(
     mt_losses_list: List[torch.Tensor] = []
     for task_type in MultitaskTaskType:
         if task_offsets[task_type + 1] - task_offsets[task_type] > 0:
+            logits = mt_logits[
+                task_offsets[task_type] : task_offsets[task_type + 1],
+                :,
+            ]
+            labels = mt_labels[
+                task_offsets[task_type] : task_offsets[task_type + 1],
+                :,
+            ]
+            weights = mt_weights[
+                task_offsets[task_type] : task_offsets[task_type + 1],
+                :,
+            ]
             if task_type == MultitaskTaskType.REGRESSION:
                 mt_losses_list.append(
-                    F.mse_loss(
-                        mt_logits[
-                            task_offsets[task_type] : task_offsets[task_type + 1],
-                            :,
-                        ],
-                        mt_labels[
-                            task_offsets[task_type] : task_offsets[task_type + 1],
-                            :,
-                        ],
-                        reduction="none",
-                    )
-                    * mt_weights[
-                        task_offsets[task_type] : task_offsets[task_type + 1],
-                        :,
-                    ]
+                    F.mse_loss(logits, labels, reduction="none") * weights
                 )
             else:
                 mt_losses_list.append(
                     F.binary_cross_entropy_with_logits(
-                        input=mt_logits[
-                            task_offsets[task_type] : task_offsets[task_type + 1],
-                            :,
-                        ],
-                        target=mt_labels[
-                            task_offsets[task_type] : task_offsets[task_type + 1],
-                            :,
-                        ],
-                        reduction="none",
+                        input=logits, target=labels, reduction="none"
                     )
-                    * mt_weights[
-                        task_offsets[task_type] : task_offsets[task_type + 1],
-                        :,
-                    ]
+                    * weights
                 )
 
     if has_multiple_task_types:

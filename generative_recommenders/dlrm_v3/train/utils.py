@@ -15,6 +15,7 @@
 # pyre-strict
 import logging
 import os
+from collections.abc import Iterator
 from datetime import timedelta
 from typing import (
     Any,
@@ -33,7 +34,6 @@ import gin
 
 import torch
 import torchrec
-from generative_recommenders.common import HammerKernel
 from generative_recommenders.dlrm_v3.checkpoint import save_dmp_checkpoint
 from generative_recommenders.dlrm_v3.configs import (
     get_embedding_table_config,
@@ -49,7 +49,7 @@ from torch.distributed.optim import (
 from torch.optim.optimizer import Optimizer
 
 from torch.utils.data import DataLoader, Dataset as TorchDataset
-from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data.distributed import _T_co, DistributedSampler
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.types import ShardedTensor
 from torchrec.modules.embedding_configs import EmbeddingConfig
@@ -119,6 +119,49 @@ class HammerToTorchDataset(TorchDataset):
         return samples
 
 
+class ChunkDistributedSampler(DistributedSampler[_T_co]):
+    """
+    Each rank reads a contiguous chunk (trunk) of the input data
+    """
+
+    def __init__(
+        self,
+        dataset: TorchDataset,
+        num_replicas: Optional[int] = None,
+        rank: Optional[int] = None,
+        shuffle: bool = True,
+        seed: int = 1,
+        drop_last: bool = False,
+    ) -> None:
+        super().__init__(
+            dataset=dataset,
+            num_replicas=num_replicas,
+            rank=rank,
+            shuffle=shuffle,
+            seed=seed,
+            drop_last=drop_last,
+        )
+
+    def __iter__(self) -> Iterator[_T_co]:
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch * 1001 + int(self.rank))
+            indices = torch.randperm(self.num_samples, generator=g).tolist()
+        else:
+            indices = list(range(self.num_samples))
+        assert (
+            self.drop_last is True
+        ), "drop_last must be True for ChunkDistributedSampler"
+        indices = [i + self.num_samples * self.rank for i in indices]
+
+        assert len(indices) == self.num_samples
+        return iter(indices)
+
+    def set_epoch(self, epoch: int) -> None:
+        logger.warning(f"Setting epoch to {epoch}")
+        self.epoch = epoch
+
+
 @gin.configurable
 def make_model(
     dataset: str,
@@ -157,6 +200,9 @@ def dense_optimizer_factory_and_class(
     elif optimizer_name == "SGD":
         optimizer_cls = torch.optim.SGD
         kwargs.update({"weight_decay": weight_decay, "momentum": momentum})
+    elif optimizer_name == "AdamW":
+        optimizer_cls = torch.optim.AdamW
+        kwargs.update({"betas": betas, "eps": eps, "weight_decay": weight_decay})
     else:
         raise Exception("Unsupported optimizer!")
 
@@ -268,6 +314,30 @@ def make_optimizer_and_shard(
 
 
 @gin.configurable
+def make_streaming_dataloader(
+    dataset: HammerToTorchDataset,
+    ts: int,
+    batch_size: int,
+    num_workers: int,
+    prefetch_factor: int,
+) -> DataLoader:
+    dataset.dataset.set_ts(ts)  # pyre-ignore [16]
+    total_items = dataset.dataset.get_item_count()
+    subset = torch.utils.data.Subset(dataset, range(total_items))
+    dataloader = DataLoader(
+        dataset=subset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        drop_last=True,
+        num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
+        sampler=DistributedSampler(subset, drop_last=True),
+    )
+    return dataloader
+
+
+@gin.configurable
 def make_train_test_dataloaders(
     batch_size: int,
     dataset_type: str,
@@ -276,9 +346,12 @@ def make_train_test_dataloaders(
     embedding_table_configs: Dict[str, EmbeddingConfig],
     new_path_prefix: str = "",
     num_workers: int = 0,
+    num_blocks: int = 1,
     prefetch_factor: Optional[int] = None,
 ) -> Tuple[DataLoader, DataLoader]:
-    dataset_class, kwargs = get_dataset(dataset_type, new_path_prefix)
+    dataset_class, kwargs = get_dataset(
+        name=dataset_type, new_path_prefix=new_path_prefix
+    )
     kwargs["embedding_config"] = embedding_table_configs
 
     # Create dataset
@@ -286,11 +359,18 @@ def make_train_test_dataloaders(
         dataset=dataset_class(hstu_config=hstu_config, is_inference=False, **kwargs)
     )
     total_items = dataset.dataset.get_item_count()
-
-    train_size = round(train_split_percentage * total_items)
-
-    train_set = torch.utils.data.Subset(dataset, range(train_size))
-    test_set = torch.utils.data.Subset(dataset, range(train_size, total_items))
+    items_per_block = total_items // num_blocks
+    train_size_per_block = round(train_split_percentage * items_per_block)
+    train_inds, test_inds = [], []
+    for i in range(num_blocks):
+        train_inds.extend(
+            range(i * items_per_block, i * items_per_block + train_size_per_block)
+        )
+        test_inds.extend(
+            range(i * items_per_block + train_size_per_block, (i + 1) * items_per_block)
+        )
+    train_set = torch.utils.data.Subset(dataset, train_inds)
+    test_set = torch.utils.data.Subset(dataset, test_inds)
 
     # Wrap dataset with dataloader
     train_dataloader = DataLoader(
@@ -301,7 +381,7 @@ def make_train_test_dataloaders(
         drop_last=True,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
-        sampler=DistributedSampler(train_set),
+        sampler=ChunkDistributedSampler(train_set, drop_last=True, shuffle=True),
     )
     test_dataloader = DataLoader(
         dataset=test_set,
@@ -311,7 +391,7 @@ def make_train_test_dataloaders(
         drop_last=True,
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
-        sampler=DistributedSampler(test_set),
+        sampler=ChunkDistributedSampler(test_set, drop_last=True, shuffle=True),
     )
     return train_dataloader, test_dataloader
 
@@ -328,13 +408,16 @@ def train_loop(
     num_batches: Optional[int] = None,
     output_trace: bool = False,
     metric_log_frequency: int = 1,
+    checkpoint_frequency: int = 100,
+    start_batch_idx: int = 0,
     # lr_scheduler: to-do: Add a scheduler
 ) -> None:
     model.train()
-    batch_idx: int = 0
+    batch_idx: int = start_batch_idx
     profiler = Profiler(rank, active=10) if output_trace else None
 
-    for _ in range(num_epochs):
+    for epoch in range(num_epochs):
+        dataloader.sampler.set_epoch(epoch)  # pyre-ignore [16]
         for sample in dataloader:
             optimizer.zero_grad()
             sample.to(device)
@@ -365,6 +448,14 @@ def train_loop(
                         "losses": aux_losses,
                     },
                 )
+            if batch_idx % checkpoint_frequency == 0 and batch_idx > 0:
+                save_dmp_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    metric_logger=metric_logger,
+                    rank=rank,
+                    batch_idx=batch_idx,
+                )
             batch_idx += 1
             if output_trace:
                 assert profiler is not None
@@ -374,8 +465,6 @@ def train_loop(
         if num_batches is not None and batch_idx >= num_batches:
             break
 
-    save_dmp_checkpoint(model, optimizer, rank)
-
 
 @gin.configurable
 def eval_loop(
@@ -384,6 +473,7 @@ def eval_loop(
     dataloader: torch.utils.data.DataLoader,
     metric_logger: MetricsLogger,
     device: torch.device,
+    metric_log_frequency: int = 1,
     num_batches: Optional[int] = None,
     output_trace: bool = False,
     # lr_scheduler: to-do: Add a scheduler
@@ -392,31 +482,34 @@ def eval_loop(
     batch_idx: int = 0
     profiler = Profiler(rank, active=10) if output_trace else None
     metric_logger.reset(mode="eval")
-    for sample in dataloader:
-        sample.to(device)
-        (
-            _,
-            _,
-            _,
-            mt_target_preds,
-            mt_target_labels,
-            mt_target_weights,
-        ) = model.forward(
-            sample.uih_features_kjt,
-            sample.candidates_features_kjt,
-        )
-        metric_logger.update(
-            mode="eval",
-            predictions=mt_target_preds,
-            labels=mt_target_labels,
-            weights=mt_target_weights,
-        )
-        batch_idx += 1
-        if output_trace:
-            assert profiler is not None
-            profiler.step()
-        if num_batches is not None and batch_idx >= num_batches:
-            break
+    with torch.no_grad():
+        for sample in dataloader:
+            sample.to(device)
+            (
+                _,
+                _,
+                _,
+                mt_target_preds,
+                mt_target_labels,
+                mt_target_weights,
+            ) = model.forward(
+                sample.uih_features_kjt,
+                sample.candidates_features_kjt,
+            )
+            metric_logger.update(
+                mode="eval",
+                predictions=mt_target_preds,
+                labels=mt_target_labels,
+                weights=mt_target_weights,
+            )
+            if batch_idx % metric_log_frequency != 0:
+                metric_logger.compute_and_log(mode="eval")
+            batch_idx += 1
+            if output_trace:
+                assert profiler is not None
+                profiler.step()
+            if num_batches is not None and batch_idx >= num_batches:
+                break
     metric_logger.compute_and_log(mode="eval")
     for k, v in metric_logger.compute(mode="eval").items():
         print(f"{k}: {v}")
@@ -430,59 +523,202 @@ def train_eval_loop(
     metric_logger: MetricsLogger,
     device: torch.device,
     num_epochs: int,
+    num_train_batches: Optional[int] = None,
+    num_eval_batches: Optional[int] = None,
     train_dataloader: Optional[torch.utils.data.DataLoader] = None,
     eval_dataloader: Optional[torch.utils.data.DataLoader] = None,
     output_trace: bool = False,
     metric_log_frequency: int = 1,
+    checkpoint_frequency: int = 100,
     eval_frequency: int = 1,
+    start_train_batch_idx: int = 0,
+    start_eval_batch_idx: int = 0,
     # lr_scheduler: to-do: Add a scheduler
 ) -> None:
+    train_batch_idx: int = start_train_batch_idx
+    eval_batch_idx: int = start_eval_batch_idx
     profiler = Profiler(rank, active=10) if output_trace else None
+    assert train_dataloader is not None and eval_dataloader is not None
+    eval_data_iterator = iter(eval_dataloader)
+    train_data_iterator = iter(train_dataloader)
+    # metric_logger.reset(mode="train")
+    # metric_logger.reset(mode="eval")
 
     for epoch in range(num_epochs):
-        if train_dataloader is not None:
+        train_dataloader.sampler.set_epoch(epoch)  # pyre-ignore [16]
+        while True:
             model.train()
-            metric_logger.reset(mode="train")
-            train_batch_idx: int = 0
-            for sample in train_dataloader:
-                optimizer.zero_grad()
-                sample.to(device)
-                (
-                    _,
-                    _,
-                    aux_losses,
-                    mt_target_preds,
-                    mt_target_labels,
-                    mt_target_weights,
-                ) = model.forward(
-                    sample.uih_features_kjt,
-                    sample.candidates_features_kjt,
-                )
-                # pyre-ignore
-                sum(aux_losses.values()).backward()
-                optimizer.step()
-                metric_logger.update(
+            try:
+                sample = next(train_data_iterator)
+            except StopIteration:
+                train_data_iterator = iter(train_dataloader)
+                break
+            optimizer.zero_grad()
+            sample.to(device)
+            (
+                _,
+                _,
+                aux_losses,
+                mt_target_preds,
+                mt_target_labels,
+                mt_target_weights,
+            ) = model.forward(
+                sample.uih_features_kjt,
+                sample.candidates_features_kjt,
+            )
+            # pyre-ignore
+            sum(aux_losses.values()).backward()
+            optimizer.step()
+            metric_logger.update(
+                mode="train",
+                predictions=mt_target_preds,
+                labels=mt_target_labels,
+                weights=mt_target_weights,
+            )
+            if train_batch_idx % metric_log_frequency == 0:
+                metric_logger.compute_and_log(
                     mode="train",
-                    predictions=mt_target_preds,
-                    labels=mt_target_labels,
-                    weights=mt_target_weights,
+                    additional_logs={
+                        "losses": aux_losses,
+                    },
                 )
-                if train_batch_idx % metric_log_frequency == 0:
-                    metric_logger.compute_and_log(
-                        mode="train",
-                        additional_logs={
-                            "losses": aux_losses,
-                        },
-                    )
-                train_batch_idx += 1
-                if output_trace:
-                    assert profiler is not None
-                    profiler.step()
-        if eval_dataloader is not None and epoch % eval_frequency == 0:
-            model.eval()
-            metric_logger.reset(mode="eval")
-            eval_batch_idx: int = 0
-            for sample in eval_dataloader:
+            if train_batch_idx % checkpoint_frequency == 0 and train_batch_idx > 0:
+                save_dmp_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    metric_logger=metric_logger,
+                    rank=rank,
+                    batch_idx=train_batch_idx,
+                )
+            train_batch_idx += 1
+            if output_trace:
+                assert profiler is not None
+                profiler.step()
+            if train_batch_idx % eval_frequency == 0:
+                model.eval()
+                eval_batch_idx: int = 0
+                with torch.no_grad():
+                    while True:
+                        try:
+                            sample = next(eval_data_iterator)
+                        except StopIteration:
+                            eval_data_iterator = iter(eval_dataloader)
+                            sample = next(eval_data_iterator)
+                        sample.to(device)
+                        (
+                            _,
+                            _,
+                            _,
+                            mt_target_preds,
+                            mt_target_labels,
+                            mt_target_weights,
+                        ) = model.forward(
+                            sample.uih_features_kjt,
+                            sample.candidates_features_kjt,
+                        )
+                        metric_logger.update(
+                            mode="eval",
+                            predictions=mt_target_preds,
+                            labels=mt_target_labels,
+                            weights=mt_target_weights,
+                        )
+                        eval_batch_idx += 1
+                        if output_trace:
+                            assert profiler is not None
+                            profiler.step()
+                        if eval_batch_idx % metric_log_frequency == 0:
+                            metric_logger.compute_and_log(mode="eval")
+                        if (
+                            num_eval_batches is not None
+                            and eval_batch_idx >= num_eval_batches
+                        ):
+                            break
+                    for k, v in metric_logger.compute(mode="eval").items():
+                        print(f"{k}: {v}")
+                model.train()
+            if num_train_batches is not None and train_batch_idx >= num_train_batches:
+                break
+
+
+@gin.configurable
+def streaming_train_eval_loop(
+    rank: int,
+    model: torch.nn.Module,
+    optimizer: Optimizer,
+    metric_logger: MetricsLogger,
+    device: torch.device,
+    num_train_ts: int,
+    hstu_config: DlrmHSTUConfig,
+    embedding_table_configs: Dict[str, EmbeddingConfig],
+    num_train_batches: Optional[int] = None,
+    num_eval_batches: Optional[int] = None,
+    output_trace: bool = False,
+    metric_log_frequency: int = 1,
+    checkpoint_frequency: int = 100,
+) -> None:
+    profiler = Profiler(rank, active=10) if output_trace else None
+    dataset_class, kwargs = get_dataset()
+    kwargs["embedding_config"] = embedding_table_configs
+    dataset = HammerToTorchDataset(
+        dataset=dataset_class(hstu_config=hstu_config, is_inference=False, **kwargs)
+    )
+    for train_ts in range(num_train_ts):
+        train_batch_idx: int = 0
+        train_dataloader = make_streaming_dataloader(dataset=dataset, ts=train_ts)
+        train_data_iterator = iter(train_dataloader)
+        while True:
+            model.train()
+            try:
+                sample = next(train_data_iterator)
+            except StopIteration:
+                break
+            optimizer.zero_grad()
+            sample.to(device)
+            (
+                _,
+                _,
+                aux_losses,
+                mt_target_preds,
+                mt_target_labels,
+                mt_target_weights,
+            ) = model.forward(
+                sample.uih_features_kjt,
+                sample.candidates_features_kjt,
+            )
+            # pyre-ignore
+            sum(aux_losses.values()).backward()
+            optimizer.step()
+            metric_logger.update(
+                mode="train",
+                predictions=mt_target_preds,
+                labels=mt_target_labels,
+                weights=mt_target_weights,
+            )
+            if train_batch_idx % metric_log_frequency == 0:
+                metric_logger.compute_and_log(
+                    mode="train",
+                    additional_logs={
+                        "losses": aux_losses,
+                    },
+                )
+            train_batch_idx += 1
+            if output_trace:
+                assert profiler is not None
+                profiler.step()
+            if num_train_batches is not None and train_batch_idx >= num_train_batches:
+                break
+        eval_ts = train_ts + 1
+        dataset.dataset.is_eval = True  # pyre-ignore [16]
+        model.eval()
+        eval_batch_idx: int = 0
+        eval_dataloader = make_streaming_dataloader(dataset=dataset, ts=eval_ts)
+        eval_data_iterator = iter(eval_dataloader)
+        with torch.no_grad():
+            while True:
+                try:
+                    sample = next(eval_data_iterator)
+                except StopIteration:
+                    break
                 sample.to(device)
                 (
                     _,
@@ -505,8 +741,60 @@ def train_eval_loop(
                 if output_trace:
                     assert profiler is not None
                     profiler.step()
-            metric_logger.compute_and_log(mode="eval")
+                if eval_batch_idx % metric_log_frequency == 0:
+                    metric_logger.compute_and_log(mode="eval")
+                if num_eval_batches is not None and eval_batch_idx >= num_eval_batches:
+                    break
             for k, v in metric_logger.compute(mode="eval").items():
                 print(f"{k}: {v}")
+        if (
+            train_ts % checkpoint_frequency == 0 and train_ts > 0
+        ) or train_ts == num_train_ts - 1:
+            save_dmp_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                metric_logger=metric_logger,
+                rank=rank,
+                batch_idx=train_ts,
+            )
 
-    save_dmp_checkpoint(model, optimizer, rank)
+    eval_ts = num_train_ts
+    dataset.dataset.is_eval = True
+    model.eval()
+    eval_batch_idx: int = 0
+    eval_dataloader = make_streaming_dataloader(dataset=dataset, ts=eval_ts)
+    eval_data_iterator = iter(eval_dataloader)
+    with torch.no_grad():
+        while True:
+            try:
+                sample = next(eval_data_iterator)
+            except StopIteration:
+                break
+            sample.to(device)
+            (
+                _,
+                _,
+                _,
+                mt_target_preds,
+                mt_target_labels,
+                mt_target_weights,
+            ) = model.forward(
+                sample.uih_features_kjt,
+                sample.candidates_features_kjt,
+            )
+            metric_logger.update(
+                mode="eval",
+                predictions=mt_target_preds,
+                labels=mt_target_labels,
+                weights=mt_target_weights,
+            )
+            eval_batch_idx += 1
+            if output_trace:
+                assert profiler is not None
+                profiler.step()
+            if eval_batch_idx % metric_log_frequency == 0:
+                metric_logger.compute_and_log(mode="eval")
+            if num_eval_batches is not None and eval_batch_idx >= num_eval_batches:
+                break
+        for k, v in metric_logger.compute(mode="eval").items():
+            print(f"{k}: {v}")

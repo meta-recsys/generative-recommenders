@@ -21,6 +21,7 @@ import argparse
 import array
 import json
 import logging
+import random
 
 logging.basicConfig(level=logging.INFO)
 import math
@@ -40,7 +41,10 @@ from generative_recommenders.dlrm_v3.configs import (
     get_embedding_table_config,
     get_hstu_configs,
 )
-from generative_recommenders.dlrm_v3.datasets.dataset import Dataset
+from generative_recommenders.dlrm_v3.datasets.dataset import Dataset, Samples
+from generative_recommenders.dlrm_v3.datasets.synthetic_streaming import (
+    DLRMv3SyntheticStreamingDataset,
+)
 from generative_recommenders.dlrm_v3.inference.data_producer import (
     MultiThreadDataProducer,
     QueryItem,
@@ -69,6 +73,8 @@ SUPPORTED_CONFIGS = {
     "debug": "debug.gin",
     "kuairand-1k": "kuairand_1k.gin",
     "movielens-13b": "movielens_13b.gin",
+    "streaming-400m": "streaming_400m.gin",
+    "streaming-100b": "streaming_100b.gin",
 }
 
 
@@ -187,9 +193,9 @@ def add_results(
 
     if metrics is not None:
         for k, v in metrics.compute().items():
-            print(f"{k}: {v}")
+            logger.warning(f"{k}: {v}")
 
-    print(
+    logger.warning(
         "{} qps={:.2f}, avg_query_time={:.4f}, time={:.3f}, queries={}, tiles={}".format(
             final_results["scenario"],
             final_results["qps"],
@@ -199,6 +205,86 @@ def add_results(
             buckets_str,
         )
     )
+
+
+class StreamingQuerySampler:
+    """
+    Sampler for streaming dataset
+    The execution order is determined by `StreamingQuerySampler.run_order`, not by the QSL or input query ID.
+    This ensures that queries are executed according to their timestamp constraints.
+    """
+
+    def __init__(
+        self,
+        ds: DLRMv3SyntheticStreamingDataset,
+        batchsize: int,
+        dataset_percentage: float,
+    ) -> None:
+        self.ds: DLRMv3SyntheticStreamingDataset = ds
+        self.ds.is_inference = True  # TODO: consider eval
+        self.batchsize = batchsize
+        self.inference_ts: int = self.ds.total_ts - self.ds.train_ts
+        self.start_ts: int = self.ds.train_ts
+        self.num_requests: List[int] = [
+            int(
+                (self.ds.ts_to_users_cumsum[t][-1] * dataset_percentage)
+                // self.batchsize
+                * self.batchsize
+            )
+            for t in range(self.start_ts, self.start_ts + self.inference_ts)
+        ]
+        self.num_requests_cumsum: List[int] = np.cumsum(self.num_requests).tolist()
+        self.total_requests: int = sum(self.num_requests)
+        self.run_order: List[List[int]] = self.build_random_exec_order()
+        self.ts: int = self.start_ts
+        self.cnt: int = 0
+        self.last_loaded: float = -1.0
+
+    def build_random_exec_order(self) -> List[List[int]]:
+        order = []
+        for req_size in self.num_requests:
+            within_ts_order = list(range(req_size))
+            random.shuffle(within_ts_order)
+            order.append(within_ts_order)
+        return order
+
+    def init_sut(self) -> None:
+        self.ts = self.start_ts
+        self.ds.set_ts(self.start_ts)
+        self.cnt = 0
+
+    def load_query_samples(self, query_ids: List[Optional[int]]) -> None:
+        length = len(query_ids)
+        ts_idx: int = 0
+        while self.num_requests_cumsum[ts_idx] < length:
+            ts_idx += 1
+        for i in range(0, ts_idx):
+            self.ds.set_ts(i + self.start_ts)
+            self.ds.load_query_samples(self.run_order[i])
+        self.ds.set_ts(ts_idx + self.start_ts)
+        delta_length = (
+            length if ts_idx == 0 else length - self.num_requests_cumsum[ts_idx - 1]
+        )
+        self.ds.load_query_samples(self.run_order[ts_idx][:delta_length])
+        self.init_sut()
+        self.last_loaded = time.time()
+
+    def unload_query_samples(self, sample_list: List[int]) -> None:
+        self.ds.unload_query_samples(sample_list)
+
+    def get_samples(self, id_list: List[int]) -> Samples:
+        batch_size = len(id_list)
+        ts_idx: int = 0
+        while self.num_requests_cumsum[ts_idx] <= self.cnt:
+            ts_idx += 1
+        self.cnt += batch_size
+        offset = 0 if ts_idx == 0 else self.num_requests_cumsum[ts_idx - 1]
+        return self.ds.get_samples(
+            self.run_order[ts_idx][self.cnt - batch_size - offset : self.cnt - offset]
+        )
+
+    def get_item_count(self) -> int:
+        return self.total_requests
 
 
 @gin.configurable
@@ -220,9 +306,10 @@ def run(
     max_latency: Optional[float] = None,
     num_queries: Optional[int] = None,
     samples_per_query_multistream: int = 8,
-    max_num_samples: int = 2048,
+    max_num_samples: int = -1,
     numpy_rand_seed: int = 123,
     dev_mode: bool = False,
+    sparse_quant: bool = False,
     dataset_percentage: float = 1.0,
 ) -> None:
     set_dev_mode(dev_mode)
@@ -237,8 +324,10 @@ def run(
     model_family = HSTUModelFamily(
         hstu_config=hstu_config,
         table_config=table_config,
+        sparse_quant=sparse_quant,
         output_trace=output_trace,
     )
+    is_streaming: bool = "streaming" in dataset
     dataset, kwargs = get_dataset(dataset, new_path_prefix)
 
     ds: Dataset = dataset(
@@ -247,6 +336,8 @@ def run(
         is_inference=not compute_eval,
         **kwargs,
     )
+    if is_streaming:
+        ds = StreamingQuerySampler(ds, batchsize, dataset_percentage)  # pyre-ignore
     model_family.load(model_path)
 
     mlperf_conf = os.path.abspath(MLPERF_CONF)
@@ -271,6 +362,8 @@ def run(
     warmup_ids = list(range(batchsize))
     ds.load_query_samples(warmup_ids)
     for _ in range(5 * int(os.environ.get("WORLD_SIZE", 1))):
+        if is_streaming:
+            ds.init_sut()  # pyre-ignore [16]
         sample = ds.get_samples(warmup_ids)
         _ = model_family.predict(sample)
     ds.unload_query_samples(None)
@@ -278,8 +371,12 @@ def run(
         h.flush()
     logger.info("warmup done")
 
-    count = int(ds.get_item_count() * dataset_percentage)
-    train_size: int = round(train_split_percentage * count)
+    count = int(
+        ds.get_item_count() * dataset_percentage
+        if not is_streaming
+        else ds.get_item_count()
+    )
+    train_size: int = round(train_split_percentage * count) if not is_streaming else 0
 
     settings = lg.TestSettings()
     settings.FromConfig(mlperf_conf, model_path, scenario_name)
@@ -299,6 +396,8 @@ def run(
         batchsize=batchsize,
         compute_eval=compute_eval,
     )
+    if is_streaming:
+        ds.init_sut()
 
     def issue_queries(query_samples) -> None:  # pyre-ignore [2]
         if compute_eval:
@@ -329,6 +428,9 @@ def run(
         queries = math.ceil(num_queries / batchsize) * batchsize
         settings.min_query_count = queries
         settings.max_query_count = queries
+    else:
+        settings.min_query_count = count
+        settings.max_query_count = count
 
     if samples_per_query_multistream:
         settings.multi_stream_samples_per_query = samples_per_query_multistream
@@ -340,7 +442,7 @@ def run(
     sut = lg.ConstructSUT(issue_queries, flush_queries)
     qsl = lg.ConstructQSL(
         count,
-        min(count, max_num_samples),
+        min(count, max_num_samples) if max_num_samples > 0 else count,
         load_query_samples,
         ds.unload_query_samples,
     )

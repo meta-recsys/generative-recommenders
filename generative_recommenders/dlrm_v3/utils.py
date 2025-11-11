@@ -32,13 +32,16 @@ from generative_recommenders.dlrm_v3.datasets.movie_lens import DLRMv3MovieLensD
 from generative_recommenders.dlrm_v3.datasets.synthetic_movie_lens import (
     DLRMv3SyntheticMovieLensDataset,
 )
-
+from generative_recommenders.dlrm_v3.datasets.synthetic_streaming import (
+    DLRMv3SyntheticStreamingDataset,
+)
 from generative_recommenders.modules.multitask_module import (
     MultitaskTaskType,
     TaskConfig,
 )
 from torch.profiler import profile, profiler, ProfilerActivity  # pyre-ignore [21]
 from torch.utils.tensorboard import SummaryWriter
+from torchrec.metrics.accuracy import AccuracyMetricComputation
 from torchrec.metrics.auc import AUCMetricComputation
 from torchrec.metrics.mae import MAEMetricComputation
 from torchrec.metrics.mse import MSEMetricComputation
@@ -146,6 +149,14 @@ class MetricsLogger:
             for mode in ["train", "eval"]:
                 self.class_metrics[mode].append(
                     NEMetricComputation(
+                        my_rank=rank,
+                        batch_size=batch_size,
+                        n_tasks=len(all_classification_tasks),
+                        window_size=window_size,
+                    ).to(device)
+                )
+                self.class_metrics[mode].append(
+                    AccuracyMetricComputation(
                         my_rank=rank,
                         batch_size=batch_size,
                         n_tasks=len(all_classification_tasks),
@@ -263,10 +274,15 @@ SUPPORTED_DATASETS = [
     "movielens-1m",
     "movielens-20m",
     "movielens-13b",
+    "movielens-18b",
     "kuairand-1k",
+    "streaming-400m",
+    "streaming-200b",
+    "streaming-100b",
 ]
 
 
+@gin.configurable
 def get_dataset(name: str, new_path_prefix: str = ""):
     assert name in SUPPORTED_DATASETS, f"dataset {name} not supported"
     if name == "debug":
@@ -298,6 +314,15 @@ def get_dataset(name: str, new_path_prefix: str = ""):
                 ),
             },
         )
+    if name == "movielens-18b":
+        return (
+            DLRMv3SyntheticMovieLensDataset,
+            {
+                "ratings_file_prefix": os.path.join(
+                    new_path_prefix, "data/ml-18b/20x36864"
+                ),
+            },
+        )
     if name == "kuairand-1k":
         return (
             DLRMv3KuaiRandDataset,
@@ -305,5 +330,50 @@ def get_dataset(name: str, new_path_prefix: str = ""):
                 "seq_logs_file": os.path.join(
                     new_path_prefix, "data/KuaiRand-1K/data/processed_seqs.csv"
                 ),
+            },
+        )
+    if name == "streaming-400m":
+        return (
+            DLRMv3SyntheticStreamingDataset,
+            {
+                "ratings_file_prefix": os.path.join(
+                    new_path_prefix, "data/streaming-400m/"
+                ),
+                "train_ts": 8,
+                "total_ts": 10,
+                "num_files": 3,
+                "num_users": 150_000,
+                "num_items": 1_500_000,
+                "num_categories": 128,
+            },
+        )
+    if name == "streaming-200b":
+        return (
+            DLRMv3SyntheticStreamingDataset,
+            {
+                "ratings_file_prefix": os.path.join(
+                    new_path_prefix, "data/streaming-200b/"
+                ),
+                "train_ts": 90,
+                "total_ts": 100,
+                "num_files": 100,
+                "num_users": 10_000_000,
+                "num_items": 1_000_000_000,
+                "num_categories": 128,
+            },
+        )
+    if name == "streaming-100b":
+        return (
+            DLRMv3SyntheticStreamingDataset,
+            {
+                "ratings_file_prefix": os.path.join(
+                    new_path_prefix, "data/streaming-100b/"
+                ),
+                "train_ts": 90,
+                "total_ts": 100,
+                "num_files": 100,
+                "num_users": 5_000_000,
+                "num_items": 1_000_000_000,
+                "num_categories": 128,
             },
         )

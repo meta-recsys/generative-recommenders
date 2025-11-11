@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # pyre-unsafe
+import logging
 import time
 from typing import List, Optional
 
@@ -26,6 +27,8 @@ from generative_recommenders.dlrm_v3.datasets.utils import (
 )
 from generative_recommenders.modules.dlrm_hstu import DlrmHSTUConfig
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
+logger = logging.getLogger(__name__)
 
 
 class DLRMv3MovieLensDataset(DLRMv3RandomDataset):
@@ -44,6 +47,8 @@ class DLRMv3MovieLensDataset(DLRMv3RandomDataset):
                 ratings_file,
                 delimiter=",",
             )
+        assert hstu_config.action_weights is not None
+        self.action_weights: List[int] = hstu_config.action_weights
 
     def get_item_count(self):
         assert self.ratings_frame is not None
@@ -84,9 +89,11 @@ class DLRMv3MovieLensDataset(DLRMv3RandomDataset):
             data.sequence_item_ids,
             candidates_max_seq_len=max_num_candidates,
         )
-        movie_history_ratings_uih, _ = separate_uih_candidates(
-            data.sequence_ratings,
-            candidates_max_seq_len=max_num_candidates,
+        movie_history_ratings_uih, movie_history_ratings_candidates = (
+            separate_uih_candidates(
+                data.sequence_ratings,
+                candidates_max_seq_len=max_num_candidates,
+            )
         )
         movie_timestamps_uih = self.get_timestamp_uih(
             data=data,
@@ -116,13 +123,15 @@ class DLRMv3MovieLensDataset(DLRMv3RandomDataset):
             uih_kjt_lengths.append(length)
 
         uih_seq_len = len(movie_history_uih)
-        movie_dummy_weights_uih = [0.0 for _ in range(uih_seq_len)]
-        movie_dummy_watch_times_uih = [0.0 for _ in range(uih_seq_len)]
+        movie_dummy_watch_times_uih = [0 for _ in range(uih_seq_len)]
+        action_weights_uih = [
+            self.action_weights[int(rating) - 1] for rating in movie_history_ratings_uih
+        ]
         uih_kjt_values.extend(
             movie_history_uih
             + movie_history_ratings_uih
             + movie_timestamps_uih
-            + movie_dummy_weights_uih
+            + action_weights_uih
             + movie_dummy_watch_times_uih
         )
         uih_kjt_lengths.extend(
@@ -134,7 +143,9 @@ class DLRMv3MovieLensDataset(DLRMv3RandomDataset):
             ]
         )
 
-        dummy_query_time = max(movie_timestamps_uih)
+        dummy_query_time = (
+            0 if movie_timestamps_uih == [] else max(movie_timestamps_uih)
+        )
         uih_kjt_values.append(dummy_query_time)
         uih_kjt_lengths.append(1)
         uih_features_kjt = KeyedJaggedTensor(
@@ -146,18 +157,21 @@ class DLRMv3MovieLensDataset(DLRMv3RandomDataset):
         candidates_kjt_lengths = max_num_candidates * torch.ones(
             len(self._candidates_keys)
         )
+        action_weights_candidates = [
+            int(rating >= 3.5) for rating in movie_history_ratings_candidates
+        ]
         candidates_kjt_values = (
             movie_history_candidates
+            + movie_history_ratings_candidates
             + [dummy_query_time] * max_num_candidates  # item_query_time
-            + [1] * max_num_candidates  # item_dummy_weights
+            + action_weights_candidates
             + [1] * max_num_candidates  # item_dummy_watchtime
         )
         candidates_features_kjt = KeyedJaggedTensor(
             keys=self._candidates_keys,
-            lengths=torch.tensor(candidates_kjt_lengths).long(),
+            lengths=candidates_kjt_lengths.detach().clone().long(),
             values=torch.tensor(candidates_kjt_values).long(),
         )
-
         return (
             uih_features_kjt,
             candidates_features_kjt,
