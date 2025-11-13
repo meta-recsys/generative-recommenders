@@ -72,12 +72,13 @@ class StreamingSyntheticDataGenerator:
         eval: bool,
         inference: bool,
         file_idx: int,
+        ts_buffers: Dict[int, List[int]],
     ) -> Tuple[List[int], List[float], List[int], List[float], Dict[int, int]]:
+        # Buffer timestamp data in memory instead of writing immediately
         if t >= 0 and (not eval):
-            output_file = output_folder + f"ts_{file_idx}_{t}.csv"
-            with open(output_file, "a") as file:
-                file.write(f"{id}\n")
-                file.flush()
+            if t not in ts_buffers:
+                ts_buffers[t] = []
+            ts_buffers[t].append(id)
         seq_len: int = self.num_inference_candidates if inference else uih_seq_len
         self.total_cnt += seq_len
         alpha = random.randint(self.alpha_range[0], self.alpha_range[1])
@@ -196,7 +197,7 @@ class StreamingSyntheticDataGenerator:
         return sample
 
     def generate_one_user(
-        self, id: int, output_folder: str, file_idx: int
+        self, id: int, output_folder: str, file_idx: int, ts_buffers: Dict[int, List[int]]
     ) -> List[str]:
         categories = random.sample(range(self.num_categories), self.categories_per_user)
         category_to_cnt = {c: 0 for c in categories}
@@ -218,6 +219,7 @@ class StreamingSyntheticDataGenerator:
             eval=False,
             inference=False,
             file_idx=file_idx,
+            ts_buffers=ts_buffers,
         )
         out_list.append(",".join([str(ind) for ind in sample_candidate_inds]))
         out_list.append(",".join([str(rat) for rat in sample_candidate_ratings]))
@@ -242,6 +244,7 @@ class StreamingSyntheticDataGenerator:
                     eval=False,
                     inference=False,
                     file_idx=file_idx,
+                    ts_buffers=ts_buffers,
                 )
                 out_list.append(",".join([str(ind) for ind in sample_candidate_inds]))
                 out_list.append(
@@ -268,6 +271,7 @@ class StreamingSyntheticDataGenerator:
             eval=True,
             inference=False,
             file_idx=file_idx,
+            ts_buffers=ts_buffers,
         )
         out_list.append(",".join([str(ind) for ind in sample_candidate_inds]))
         out_list.append(",".join([str(rat) for rat in sample_candidate_ratings]))
@@ -294,6 +298,7 @@ class StreamingSyntheticDataGenerator:
                     eval=False,
                     inference=True,
                     file_idx=file_idx,
+                    ts_buffers=ts_buffers,
                 )
                 out_list.append(",".join([str(ind) for ind in sample_candidate_inds]))
                 out_list.append(
@@ -311,7 +316,12 @@ class StreamingSyntheticDataGenerator:
         t0 = time.time()
         num_users_per_file = self.num_users // num_files
         user_id: int = num_users_per_file * file_idx
+        random.seed(seed + file_idx)
         np.random.seed(seed + file_idx)
+        
+        # Buffer timestamp data in memory to avoid excessive file I/O
+        ts_buffers: Dict[int, List[int]] = {}
+        
         output_file = output_folder + f"{file_idx}.csv"
         with open(output_file, "w") as file:
             writer = csv.writer(file)
@@ -320,6 +330,7 @@ class StreamingSyntheticDataGenerator:
                     id=user_id,
                     output_folder=output_folder,
                     file_idx=file_idx,
+                    ts_buffers=ts_buffers,
                 )
                 user_id += 1
                 writer.writerow(out_list)
@@ -327,6 +338,14 @@ class StreamingSyntheticDataGenerator:
                     logger.warning(
                         f"rank {self.rank}: Done with users {i} for file {file_idx + 1} / {num_files}, total_cnt = {self.total_cnt}, spends {time.time() - t0} seconds."
                     )
+        # Write buffered timestamp data after all users are processed
+        for ts, user_ids in ts_buffers.items():
+            ts_file = output_folder + f"ts_{file_idx}_{ts}.csv"
+            with open(ts_file, "w") as f:
+                writer = csv.writer(f)
+                for uid in user_ids:
+                    writer.writerow([uid])
+        logger.warning(f"rank {self.rank}: Wrote {len(ts_buffers)} timestamp files for file {file_idx}")
 
 
 def worker(
