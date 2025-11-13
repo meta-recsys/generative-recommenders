@@ -27,6 +27,7 @@ import triton.language as tl
 
 from generative_recommenders.common import (
     autotune_max_seq_len,
+    fine_grained_autotune_max_seq_len,
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
@@ -704,7 +705,7 @@ def triton_jagged_dense_bmm_add_fwd(
         Dense=dense,
         Bias=bias,
         Out=out,
-        AUTOTUNE_MAX_SEQ_LEN=autotune_max_seq_len(max_seq_len),
+        AUTOTUNE_MAX_SEQ_LEN=fine_grained_autotune_max_seq_len(max_seq_len),
         N=N,
         K=K,
         stride_jm=jagged.stride(0),
