@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 #!/usr/bin/env python3
 
 from typing import List, Optional, Tuple
@@ -287,7 +286,13 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
 
         # Add TLX configs if TLX is available
         if HAS_TLX:
-            if torch.cuda.get_device_capability()[0] == 9:
+            try:
+                device_capability = torch.cuda.get_device_capability()[0]
+            except (RuntimeError, AssertionError):
+                # No CUDA device available
+                device_capability = None
+
+            if device_capability == 9:
                 # H100 configs
                 configs.append(
                     triton.Config(
