@@ -289,6 +289,63 @@ def autotune_max_seq_len(runtime_max_seq_len: int) -> int:
         return STATIC_MAX_SEQ_LENS[-1]
 
 
+def fine_grained_autotune_max_seq_len(runtime_max_seq_len: int) -> int:
+    global USE_RUNTIME_MAX_SEQ_LEN
+
+    if USE_RUNTIME_MAX_SEQ_LEN:
+        return _fine_grained_bucket_size(runtime_max_seq_len)
+    else:
+        if STATIC_MAX_SEQ_LENS == []:
+            return 1
+        for max_len in STATIC_MAX_SEQ_LENS:
+            if max_len >= runtime_max_seq_len:
+                return max_len
+        return STATIC_MAX_SEQ_LENS[-1]
+
+
+def _generate_fine_grained_buckets() -> List[int]:
+    buckets = [
+        1024,
+        2048,
+        4096,
+        8192,
+        12288,
+        16384,
+        24576,
+        32768,
+        40960,
+        49152,
+        65536,
+        81920,
+        98304,
+    ]
+    return buckets
+
+
+@torch.fx.wrap
+def _fine_grained_bucket_size(x: int) -> int:
+    if torch.compiler.is_compiling():
+        x_tensor = torch.scalar_tensor(x, dtype=torch.int64)
+        buckets = torch.tensor(_generate_fine_grained_buckets(), dtype=torch.int64)
+
+        mask = buckets >= x_tensor
+        valid_buckets = torch.where(
+            mask, buckets, torch.tensor(2**31 - 1, dtype=torch.int64)
+        )
+
+        result = torch.where(mask.any(), valid_buckets.min(), buckets[-1])
+
+        return int(result.item())
+    else:
+        buckets = _generate_fine_grained_buckets()
+
+        for bucket in buckets:
+            if x <= bucket:
+                return bucket
+
+        return buckets[-1]
+
+
 @torch.fx.wrap
 def fx_unwrap_optional_tensor(optional: Optional[torch.Tensor]) -> torch.Tensor:
     assert optional is not None, "Expected optional to be non-None Tensor"
