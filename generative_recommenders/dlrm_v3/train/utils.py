@@ -34,7 +34,7 @@ import gin
 
 import torch
 import torchrec
-from generative_recommenders.dlrm_v3.checkpoint import save_dmp_checkpoint
+from generative_recommenders.dlrm_v3.checkpoint import save_dmp_checkpoint, save_dmp_checkpoint_single_rank
 from generative_recommenders.dlrm_v3.configs import (
     get_embedding_table_config,
     get_hstu_configs,
@@ -750,7 +750,7 @@ def streaming_train_eval_loop(
         if (
             train_ts % checkpoint_frequency == 0 and train_ts > 0
         ) or train_ts == num_train_ts - 1:
-            save_dmp_checkpoint(
+            save_dmp_checkpoint_single_rank(
                 model=model,
                 optimizer=optimizer,
                 metric_logger=metric_logger,

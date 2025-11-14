@@ -29,6 +29,7 @@ import torchrec
 from generative_recommenders.dlrm_v3.checkpoint import (
     load_nonsparse_checkpoint,
     load_sparse_checkpoint,
+    load_sparse_checkpoint_single_rank,
 )
 from generative_recommenders.dlrm_v3.datasets.dataset import Samples
 from generative_recommenders.dlrm_v3.inference.inference_modules import (
@@ -131,7 +132,8 @@ class ModelFamilySparseDist:
             table_config=self.table_config,
             hstu_config=self.hstu_config,
         )
-        load_sparse_checkpoint(model=sparse_arch._hstu_model, path=model_path)
+        # load_sparse_checkpoint(model=sparse_arch._hstu_model, path=model_path)
+        load_sparse_checkpoint_single_rank(model=sparse_arch._hstu_model, path=model_path)
         sparse_arch.eval()
         if self.quant:
             self.module = quant.quantize_dynamic(

@@ -22,7 +22,7 @@ from generative_recommenders.modules.multitask_module import (
 )
 from torchrec.modules.embedding_configs import DataType, EmbeddingConfig
 
-HSTU_EMBEDDING_DIM = 256  # TODO: change to 512 for the final DLRMv3 model
+HSTU_EMBEDDING_DIM = 512
 HASH_SIZE = 10_000_000
 
 
