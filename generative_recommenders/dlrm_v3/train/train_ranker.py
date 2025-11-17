@@ -75,7 +75,7 @@ def _main_func(
     gin.parse_config_file(gin_file)
 
     model, model_configs, embedding_table_configs = make_model()
-    model, optimizer = make_optimizer_and_shard(model=model, device=device)
+    model, optimizer = make_optimizer_and_shard(model=model, device=device, world_size=world_size)
     train_dataloader, test_dataloader = make_train_test_dataloaders(
         hstu_config=model_configs,
         embedding_table_configs=embedding_table_configs,

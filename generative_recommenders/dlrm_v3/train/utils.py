@@ -60,6 +60,9 @@ from torchrec.modules.embedding_modules import (
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import in_backward_optimizer_filter
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
+from torchrec.distributed.sharding_plan import get_default_sharders
+from torchrec.distributed.types import ShardingEnv
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -254,6 +257,7 @@ def sparse_optimizer_factory_and_class(
 def make_optimizer_and_shard(
     model: torch.nn.Module,
     device: torch.device,
+    world_size: int,
 ) -> Tuple[DistributedModelParallel, torch.optim.Optimizer]:
     dense_opt_cls, dense_opt_args, dense_opt_factory = (
         dense_optimizer_factory_and_class()
@@ -270,13 +274,31 @@ def make_optimizer_and_shard(
                     apply_optimizer_in_backward(
                         sparse_opt_cls, [param], sparse_opt_args
                     )
+    sharders = get_default_sharders()
+    planner = EmbeddingShardingPlanner(
+        topology=Topology(
+            local_world_size=world_size,
+            world_size=world_size,
+            compute_device="cuda",
+            hbm_cap=160 * 1024 * 1024 * 1024,
+            ddr_cap=32 * 1024 * 1024 * 1024,
+        )
+    )
+    pg = dist.GroupMember.WORLD
+    env = ShardingEnv.from_process_group(pg)
+    pg = env.process_group
+   
+    plan = planner.collective_plan(model, sharders, pg)
+
+
 
     # Shard model
     model = DistributedModelParallel(
         module=model,
         device=device,
+        plan=plan,
+        sharders=sharders,
     )
-
     # Create keyed optimizer
     all_optimizers = []
     all_params = {}
