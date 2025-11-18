@@ -51,7 +51,9 @@ from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader, Dataset as TorchDataset
 from torch.utils.data.distributed import _T_co, DistributedSampler
 from torchrec.distributed.model_parallel import DistributedModelParallel
-from torchrec.distributed.types import ShardedTensor
+from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
+from torchrec.distributed.sharding_plan import get_default_sharders
+from torchrec.distributed.types import ShardedTensor, ShardingEnv
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
@@ -254,6 +256,7 @@ def sparse_optimizer_factory_and_class(
 def make_optimizer_and_shard(
     model: torch.nn.Module,
     device: torch.device,
+    world_size: int,
 ) -> Tuple[DistributedModelParallel, torch.optim.Optimizer]:
     dense_opt_cls, dense_opt_args, dense_opt_factory = (
         dense_optimizer_factory_and_class()
@@ -270,13 +273,29 @@ def make_optimizer_and_shard(
                     apply_optimizer_in_backward(
                         sparse_opt_cls, [param], sparse_opt_args
                     )
+    sharders = get_default_sharders()
+    planner = EmbeddingShardingPlanner(
+        topology=Topology(
+            local_world_size=world_size,
+            world_size=world_size,
+            compute_device="cuda",
+            hbm_cap=160 * 1024 * 1024 * 1024,
+            ddr_cap=32 * 1024 * 1024 * 1024,
+        )
+    )
+    pg = dist.GroupMember.WORLD
+    env = ShardingEnv.from_process_group(pg)  # pyre-ignore [6]
+    pg = env.process_group
+
+    plan = planner.collective_plan(model, sharders, pg)
 
     # Shard model
     model = DistributedModelParallel(
         module=model,
         device=device,
+        plan=plan,
+        sharders=sharders,
     )
-
     # Create keyed optimizer
     all_optimizers = []
     all_params = {}
