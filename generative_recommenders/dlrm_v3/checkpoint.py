@@ -14,6 +14,7 @@
 
 # pyre-strict
 
+import gc
 import os
 from datetime import datetime
 from typing import Any, Dict, Optional, Set
@@ -143,10 +144,12 @@ def load_sparse_checkpoint(
         k for k, v in model.state_dict().items() if is_sparse_key(k, v)
     }
     sparse_dict = {"sparse_dict": SparseState(model, sparse_tensor_keys)}
+    gc.collect()
     torch.distributed.checkpoint.load(
         sparse_dict,
         storage_reader=torch.distributed.checkpoint.FileSystemReader(sparse_path),
     )
+    gc.collect()
     print("sparse checkpoint successfully loaded")
 
 

@@ -1,10 +1,10 @@
-run.model_path = ""
+run.model_path = "/home/linjianma/ckpts/streaming_100b/89/"
 run.scenario_name = "Server"
 run.batchsize = 5
 run.out_dir = ""
 run.output_trace = False
 run.data_producer_threads = 8
-run.compute_eval = False
+run.compute_eval = True
 run.find_peak_performance = False
 run.train_split_percentage = 0.75
 run.dev_mode = False

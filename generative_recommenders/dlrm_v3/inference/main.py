@@ -74,7 +74,7 @@ SUPPORTED_CONFIGS = {
     "kuairand-1k": "kuairand_1k.gin",
     "movielens-13b": "movielens_13b.gin",
     "streaming-400m": "streaming_400m.gin",
-    "streaming-100b": "streaming_100b.gin",
+    "sampled-streaming-100b": "streaming_100b.gin",
 }
 
 
@@ -142,9 +142,9 @@ class Runner:
                 assert mt_target_weights is not None
                 assert self.metrics is not None
                 self.metrics.update(
-                    predictions=mt_target_preds.t(),
-                    labels=mt_target_labels.t(),
-                    weights=mt_target_weights.t(),
+                    predictions=mt_target_preds,
+                    labels=mt_target_labels,
+                    weights=mt_target_weights,
                 )
             self.result_timing.append(time.time() - t0)
             self.result_batches.append(len(qitem.query_ids))
@@ -221,7 +221,7 @@ class StreamingQuerySampler:
         dataset_percentage: float,
     ) -> None:
         self.ds: DLRMv3SyntheticStreamingDataset = ds
-        self.ds.is_inference = True  # TODO: consider eval
+        self.ds.is_inference = True
         self.batchsize = batchsize
         self.inference_ts: int = self.ds.total_ts - self.ds.train_ts
         self.start_ts: int = self.ds.train_ts
@@ -315,9 +315,13 @@ def run(
     set_dev_mode(dev_mode)
     if scenario_name not in SCENARIO_MAP:
         raise NotImplementedError("valid scanarios:" + str(list(SCENARIO_MAP.keys())))
+    scenario = SCENARIO_MAP[scenario_name]
+    if scenario != lg.TestScenario.Server or compute_eval:
+        batchsize = 1
     np.random.seed(numpy_rand_seed)
 
     hstu_config = get_hstu_configs(dataset)
+    hstu_config.max_num_candidates = hstu_config.max_num_candidates_inference
     table_config = get_embedding_table_config(dataset)
     set_is_inference(is_inference=not compute_eval)
 
@@ -353,10 +357,6 @@ def run(
         output_dir = os.path.abspath(out_dir)
         os.makedirs(output_dir, exist_ok=True)
         os.chdir(output_dir)
-
-    scenario = SCENARIO_MAP[scenario_name]
-    if scenario != lg.TestScenario.Server or compute_eval:
-        batchsize = 1
 
     # warmup
     warmup_ids = list(range(batchsize))

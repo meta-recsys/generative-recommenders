@@ -6,6 +6,7 @@ import math
 import multiprocessing
 import os
 import random
+import shutil
 import time
 from typing import Dict, List, Tuple
 
@@ -454,6 +455,23 @@ def write_ts_metadata(output_folder: str, total_ts: int, num_files: int) -> None
         writer.writerow([",".join([str(offset) for offset in offsets])])
 
 
+def copy_sub_dataset(src_folder: str) -> None:
+    dst_folder = src_folder + "sampled_data/"
+    files_to_copy = [
+        "0.csv",
+        "offset.csv",
+        "requests_per_ts.csv",
+        "requests_per_ts_offset.csv",
+        "users_cumsum_per_ts.csv",
+    ]
+    os.makedirs(dst_folder, exist_ok=True)
+    for filename in files_to_copy:
+        src_path = os.path.join(src_folder, filename)
+        dst_path = os.path.join(dst_folder, filename)
+        shutil.copy2(src_path, dst_path)
+    logger.warning("Files copied successfully.")
+
+
 def main() -> None:
     processes = []
     num_files = 100
@@ -496,6 +514,7 @@ def main() -> None:
         p.join()
     write_offset(output_folder, num_files, num_users)
     write_ts_metadata(output_folder, num_timestamps, num_files)
+    copy_sub_dataset(src_folder=output_folder)
 
 
 if __name__ == "__main__":
