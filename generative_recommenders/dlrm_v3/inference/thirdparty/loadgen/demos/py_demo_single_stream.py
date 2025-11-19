@@ -38,23 +38,24 @@ def unload_samples_from_ram(query_samples):
 
 def process_query_async(query_samples):
     """Processes the list of queries."""
-    time.sleep(.001)
+    time.sleep(0.001)
     responses = []
     response_array = array.array(
-        "f", [0, 1, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 254, 255])
+        "f", [0, 1, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 254, 255]
+    )
     response_info = response_array.buffer_info()
     response_data = response_info[0]
     response_size = response_info[1] * response_array.itemsize
     for s in query_samples:
         responses.append(
             mlperf_loadgen.QuerySampleResponse(
-                s.id, response_data, response_size))
+                s.id, response_data, response_size)
+        )
     mlperf_loadgen.QuerySamplesComplete(responses)
 
 
 def issue_query(query_samples):
-    threading.Thread(target=process_query_async,
-                     args=[query_samples]).start()
+    threading.Thread(target=process_query_async, args=[query_samples]).start()
 
 
 def flush_queries():
@@ -72,7 +73,8 @@ def main(argv):
 
     sut = mlperf_loadgen.ConstructSUT(issue_query, flush_queries)
     qsl = mlperf_loadgen.ConstructQSL(
-        1024, 128, load_samples_to_ram, unload_samples_from_ram)
+        1024, 128, load_samples_to_ram, unload_samples_from_ram
+    )
     mlperf_loadgen.StartTest(sut, qsl, settings)
     mlperf_loadgen.DestroyQSL(qsl)
     mlperf_loadgen.DestroySUT(sut)

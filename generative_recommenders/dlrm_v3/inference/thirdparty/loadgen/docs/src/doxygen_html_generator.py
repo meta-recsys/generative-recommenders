@@ -13,7 +13,7 @@
 # limitations under the License.
 # =============================================================================
 
-## \file
+# \file
 #  \brief A script that sets the environment variables expected by doxygen.cfg.
 #  \details This can be run manually without any arguments, but also allows a
 #  build system to customize the output directory.

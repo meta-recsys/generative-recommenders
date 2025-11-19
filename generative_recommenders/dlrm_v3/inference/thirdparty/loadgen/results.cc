@@ -11,6 +11,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include "results.h"
+
 #include "early_stopping.h"
 #include "utils.h"
 
@@ -55,7 +56,7 @@ void PerformanceSummary::ProcessLatencies() {
                          max_latency);
   }
 
-  if (settings.use_token_latencies){
+  if (settings.use_token_latencies) {
     ProcessTokenLatencies();
   }
 
@@ -85,9 +86,8 @@ void PerformanceSummary::ProcessLatencies() {
 void PerformanceSummary::ProcessTokenLatencies() {
   constexpr auto nTokenInvalid = std::numeric_limits<int64_t>::min();
   token_count = 0;
-  for (auto n_tokens: pr.token_results.tokens_per_sample){
-    if (n_tokens != nTokenInvalid)
-      token_count += n_tokens;
+  for (auto n_tokens : pr.token_results.tokens_per_sample) {
+    if (n_tokens != nTokenInvalid) token_count += n_tokens;
   }
   if (pr.token_results.first_token_latencies.empty()) {
     return;
@@ -102,29 +102,37 @@ void PerformanceSummary::ProcessTokenLatencies() {
     accumulated_tpot += latency;
   }
   time_per_output_token_mean = accumulated_tpot / sample_count;
-  std::sort(pr.token_results.first_token_latencies.begin(), 
-    pr.token_results.first_token_latencies.end());
+  std::sort(pr.token_results.first_token_latencies.begin(),
+            pr.token_results.first_token_latencies.end());
   std::sort(pr.token_results.time_per_output_token_arr.begin(),
-    pr.token_results.time_per_output_token_arr.end());
-  
+            pr.token_results.time_per_output_token_arr.end());
+
   token_target_latency_percentile.sample_latency =
-      pr.token_results.first_token_latencies[sample_count * token_target_latency_percentile.percentile];
+      pr.token_results
+          .first_token_latencies[sample_count *
+                                 token_target_latency_percentile.percentile];
   first_token_latency_min = pr.token_results.first_token_latencies.front();
   first_token_latency_max = pr.token_results.first_token_latencies.back();
   for (auto& lp : token_latency_percentiles) {
     assert(lp.percentile >= 0.0);
     assert(lp.percentile < 1.0);
-    lp.sample_latency = pr.token_results.first_token_latencies[sample_count * lp.percentile];
+    lp.sample_latency =
+        pr.token_results.first_token_latencies[sample_count * lp.percentile];
   }
 
   target_tpot_percentile.sample_latency =
-      pr.token_results.time_per_output_token_arr[sample_count * target_tpot_percentile.percentile];
-  time_per_output_token_min = pr.token_results.time_per_output_token_arr.front();
+      pr.token_results
+          .time_per_output_token_arr[sample_count *
+                                     target_tpot_percentile.percentile];
+  time_per_output_token_min =
+      pr.token_results.time_per_output_token_arr.front();
   time_per_output_token_max = pr.token_results.time_per_output_token_arr.back();
   for (auto& lp : tpot_percentiles) {
     assert(lp.percentile >= 0.0);
     assert(lp.percentile < 1.0);
-    lp.sample_latency = pr.token_results.time_per_output_token_arr[sample_count * lp.percentile];
+    lp.sample_latency =
+        pr.token_results
+            .time_per_output_token_arr[sample_count * lp.percentile];
   }
 
   if (settings.scenario == TestScenario::Server) {
@@ -132,16 +140,17 @@ void PerformanceSummary::ProcessTokenLatencies() {
     QuerySampleLatency max_latency = settings.target_latency.count() + 1;
     overlatency_first_token_count =
         pr.token_results.first_token_latencies.end() -
-        std::lower_bound(pr.token_results.first_token_latencies.begin(), pr.token_results.first_token_latencies.end(),
+        std::lower_bound(pr.token_results.first_token_latencies.begin(),
+                         pr.token_results.first_token_latencies.end(),
                          max_latency);
   }
-
 }
 
-bool PerformanceSummary::EarlyStopping(std::string* recommendation, int64_t queries_issued, 
-                                        std::vector<QuerySampleLatency>* sample_latencies,
-                                        std::vector<QuerySampleLatency>* query_latencies,
-                                        std::chrono::nanoseconds target_latency) {
+bool PerformanceSummary::EarlyStopping(
+    std::string* recommendation, int64_t queries_issued,
+    std::vector<QuerySampleLatency>* sample_latencies,
+    std::vector<QuerySampleLatency>* query_latencies,
+    std::chrono::nanoseconds target_latency) {
   recommendation->clear();
 
   MinPassingQueriesFinder find_min_passing;
@@ -180,7 +189,7 @@ bool PerformanceSummary::EarlyStopping(std::string* recommendation, int64_t quer
           std::to_string(queries_issued) + ").\n" + " * Would discard " +
           std::to_string(t - 1) + " highest latency queries.\n" +
           " * Early stopping " +
-          DoubleToString(target_latency_percentile.percentile * 100, 0) +
+          DoubleToString(target_latency_percentile.percentile * 100, 1) +
           "th percentile estimate: " + std::to_string(percentile_estimate);
       early_stopping_latency_ss = percentile_estimate;
 
@@ -193,7 +202,7 @@ bool PerformanceSummary::EarlyStopping(std::string* recommendation, int64_t quer
       if (queries_issued < h_min + 1) {
         *recommendation +=
             "\n * Not enough queries processed for " +
-            DoubleToString(multi_stream_percentile * 100, 0) +
+            DoubleToString(multi_stream_percentile * 100, 1) +
             "th percentile\n" +
             " early stopping estimate (would need to process at\n least " +
             std::to_string(h_min + 1) + " total queries).";
@@ -209,7 +218,7 @@ bool PerformanceSummary::EarlyStopping(std::string* recommendation, int64_t quer
         percentile_estimate = (*sample_latencies)[queries_issued - t];
         *recommendation +=
             "\n * Early stopping " +
-            DoubleToString(multi_stream_percentile * 100, 0) +
+            DoubleToString(multi_stream_percentile * 100, 1) +
             "th percentile estimate: " + std::to_string(percentile_estimate);
         early_stopping_latency_ms = percentile_estimate;
       }
@@ -264,7 +273,7 @@ bool PerformanceSummary::EarlyStopping(std::string* recommendation, int64_t quer
           std::to_string(queries_issued) + ").\n" + " * Would discard " +
           std::to_string(t - 1) + " highest latency queries.\n" +
           " * Early stopping " +
-          DoubleToString(target_latency_percentile.percentile * 100, 0) +
+          DoubleToString(target_latency_percentile.percentile * 100, 1) +
           "th percentile estimate: " + std::to_string(percentile_estimate);
       early_stopping_latency_ms = percentile_estimate;
       break;
@@ -336,25 +345,29 @@ bool PerformanceSummary::PerfConstraintsMet(std::string* recommendation) {
       break;
     case TestScenario::Server:
       ProcessLatencies();
-      if (!settings.use_token_latencies){
+      if (!settings.use_token_latencies) {
         if (target_latency_percentile.sample_latency >
             settings.target_latency.count()) {
           *recommendation = "Reduce target QPS to improve latency.";
           perf_constraints_met = false;
         }
       } else {
-        if ( token_target_latency_percentile.sample_latency >
+        if (token_target_latency_percentile.sample_latency >
             settings.server_ttft_latency) {
-          *recommendation = "TTFT constrain not met: Reduce target QPS to improve latency.";
+          *recommendation =
+              "TTFT constrain not met: Reduce target QPS to improve latency.";
           perf_constraints_met = false;
         }
 
-        if ( target_tpot_percentile.sample_latency >
+        if (target_tpot_percentile.sample_latency >
             settings.server_tpot_latency) {
-          if (recommendation->empty()){
-            *recommendation = "TPOT constrain not met: Reduce target QPS to improve latency.";
+          if (recommendation->empty()) {
+            *recommendation =
+                "TPOT constrain not met: Reduce target QPS to improve latency.";
           } else {
-            recommendation->append("\n * TPOT constrain not met: Reduce target QPS to improve latency.");
+            recommendation->append(
+                "\n * TPOT constrain not met: Reduce target QPS to improve "
+                "latency.");
           }
           perf_constraints_met = false;
         }
@@ -379,13 +392,13 @@ void PerformanceSummary::LogSummary(AsyncSummary& summary) {
 
   switch (settings.scenario) {
     case TestScenario::SingleStream: {
-        summary(DoubleToString(target_latency_percentile.percentile * 100, 0) +
-                    "th percentile latency (ns) : ",
-                target_latency_percentile.sample_latency);
-        break;
+      summary(DoubleToString(target_latency_percentile.percentile * 100, 1) +
+                  "th percentile latency (ns) : ",
+              target_latency_percentile.sample_latency);
+      break;
     }
     case TestScenario::MultiStream: {
-      summary(DoubleToString(target_latency_percentile.percentile * 100, 0) +
+      summary(DoubleToString(target_latency_percentile.percentile * 100, 1) +
                   "th percentile latency (ns) : ",
               target_latency_percentile.query_latency);
       break;
@@ -401,7 +414,7 @@ void PerformanceSummary::LogSummary(AsyncSummary& summary) {
       //    1000 queries / 1 second.
       // TODO: make a more permanent solution
       double qps_as_completed =
-        (sample_count - 1) / pr.final_query_all_samples_done_time;
+          (sample_count - 1) / pr.final_query_all_samples_done_time;
       summary("Completed samples per second    : ",
               DoubleToString(qps_as_completed));
       break;
@@ -413,16 +426,18 @@ void PerformanceSummary::LogSummary(AsyncSummary& summary) {
     }
   }
 
-  if (settings.use_token_latencies){
+  if (settings.use_token_latencies) {
     switch (settings.scenario) {
       case TestScenario::SingleStream: {
-      summary(DoubleToString(token_target_latency_percentile.percentile * 100, 0) +
-                  "th first token percentile latency (ns) : ",
-              token_target_latency_percentile.sample_latency);
-      break;
+        summary(DoubleToString(token_target_latency_percentile.percentile * 100,
+                               1) +
+                    "th first token percentile latency (ns) : ",
+                token_target_latency_percentile.sample_latency);
+        break;
       }
       case TestScenario::MultiStream: {
-        summary(DoubleToString(token_target_latency_percentile.percentile * 100, 0) +
+        summary(DoubleToString(token_target_latency_percentile.percentile * 100,
+                               1) +
                     "th first token percentile latency (ns) : ",
                 token_target_latency_percentile.sample_latency);
         break;
@@ -441,7 +456,7 @@ void PerformanceSummary::LogSummary(AsyncSummary& summary) {
     }
   }
 
-  if (settings.infer_token_latencies){
+  if (settings.infer_token_latencies) {
     switch (settings.scenario) {
       case TestScenario::SingleStream: {
         break;
@@ -450,13 +465,15 @@ void PerformanceSummary::LogSummary(AsyncSummary& summary) {
         break;
       }
       case TestScenario::Offline: {
-        double tokens_per_second = settings.token_latency_scaling_factor * sample_count / pr.max_latency;
+        double tokens_per_second = settings.token_latency_scaling_factor *
+                                   sample_count / pr.max_latency;
         summary("Tokens per second (inferred): ", tokens_per_second);
         break;
       }
       case TestScenario::Server:
-        double tps_as_completed =
-          settings.token_latency_scaling_factor * (sample_count - 1) / pr.final_query_all_samples_done_time;
+        double tps_as_completed = settings.token_latency_scaling_factor *
+                                  (sample_count - 1) /
+                                  pr.final_query_all_samples_done_time;
         summary("Completed tokens per second (inferred): ",
                 DoubleToString(tps_as_completed));
         break;
@@ -472,23 +489,20 @@ void PerformanceSummary::LogSummary(AsyncSummary& summary) {
   bool min_duration_met = MinDurationMet(&min_duration_recommendation);
   bool min_queries_met = MinQueriesMet() && MinSamplesMet();
   bool early_stopping_met = true;
-  if (!settings.use_token_latencies){
-    early_stopping_met = EarlyStopping(&early_stopping_recommendation,
-                                        pr.queries_issued, 
-                                        &pr.sample_latencies, 
-                                        &pr.query_latencies,
-                                        settings.target_latency);
+  if (!settings.use_token_latencies) {
+    early_stopping_met = EarlyStopping(
+        &early_stopping_recommendation, pr.queries_issued, &pr.sample_latencies,
+        &pr.query_latencies, settings.target_latency);
   } else {
-    early_stopping_met = EarlyStopping(&early_stopping_tpot_recommendation,
-                                        pr.queries_issued, 
-                                        &pr.token_results.time_per_output_token_arr, 
-                                        &pr.query_latencies,
-                                        std::chrono::nanoseconds(settings.server_tpot_latency)) && 
-                          EarlyStopping(&early_stopping_ttft_recommendation,
-                                        pr.queries_issued, 
-                                        &pr.token_results.first_token_latencies, 
-                                        &pr.query_latencies,
-                                        std::chrono::nanoseconds(settings.server_ttft_latency));
+    early_stopping_met =
+        EarlyStopping(&early_stopping_tpot_recommendation, pr.queries_issued,
+                      &pr.token_results.time_per_output_token_arr,
+                      &pr.query_latencies,
+                      std::chrono::nanoseconds(settings.server_tpot_latency)) &&
+        EarlyStopping(&early_stopping_ttft_recommendation, pr.queries_issued,
+                      &pr.token_results.first_token_latencies,
+                      &pr.query_latencies,
+                      std::chrono::nanoseconds(settings.server_ttft_latency));
   }
   bool perf_constraints_met =
       PerfConstraintsMet(&perf_constraints_recommendation);
@@ -521,7 +535,7 @@ void PerformanceSummary::LogSummary(AsyncSummary& summary) {
   if (settings.scenario == TestScenario::SingleStream ||
       settings.scenario == TestScenario::Server ||
       settings.scenario == TestScenario::MultiStream) {
-    if (!settings.use_token_latencies){
+    if (!settings.use_token_latencies) {
       summary("Early Stopping Result:");
       summary(early_stopping_recommendation);
     } else {
@@ -547,9 +561,9 @@ void PerformanceSummary::LogSummary(AsyncSummary& summary) {
   } else if (settings.scenario == TestScenario::Server) {
     // Scheduled samples per second as an additional stat
     double qps_as_scheduled =
-          (sample_count - 1) / pr.final_query_scheduled_time;
-      summary("Scheduled samples per second : ",
-              DoubleToString(qps_as_scheduled));
+        (sample_count - 1) / pr.final_query_scheduled_time;
+    summary("Scheduled samples per second : ",
+            DoubleToString(qps_as_scheduled));
   } else if (settings.scenario == TestScenario::MultiStream) {
     summary("Per-query latency:  ");
     summary("Min latency (ns)                : ", query_latency_min);
@@ -572,14 +586,16 @@ void PerformanceSummary::LogSummary(AsyncSummary& summary) {
           lp.sample_latency);
     }
   }
-  if (settings.use_token_latencies){
+  if (settings.use_token_latencies) {
     summary("");
     if (settings.scenario == TestScenario::SingleStream) {
-    double tps_w_lg = token_count / pr.final_query_issued_time;
-    double tps_wo_lg = ((double)token_count) / (QuerySampleLatencyToSeconds(sample_latency_mean) * sample_count);
-    summary("TPS w/ loadgen overhead         : " + DoubleToString(tps_w_lg));
-    summary("TPS w/o loadgen overhead        : " + DoubleToString(tps_wo_lg));
-    
+      double tps_w_lg = token_count / pr.final_query_issued_time;
+      double tps_wo_lg =
+          ((double)token_count) /
+          (QuerySampleLatencyToSeconds(sample_latency_mean) * sample_count);
+      summary("TPS w/ loadgen overhead         : " + DoubleToString(tps_w_lg));
+      summary("TPS w/o loadgen overhead        : " + DoubleToString(tps_wo_lg));
+
     } else if (settings.scenario == TestScenario::Server) {
       double tps_as_completed =
           token_count / pr.final_query_all_samples_done_time;
@@ -588,22 +604,28 @@ void PerformanceSummary::LogSummary(AsyncSummary& summary) {
     }
 
     if (settings.scenario != TestScenario::Offline) {
-      summary("Min First Token latency (ns)                : ", first_token_latency_min);
-      summary("Max First Token latency (ns)                : ", first_token_latency_max);
-      summary("Mean First Token latency (ns)               : ", first_token_latency_mean);
+      summary("Min First Token latency (ns)                : ",
+              first_token_latency_min);
+      summary("Max First Token latency (ns)                : ",
+              first_token_latency_max);
+      summary("Mean First Token latency (ns)               : ",
+              first_token_latency_mean);
       for (auto& lp : token_latency_percentiles) {
-        summary(
-            DoubleToString(lp.percentile * 100) + " percentile first token latency (ns)   : ",
-            lp.sample_latency);
+        summary(DoubleToString(lp.percentile * 100) +
+                    " percentile first token latency (ns)   : ",
+                lp.sample_latency);
       }
       summary("");
-      summary("Min Time to Output Token (ns)                : ", time_per_output_token_min);
-      summary("Max Time to Output Token (ns)                : ", time_per_output_token_max);
-      summary("Mean Time to Output Token (ns)               : ", time_per_output_token_mean);
+      summary("Min Time per Output Token (ns)                : ",
+              time_per_output_token_min);
+      summary("Max Time per Output Token (ns)                : ",
+              time_per_output_token_max);
+      summary("Mean Time per Output Token (ns)               : ",
+              time_per_output_token_mean);
       for (auto& lp : tpot_percentiles) {
-        summary(
-            DoubleToString(lp.percentile * 100) + " percentile time to output token (ns)   : ",
-            lp.sample_latency);
+        summary(DoubleToString(lp.percentile * 100) +
+                    " percentile time to output token (ns)   : ",
+                lp.sample_latency);
       }
     }
   }
@@ -631,23 +653,20 @@ void PerformanceSummary::LogDetail(AsyncDetail& detail) {
   bool perf_constraints_met =
       PerfConstraintsMet(&perf_constraints_recommendation);
   bool early_stopping_met = true;
-  if (!settings.use_token_latencies){
-    early_stopping_met = EarlyStopping(&early_stopping_recommendation,
-                                        pr.queries_issued, 
-                                        &pr.sample_latencies, 
-                                        &pr.query_latencies,
-                                        settings.target_latency);
+  if (!settings.use_token_latencies) {
+    early_stopping_met = EarlyStopping(
+        &early_stopping_recommendation, pr.queries_issued, &pr.sample_latencies,
+        &pr.query_latencies, settings.target_latency);
   } else {
-    early_stopping_met = EarlyStopping(&early_stopping_tpot_recommendation,
-                                        pr.queries_issued, 
-                                        &pr.token_results.time_per_output_token_arr, 
-                                        &pr.query_latencies,
-                                        std::chrono::nanoseconds(settings.server_tpot_latency)) && 
-                          EarlyStopping(&early_stopping_ttft_recommendation,
-                                        pr.queries_issued, 
-                                        &pr.token_results.first_token_latencies, 
-                                        &pr.query_latencies,
-                                        std::chrono::nanoseconds(settings.server_ttft_latency));
+    early_stopping_met =
+        EarlyStopping(&early_stopping_tpot_recommendation, pr.queries_issued,
+                      &pr.token_results.time_per_output_token_arr,
+                      &pr.query_latencies,
+                      std::chrono::nanoseconds(settings.server_tpot_latency)) &&
+        EarlyStopping(&early_stopping_ttft_recommendation, pr.queries_issued,
+                      &pr.token_results.first_token_latencies,
+                      &pr.query_latencies,
+                      std::chrono::nanoseconds(settings.server_ttft_latency));
   }
   bool all_constraints_met = min_duration_met && min_queries_met &&
                              perf_constraints_met && early_stopping_met;
@@ -672,21 +691,22 @@ void PerformanceSummary::LogDetail(AsyncDetail& detail) {
       recommendation +=
           "The test exited early, before enough queries were issued.";
     }
-    std::replace(recommendation.begin(),
-               recommendation.end(), '\n', ' ');
+    std::replace(recommendation.begin(), recommendation.end(), '\n', ' ');
     MLPERF_LOG(detail, "result_invalid_reason", recommendation);
   }
   std::replace(early_stopping_recommendation.begin(),
                early_stopping_recommendation.end(), '\n', ' ');
-  if (!settings.use_token_latencies){
+  if (!settings.use_token_latencies) {
     MLPERF_LOG(detail, "early_stopping_result", early_stopping_recommendation);
-  } else{
+  } else {
     std::replace(early_stopping_ttft_recommendation.begin(),
-               early_stopping_ttft_recommendation.end(), '\n', ' ');
+                 early_stopping_ttft_recommendation.end(), '\n', ' ');
     std::replace(early_stopping_tpot_recommendation.begin(),
-                early_stopping_tpot_recommendation.end(), '\n', ' ');
-    MLPERF_LOG(detail, "early_stopping_ttft_result", early_stopping_ttft_recommendation);
-    MLPERF_LOG(detail, "early_stopping_tpot_result", early_stopping_tpot_recommendation);
+                 early_stopping_tpot_recommendation.end(), '\n', ' ');
+    MLPERF_LOG(detail, "early_stopping_ttft_result",
+               early_stopping_ttft_recommendation);
+    MLPERF_LOG(detail, "early_stopping_tpot_result",
+               early_stopping_tpot_recommendation);
   }
   // Report number of queries
   MLPERF_LOG(detail, "result_query_count", query_count);
@@ -761,49 +781,64 @@ void PerformanceSummary::LogDetail(AsyncDetail& detail) {
                lp.sample_latency);
   }
   // Detailed first token latencies
-  if (settings.use_token_latencies){
+  if (settings.use_token_latencies) {
     if (settings.scenario != TestScenario::Offline) {
-      MLPERF_LOG(detail, "result_first_token_min_latency_ns", first_token_latency_min);
-      MLPERF_LOG(detail, "result_first_token_max_latency_ns", first_token_latency_max);
-      MLPERF_LOG(detail, "result_first_token_mean_latency_ns", first_token_latency_mean);
+      MLPERF_LOG(detail, "result_first_token_min_latency_ns",
+                 first_token_latency_min);
+      MLPERF_LOG(detail, "result_first_token_max_latency_ns",
+                 first_token_latency_max);
+      MLPERF_LOG(detail, "result_first_token_mean_latency_ns",
+                 first_token_latency_mean);
       for (auto& lp : token_latency_percentiles) {
         MLPERF_LOG(detail,
-                    "result_first_token_" + DoubleToString(lp.percentile * 100) +
-                        "_percentile_latency_ns",
-                    lp.sample_latency);
+                   "result_first_token_" + DoubleToString(lp.percentile * 100) +
+                       "_percentile_latency_ns",
+                   lp.sample_latency);
       }
       double tps_w_lg = ((double)token_count) / pr.final_query_issued_time;
-      double tps_wo_lg= ((double)token_count) / (sample_latency_mean * sample_count);
-      MLPERF_LOG(detail, "result_token_throughput_with_loadgen_overhead", tps_w_lg);
+      double tps_wo_lg =
+          ((double)token_count) / (sample_latency_mean * sample_count);
+      MLPERF_LOG(detail, "result_token_throughput_with_loadgen_overhead",
+                 tps_w_lg);
       MLPERF_LOG(detail, "result_token_throughput", tps_wo_lg);
       for (auto& lp : tpot_percentiles) {
         MLPERF_LOG(detail,
-                    "result_time_per_output_token_" + DoubleToString(lp.percentile * 100) +
-                        "_percentile_ns",
-                    lp.sample_latency);
+                   "result_time_per_output_token_" +
+                       DoubleToString(lp.percentile * 100) + "_percentile_ns",
+                   lp.sample_latency);
       }
-      MLPERF_LOG(detail, "result_time_to_output_token_min", time_per_output_token_min);
-      MLPERF_LOG(detail, "result_time_to_output_token_max", time_per_output_token_max);
-      MLPERF_LOG(detail, "result_time_to_output_token_mean", time_per_output_token_mean);
+      MLPERF_LOG(detail, "result_time_to_output_token_min",
+                 time_per_output_token_min);
+      MLPERF_LOG(detail, "result_time_to_output_token_max",
+                 time_per_output_token_max);
+      MLPERF_LOG(detail, "result_time_to_output_token_mean",
+                 time_per_output_token_mean);
       double tps_as_completed =
-            token_count / pr.final_query_all_samples_done_time;
-      MLPERF_LOG(detail, "result_completed_tokens_per_second", tps_as_completed);
+          token_count / pr.final_query_all_samples_done_time;
+      MLPERF_LOG(detail, "result_completed_tokens_per_second",
+                 tps_as_completed);
     } else {
       double tokens_per_second = token_count / pr.max_latency;
       MLPERF_LOG(detail, "result_tokens_per_second", tokens_per_second);
     }
   }
 
-  if (settings.infer_token_latencies){
+  if (settings.infer_token_latencies) {
     switch (settings.scenario) {
       case TestScenario::Server: {
-        double completed_tokens_per_second = (sample_count - 1) * settings.token_latency_scaling_factor / pr.final_query_all_samples_done_time;
-        MLPERF_LOG(detail, "result_inferred_completed_tokens_per_second", completed_tokens_per_second);
+        double completed_tokens_per_second =
+            (sample_count - 1) * settings.token_latency_scaling_factor /
+            pr.final_query_all_samples_done_time;
+        MLPERF_LOG(detail, "result_inferred_completed_tokens_per_second",
+                   completed_tokens_per_second);
         break;
       }
       case TestScenario::Offline: {
-        double tokens_per_second = sample_count * settings.token_latency_scaling_factor / pr.max_latency;
-        MLPERF_LOG(detail, "result_inferred_tokens_per_second", tokens_per_second);
+        double tokens_per_second = sample_count *
+                                   settings.token_latency_scaling_factor /
+                                   pr.max_latency;
+        MLPERF_LOG(detail, "result_inferred_tokens_per_second",
+                   tokens_per_second);
         break;
       }
       case TestScenario::SingleStream: {
@@ -812,9 +847,10 @@ void PerformanceSummary::LogDetail(AsyncDetail& detail) {
       case TestScenario::MultiStream: {
         break;
       }
+    }
   }
+  MLPERF_LOG(detail, "num_errors", detail.async_log().GetErrorCount());
 #endif
 }
-}
 }  // namespace loadgen
-} // namespace mlperf
+}  // namespace mlperf

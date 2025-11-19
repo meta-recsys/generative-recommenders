@@ -36,12 +36,12 @@ limitations under the License.
 #include "logging.h"
 #include "query_sample.h"
 #include "query_sample_library.h"
+#include "results.h"
 #include "system_under_test.h"
 #include "test_settings.h"
 #include "test_settings_internal.h"
 #include "utils.h"
 #include "version.h"
-#include "results.h"
 
 namespace mlperf {
 
@@ -97,7 +97,8 @@ struct ResponseDelegateDetailed : public ResponseDelegate {
       sample_data_copy = new std::vector<uint8_t>(src_begin, src_end);
     }
     int64_t n_tokens = response->n_tokens;
-    Log([sample, complete_begin_time, sample_data_copy, n_tokens](AsyncLog& log) {
+    Log([sample, complete_begin_time, sample_data_copy,
+         n_tokens](AsyncLog& log) {
       QueryMetadata* query = sample->query_metadata;
       DurationGeneratorNs sched{query->scheduled_time};
       if (scenario == TestScenario::Server) {
@@ -132,9 +133,9 @@ struct ResponseDelegateDetailed : public ResponseDelegate {
     });
   }
 
-    void TokenComplete(SampleMetadata* sample, QuerySampleResponse* response,
-                      PerfClock::time_point complete_begin_time,
-                      const ResponseCallback& response_cb) override {
+  void TokenComplete(SampleMetadata* sample, QuerySampleResponse* response,
+                     PerfClock::time_point complete_begin_time,
+                     const ResponseCallback& response_cb) override {
     // Using a raw pointer here should help us hit the std::function
     // small buffer optimization code path when we aren't copying data.
     // For some reason, using std::unique_ptr<std::vector> wasn't moving
@@ -155,24 +156,25 @@ struct ResponseDelegateDetailed : public ResponseDelegate {
       DurationGeneratorNs sched{query->scheduled_time};
       if (scenario == TestScenario::Server) {
         DurationGeneratorNs issued{query->issued_start_time};
-        log.TraceCounterEvent("Token_Latency", query->scheduled_time, "issue_delay",
-                              sched.delta(query->issued_start_time),
-                              "issue_to_done",
-                              issued.delta(complete_begin_time));
-      }else{
+        log.TraceCounterEvent(
+            "Token_Latency", query->scheduled_time, "issue_delay",
+            sched.delta(query->issued_start_time), "issue_to_done",
+            issued.delta(complete_begin_time));
+      } else {
         log.TraceSample("Token", sample->sequence_id, query->scheduled_time,
-                      complete_begin_time, "sample_seq", sample->sequence_id,
-                      "query_seq", query->sequence_id, "sample_idx",
-                      sample->sample_index, "issue_start_ns",
-                      sched.delta(query->issued_start_time), "complete_ns",
-                      sched.delta(complete_begin_time));
+                        complete_begin_time, "sample_seq", sample->sequence_id,
+                        "query_seq", query->sequence_id, "sample_idx",
+                        sample->sample_index, "issue_start_ns",
+                        sched.delta(query->issued_start_time), "complete_ns",
+                        sched.delta(complete_begin_time));
       }
       if (token_data_copy) {
-        log.CacheToken(sample->sequence_id, LogBinaryAsHexString{token_data_copy});
+        log.CacheToken(sample->sequence_id,
+                       LogBinaryAsHexString{token_data_copy});
       }
       QuerySampleLatency latency = sched.delta(complete_begin_time);
       log.RecordTokenCompletion(sample->sequence_id, complete_begin_time,
-                                 latency);
+                                latency);
     });
   }
 
@@ -227,7 +229,8 @@ auto SampleDistribution<TestMode::PerformanceOnly>(size_t sample_count,
              auto& gen) mutable { return dist(gen); };
 }
 
-/// \brief Sample across the dataset, and ensure coverage of each of the samples.
+/// \brief Sample across the dataset, and ensure coverage of each of the
+/// samples.
 // Useful for non-uniform dataset (e.g. Llama2, GPTJ, 3d-unet)
 auto SampleDistributionEqualIssue(size_t sample_count, size_t set_size,
                                   std::mt19937* rng) {
@@ -304,10 +307,8 @@ std::vector<QueryMetadata> GenerateQueries(
   auto sample_distribution_unique = SampleDistribution<TestMode::AccuracyOnly>(
       loaded_sample_set.sample_distribution_end, sample_stride, &sample_rng);
 
-  auto sample_distribution_equal_issue =
-      SampleDistributionEqualIssue(min_queries,
-                                   loaded_samples.size(),
-                                   &sample_rng);
+  auto sample_distribution_equal_issue = SampleDistributionEqualIssue(
+      min_queries, loaded_samples.size(), &sample_rng);
 
   auto schedule_distribution =
       ScheduleDistribution<scenario>(settings.target_qps);
@@ -315,20 +316,19 @@ std::vector<QueryMetadata> GenerateQueries(
   // When sample_concatenate_permutation is turned on, pad to a multiple of the
   // complete dataset to ensure fairness.
   auto enable_equal_issue = settings.sample_concatenate_permutation;
-  if (mode != TestMode::AccuracyOnly && enable_equal_issue)
-  {
+  if (mode != TestMode::AccuracyOnly && enable_equal_issue) {
     if (scenario == TestScenario::Offline &&
-      samples_per_query % loaded_samples.size() != 0)
-    {
+        samples_per_query % loaded_samples.size() != 0) {
       // In offline mode, we pad samples_per_query
       size_t pad_size =
-        (loaded_samples.size() - samples_per_query % loaded_samples.size());
+          (loaded_samples.size() - samples_per_query % loaded_samples.size());
       samples_per_query += pad_size;
-    }
-    else if (min_queries % loaded_samples.size() != 0)
-    {
-      // In Server, SingleStream, MultiStream mode, the min_queries should be padded
-      size_t pad_size = (loaded_samples.size() - min_queries % loaded_samples.size());
+    } else if ((scenario != TestScenario::Offline) &&
+               (min_queries % loaded_samples.size() != 0)) {
+      // In Server, SingleStream, MultiStream mode, the min_queries should be
+      // padded
+      size_t pad_size =
+          (loaded_samples.size() - min_queries % loaded_samples.size());
       min_queries += pad_size;
     }
   }
@@ -388,10 +388,9 @@ std::vector<QueryMetadata> GenerateQueries(
     } else {
       for (auto& s : samples) {
         s = loaded_samples[settings.performance_issue_unique
-                           ? sample_distribution_unique(sample_rng)
-                           : settings.performance_issue_same
-                             ? same_sample
-                             : enable_equal_issue
+                               ? sample_distribution_unique(sample_rng)
+                           : settings.performance_issue_same ? same_sample
+                           : enable_equal_issue
                                ? sample_distribution_equal_issue(sample_rng)
                                : sample_distribution(sample_rng)];
       }
@@ -399,11 +398,11 @@ std::vector<QueryMetadata> GenerateQueries(
     queries.emplace_back(samples, timestamp, response_delegate, sequence_gen);
     prev_timestamp = timestamp;
     timestamp += schedule_distribution(schedule_rng);
-    // In equal_issue mode, the min_queries will be bumped up by a multiple of the dataset size
-    // if the test time has not met the threshold.
+    // In equal_issue mode, the min_queries will be bumped up by a multiple of
+    // the dataset size if the test time has not met the threshold.
     if (enable_equal_issue && (queries.size() >= min_queries) &&
-      (prev_timestamp < gen_duration) && (scenario != TestScenario::Offline))
-    {
+        (prev_timestamp < gen_duration) &&
+        (scenario != TestScenario::Offline)) {
       min_queries += loaded_samples.size();
     }
   }
@@ -422,7 +421,7 @@ std::vector<QueryMetadata> GenerateQueries(
     }
   }
 
-  LogDetail([count = queries.size(), spq = settings.samples_per_query,
+  LogDetail([count = queries.size(), spq = samples_per_query,
              duration = timestamp.count()](AsyncDetail& detail) {
 #if USE_NEW_LOGGING_FORMAT
     MLPERF_LOG(detail, "generated_query_count", count);
@@ -536,14 +535,13 @@ PerformanceResult IssueQueries(SystemUnderTest* sut,
       GlobalLogger().GetLatenciesBlocking(expected_latencies));
 
   std::vector<QuerySampleLatency> first_token_latencies(
-    GlobalLogger().GetTokenLatencies(expected_latencies));
+      GlobalLogger().GetTokenLatencies(expected_latencies));
 
   std::vector<QuerySampleLatency> time_per_output_token_arr(
-    GlobalLogger().GetTimePerOutputToken(expected_latencies));
+      GlobalLogger().GetTimePerOutputToken(expected_latencies));
 
   std::vector<int64_t> tokens_per_sample(
-    GlobalLogger().GetTokensPerSample(expected_latencies));
-
+      GlobalLogger().GetTokensPerSample(expected_latencies));
 
   // Log contention counters after every test as a sanity check.
   GlobalLogger().LogContentionAndAllocations();
@@ -591,19 +589,16 @@ PerformanceResult IssueQueries(SystemUnderTest* sut,
     }
   }
 
-  return PerformanceResult{std::move(sample_latencies),
-                          std::move(query_latencies),
-                          queries_issued,
-                          max_latency,
-                          final_query_scheduled_time,
-                          final_query_issued_time,
-                          final_query_all_samples_done_time,
-                          TokenPerformanceResults{
-                            first_token_latencies,
-                            time_per_output_token_arr,
-                            tokens_per_sample
-                          }
-                        };
+  return PerformanceResult{
+      std::move(sample_latencies),
+      std::move(query_latencies),
+      queries_issued,
+      max_latency,
+      final_query_scheduled_time,
+      final_query_issued_time,
+      final_query_all_samples_done_time,
+      TokenPerformanceResults{first_token_latencies, time_per_output_token_arr,
+                              tokens_per_sample}};
 }
 
 void LoadSamplesToRam(QuerySampleLibrary* qsl,
@@ -1172,9 +1167,10 @@ void StartTest(SystemUnderTest* sut, QuerySampleLibrary* qsl,
                               &log_outputs.accuracy_out,
                               log_settings.log_output.copy_detail_to_stdout,
                               log_settings.log_output.copy_summary_to_stdout);
-            
+
   GlobalLogger().SetUseTokens(requested_settings.use_token_latencies);
-  bool needs_first_token = (requested_settings.scenario != TestScenario::Offline);
+  bool needs_first_token =
+      (requested_settings.scenario != TestScenario::Offline);
   GlobalLogger().SetNeedsFirstToken(needs_first_token);
 
   if (log_settings.enable_trace) {
@@ -1233,9 +1229,9 @@ void StartTest(SystemUnderTest* sut, QuerySampleLibrary* qsl,
     RemoveValue(&audit_scenario, ' ');
     const std::string generic_model = "*";
     test_settings.FromConfig(audit_config_filename, generic_model,
-                             audit_scenario);
+                             audit_scenario, 2);
   }
-  if(test_settings.test05){
+  if (test_settings.test05) {
     // If the configuration indicates we are running test05,
     // random seeds
     LogDetail([](AsyncDetail& detail) {
@@ -1251,8 +1247,10 @@ void StartTest(SystemUnderTest* sut, QuerySampleLibrary* qsl,
     });
     test_settings.mode = TestMode::PerformanceOnly;
     test_settings.qsl_rng_seed = requested_settings.test05_qsl_rng_seed;
-    test_settings.sample_index_rng_seed = requested_settings.test05_sample_index_rng_seed;
-    test_settings.schedule_rng_seed = requested_settings.test05_schedule_rng_seed;
+    test_settings.sample_index_rng_seed =
+        requested_settings.test05_sample_index_rng_seed;
+    test_settings.schedule_rng_seed =
+        requested_settings.test05_schedule_rng_seed;
   }
 
   loadgen::TestSettingsInternal sanitized_settings(
@@ -1324,11 +1322,11 @@ void QuerySamplesComplete(QuerySampleResponse* responses, size_t response_count,
 }
 
 void FirstTokenComplete(QuerySampleResponse* responses, size_t response_count,
-                          const ResponseCallback& response_cb) {
+                        const ResponseCallback& response_cb) {
   PerfClock::time_point timestamp = PerfClock::now();
 
-  auto tracer = MakeScopedTracer(
-      [](AsyncTrace& trace) { trace("FirstTokenComplete"); });
+  auto tracer =
+      MakeScopedTracer([](AsyncTrace& trace) { trace("FirstTokenComplete"); });
 
   const QuerySampleResponse* end = responses + response_count;
 
@@ -1338,7 +1336,7 @@ void FirstTokenComplete(QuerySampleResponse* responses, size_t response_count,
         reinterpret_cast<loadgen::SampleMetadata*>(response->id);
     loadgen::QueryMetadata* query = sample->query_metadata;
     query->response_delegate->TokenComplete(sample, response, timestamp,
-                                             response_cb);
+                                            response_cb);
   }
   // PerfClock::time_point end_timestamp = PerfClock::now();
   // mlperf::tokens_overhead_acum += (end_timestamp - timestamp).count();

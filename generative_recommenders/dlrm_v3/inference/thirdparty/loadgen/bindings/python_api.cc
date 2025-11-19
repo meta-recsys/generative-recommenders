@@ -19,9 +19,9 @@ limitations under the License.
 #include <functional>
 
 #include "../loadgen.h"
+#include "../query_dispatch_library.h"
 #include "../query_sample.h"
 #include "../query_sample_library.h"
-#include "../query_dispatch_library.h"
 #include "../system_under_test.h"
 #include "../test_settings.h"
 #include "pybind11/functional.h"
@@ -133,34 +133,36 @@ class QuerySampleLibraryTrampoline : public QuerySampleLibrary {
 // A QDL that allows defining callbacks for
 // IssueQuery, FlushQueries, and Name methods.
 class QueryDispatchLibraryTrampoline : public QueryDispatchLibrary {
-  public:
-    QueryDispatchLibraryTrampoline(IssueQueryCallback issue_query_callback,
+ public:
+  QueryDispatchLibraryTrampoline(IssueQueryCallback issue_query_callback,
                                  FlushQueriesCallback flush_queries_callback,
                                  NameCallback name_callback)
-        : issue_query_callback_(issue_query_callback),
-          flush_queries_callback_(flush_queries_callback),
-          name_callback_(name_callback) {}
+      : issue_query_callback_(issue_query_callback),
+        flush_queries_callback_(flush_queries_callback),
+        name_callback_(name_callback) {}
 
-    // Returns the name of the SUT. Name shall be returned over the network
-    // TODO: other bindings should also be fixed eventually to be used over the network 
-    const std::string& Name() override {
-      static std::string name; // HACK: avoid returning a reference to temporary.
-      pybind11::gil_scoped_acquire gil_acquirer; 
-      name = name_callback_(); // name_callback_() shall returned name over the network.
-      return name;
-    }
+  // Returns the name of the SUT. Name shall be returned over the network
+  // TODO: other bindings should also be fixed eventually to be used over the
+  // network
+  const std::string& Name() override {
+    static std::string name;  // HACK: avoid returning a reference to temporary.
+    pybind11::gil_scoped_acquire gil_acquirer;
+    name = name_callback_();  // name_callback_() shall returned name over the
+                              // network.
+    return name;
+  }
 
-    void IssueQuery(const std::vector<QuerySample>& samples) override {
-        pybind11::gil_scoped_acquire gil_acquirer;
-        issue_query_callback_(samples);
-    }
+  void IssueQuery(const std::vector<QuerySample>& samples) override {
+    pybind11::gil_scoped_acquire gil_acquirer;
+    issue_query_callback_(samples);
+  }
 
-    void FlushQueries() override { flush_queries_callback_(); }
+  void FlushQueries() override { flush_queries_callback_(); }
 
-    protected:
-      IssueQueryCallback issue_query_callback_;
-      FlushQueriesCallback flush_queries_callback_;
-      NameCallback name_callback_;
+ protected:
+  IssueQueryCallback issue_query_callback_;
+  FlushQueriesCallback flush_queries_callback_;
+  NameCallback name_callback_;
 };
 
 }  // namespace
@@ -213,8 +215,8 @@ void DestroyQSL(uintptr_t qsl) {
 uintptr_t ConstructQDL(IssueQueryCallback issue_cb,
                        FlushQueriesCallback flush_queries_cb,
                        NameCallback name_callback) {
-  QueryDispatchLibraryTrampoline* qdl =
-      new QueryDispatchLibraryTrampoline(issue_cb, flush_queries_cb, name_callback);
+  QueryDispatchLibraryTrampoline* qdl = new QueryDispatchLibraryTrampoline(
+      issue_cb, flush_queries_cb, name_callback);
   return reinterpret_cast<uintptr_t>(qdl);
 }
 
@@ -223,7 +225,7 @@ void DestroyQDL(uintptr_t qdl) {
       reinterpret_cast<QueryDispatchLibraryTrampoline*>(qdl);
   delete qdl_cast;
 }
- 
+
 void StartTest(uintptr_t sut, uintptr_t qsl, mlperf::TestSettings test_settings,
                const std::string& audit_config_filename) {
   pybind11::gil_scoped_release gil_releaser;
@@ -259,7 +261,7 @@ void QuerySamplesComplete(std::vector<QuerySampleResponse> responses,
 }
 
 void FirstTokenComplete(std::vector<QuerySampleResponse> responses,
-                          ResponseCallback response_cb = {}) {
+                        ResponseCallback response_cb = {}) {
   pybind11::gil_scoped_release gil_releaser;
   mlperf::FirstTokenComplete(responses.data(), responses.size(), response_cb);
 }
@@ -331,18 +333,27 @@ PYBIND11_MODULE(mlperf_loadgen, m) {
                      &TestSettings::performance_issue_same_index)
       .def_readwrite("performance_sample_count_override",
                      &TestSettings::performance_sample_count_override)
-      .def_readwrite("test05",
-                     &TestSettings::test05)
+      .def_readwrite("test05", &TestSettings::test05)
       .def_readwrite("test05_qsl_rng_seed", &TestSettings::test05_qsl_rng_seed)
       .def_readwrite("test05_sample_index_rng_seed",
                      &TestSettings::test05_sample_index_rng_seed)
-      .def_readwrite("test05_schedule_rng_seed", &TestSettings::test05_schedule_rng_seed)
+      .def_readwrite("test05_schedule_rng_seed",
+                     &TestSettings::test05_schedule_rng_seed)
       .def_readwrite("use_token_latencies", &TestSettings::use_token_latencies)
       .def_readwrite("ttft_latency", &TestSettings::server_ttft_latency)
       .def_readwrite("tpot_latency", &TestSettings::server_tpot_latency)
-      .def_readwrite("infer_token_latencies", &TestSettings::infer_token_latencies)
-      .def_readwrite("token_latency_scaling_factor", &TestSettings::token_latency_scaling_factor)
-      .def("FromConfig", &TestSettings::FromConfig, "FromConfig.");
+      .def_readwrite("infer_token_latencies",
+                     &TestSettings::infer_token_latencies)
+      .def_readwrite("token_latency_scaling_factor",
+                     &TestSettings::token_latency_scaling_factor)
+      .def("FromConfig", &TestSettings::FromConfig, pybind11::arg("path"),
+           pybind11::arg("model"), pybind11::arg("scenario"),
+           pybind11::arg("conf_type") = 1,
+           "This function configures settings from the given user "
+           "configuration file, model, and scenario. The conf_type flag "
+           "should be set to 1 for loading user.conf or else only the default "
+           "mlperf_conf file "
+           "will be loaded by the loadgen.");
 
   pybind11::enum_<LoggingMode>(m, "LoggingMode")
       .value("AsyncPoll", LoggingMode::AsyncPoll)
@@ -410,10 +421,9 @@ PYBIND11_MODULE(mlperf_loadgen, m) {
             q.id = t[0].cast<uintptr_t>();
             q.data = t[1].cast<uintptr_t>();
             q.size = t[2].cast<size_t>();
-            if (t.size() == 4){
+            if (t.size() == 4) {
               q.n_tokens = t[3].cast<int64_t>();
-            }
-            else{
+            } else {
               q.n_tokens = 0;
             }
             return q;
@@ -438,10 +448,11 @@ PYBIND11_MODULE(mlperf_loadgen, m) {
   m.def("DestroyQSL", &py::DestroyQSL,
         "Destroy the object created by ConstructQSL.");
 
-  m.def("ConstructQDL", &py::ConstructQDL, 
-      "Construct the query sample library, communicating with the SUT over the network.");
+  m.def("ConstructQDL", &py::ConstructQDL,
+        "Construct the query sample library, communicating with the SUT over "
+        "the network.");
   m.def("DestroyQDL", &py::DestroyQDL,
-      "Destroy the object created by ConstructQDL.");
+        "Destroy the object created by ConstructQDL.");
 
   m.def("StartTest", &py::StartTest,
         "Run tests on a SUT created by ConstructSUT() with the provided QSL. "

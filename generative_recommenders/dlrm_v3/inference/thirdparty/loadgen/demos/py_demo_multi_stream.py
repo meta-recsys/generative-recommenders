@@ -28,7 +28,8 @@ from datetime import datetime
 
 # Global var
 NUM_AGENTS = 8
-LOOPBACK_LATENCY_S = .001
+LOOPBACK_LATENCY_S = 0.001
+
 
 def load_samples_to_ram(query_samples):
     del query_samples
@@ -44,7 +45,8 @@ def unload_samples_from_ram(query_samples):
 def process_query_async(query_samples, i_slice):
     time.sleep(LOOPBACK_LATENCY_S * (i_slice + 1))
     responses = []
-    samples_to_complete = query_samples[i_slice:len(query_samples):NUM_AGENTS]
+    samples_to_complete = query_samples[i_slice: len(
+        query_samples): NUM_AGENTS]
     for j, s in enumerate(samples_to_complete):
         responses.append(mlperf_loadgen.QuerySampleResponse(s.id, 0, 0))
     mlperf_loadgen.QuerySamplesComplete(responses)
@@ -52,8 +54,9 @@ def process_query_async(query_samples, i_slice):
 
 def issue_query(query_samples):
     for i in range(8):
-        threading.Thread(target=process_query_async,
-                         args=(query_samples, i)).start()
+        threading.Thread(
+            target=process_query_async, args=(
+                query_samples, i)).start()
 
 
 def flush_queries():
@@ -72,7 +75,8 @@ def main(argv):
 
     sut = mlperf_loadgen.ConstructSUT(issue_query, flush_queries)
     qsl = mlperf_loadgen.ConstructQSL(
-        1024, 128, load_samples_to_ram, unload_samples_from_ram)
+        1024, 128, load_samples_to_ram, unload_samples_from_ram
+    )
     mlperf_loadgen.StartTest(sut, qsl, settings)
     mlperf_loadgen.DestroyQSL(qsl)
     mlperf_loadgen.DestroySUT(sut)

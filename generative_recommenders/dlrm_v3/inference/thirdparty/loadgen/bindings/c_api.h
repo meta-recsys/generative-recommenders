@@ -49,13 +49,12 @@ void QuerySamplesCompleteResponseCb(QuerySampleResponse* responses,
                                     ResponseCallback response_cb,
                                     ClientData client_data);
 
-void FirstTokenComplete(QuerySampleResponse* responses,
-                          size_t response_count);
-                        
+void FirstTokenComplete(QuerySampleResponse* responses, size_t response_count);
+
 void FirstTokenCompleteResponseCb(QuerySampleResponse* responses,
-                                    size_t response_count,
-                                    ResponseCallback response_cb,
-                                    ClientData client_data);
+                                  size_t response_count,
+                                  ResponseCallback response_cb,
+                                  ClientData client_data);
 
 /// \brief Create an opaque SUT pointer based on C callbacks.
 void* ConstructSUT(ClientData client_data, const char* name, size_t name_length,

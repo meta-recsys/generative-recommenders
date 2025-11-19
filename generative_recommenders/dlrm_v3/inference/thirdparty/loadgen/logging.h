@@ -119,13 +119,10 @@ class ChromeTracer {
   void AddCompleteEvent(const std::string& name, uint64_t pid, uint64_t tid,
                         PerfClock::time_point start, PerfClock::time_point end,
                         const Args... args) {
-    *out_ << "{\"name\":\"" << name << "\","
-          << "\"ph\":\"X\","
-          << "\"pid\":" << pid << ","
-          << "\"tid\":" << tid << ","
+    *out_ << "{\"name\":\"" << name << "\"," << "\"ph\":\"X\","
+          << "\"pid\":" << pid << "," << "\"tid\":" << tid << ","
           << "\"ts\":" << Micros(start - origin_).count() << ","
-          << "\"dur\":" << Micros(end - start).count() << ","
-          << "\"args\":{";
+          << "\"dur\":" << Micros(end - start).count() << "," << "\"args\":{";
     AddArgs(args...);
     *out_ << "}},\n";
   }
@@ -133,12 +130,9 @@ class ChromeTracer {
   template <typename... Args>
   void AddAsyncBeginEvent(const std::string& name, uint64_t pid, uint64_t id,
                           PerfClock::time_point time, const Args... args) {
-    *out_ << "{\"name\":\"" << name << "\","
-          << "\"cat\":\"default\","
-          << "\"ph\":\"b\","
-          << "\"pid\":" << pid << ","
-          << "\"id\":" << id << ","
-          << "\"ts\":" << Micros(time - origin_).count() << ","
+    *out_ << "{\"name\":\"" << name << "\"," << "\"cat\":\"default\","
+          << "\"ph\":\"b\"," << "\"pid\":" << pid << "," << "\"id\":" << id
+          << "," << "\"ts\":" << Micros(time - origin_).count() << ","
           << "\"args\":{";
     AddArgs(args...);
     *out_ << "}},\n";
@@ -147,12 +141,9 @@ class ChromeTracer {
   template <typename... Args>
   void AddAsyncInstantEvent(const std::string& name, uint64_t pid, uint64_t id,
                             PerfClock::time_point time, const Args... args) {
-    *out_ << "{\"name\":\"" << name << "\","
-          << "\"cat\":\"default\","
-          << "\"ph\":\"n\","
-          << "\"pid\":" << pid << ","
-          << "\"id\":" << id << ","
-          << "\"ts\":" << Micros(time - origin_).count() << ","
+    *out_ << "{\"name\":\"" << name << "\"," << "\"cat\":\"default\","
+          << "\"ph\":\"n\"," << "\"pid\":" << pid << "," << "\"id\":" << id
+          << "," << "\"ts\":" << Micros(time - origin_).count() << ","
           << "\"args\":{";
     AddArgs(args...);
     *out_ << "}},\n";
@@ -161,19 +152,15 @@ class ChromeTracer {
   template <typename... Args>
   void AddAsyncEndEvent(const std::string& name, uint64_t pid, uint64_t id,
                         PerfClock::time_point time) {
-    *out_ << "{\"name\":\"" << name << "\","
-          << "\"cat\":\"default\","
-          << "\"ph\":\"e\", "
-          << "\"pid\":" << pid << ","
-          << "\"id\":" << id << ","
-          << "\"ts\":" << Micros(time - origin_).count() << "},\n";
+    *out_ << "{\"name\":\"" << name << "\"," << "\"cat\":\"default\","
+          << "\"ph\":\"e\", " << "\"pid\":" << pid << "," << "\"id\":" << id
+          << "," << "\"ts\":" << Micros(time - origin_).count() << "},\n";
   }
 
   template <typename... Args>
   void AddCounterEvent(const std::string& name, uint64_t pid,
                        PerfClock::time_point time, const Args... args) {
-    *out_ << "{\"name\":\"" << name << "\","
-          << "\"ph\": \"C\","
+    *out_ << "{\"name\":\"" << name << "\"," << "\"ph\": \"C\","
           << "\"pid\":" << pid << ","
           << "\"ts\":" << Micros(time - origin_).count() << ","
           << "\"args\":{ ";
@@ -315,11 +302,10 @@ class AsyncLog {
                                size_t latencies_to_reserve);
   void RecordSampleCompletion(uint64_t sample_sequence_id,
                               PerfClock::time_point completion_time,
-                              QuerySampleLatency latency,
-                              int64_t n_tokens);
+                              QuerySampleLatency latency, int64_t n_tokens);
   void RecordTokenCompletion(uint64_t sample_sequence_id,
-                              PerfClock::time_point completion_time,
-                              QuerySampleLatency latency);
+                             PerfClock::time_point completion_time,
+                             QuerySampleLatency latency);
   std::vector<QuerySampleLatency> GetLatenciesBlocking(size_t expected_count);
   std::vector<QuerySampleLatency> GetTokenLatencies(size_t expected_count);
   std::vector<QuerySampleLatency> GetTimePerOutputToken(size_t expected_count);
@@ -328,6 +314,7 @@ class AsyncLog {
   QuerySampleLatency GetMaxLatencySoFar();
   void SetUseTokens(bool use_tokens);
   void SetNeedsFirstToken(bool needs_first_token);
+  size_t GetErrorCount() { return log_error_count_; };
 
  private:
   void WriteAccuracyHeaderLocked();
@@ -734,15 +721,13 @@ void AsyncLog::LogDetail(const std::string& key, const T& value,
   }
   auto time_ns = (log_detail_time_ - log_origin_).count();
   for (auto os : detail_streams) {
-    *os << ":::MLLOG {"
-        << "\"key\": " << ArgValueTransform(key) << ", "
+    *os << ":::MLLOG {" << "\"key\": " << ArgValueTransform(key) << ", "
         << "\"value\": " << ArgValueTransform(value) << ", "
         << "\"time_ms\": " << ArgValueTransform(time_ns / 1000000ULL) << "."
         << std::setfill('0') << std::setw(6)
         << ArgValueTransform(time_ns % 1000000ULL) << ", "
         << "\"namespace\": \"mlperf::logging\", "
-        << "\"event_type\": \"POINT_IN_TIME\", "
-        << "\"metadata\": {"
+        << "\"event_type\": \"POINT_IN_TIME\", " << "\"metadata\": {"
         << "\"is_error\": " << ArgValueTransform(error_flagged_) << ", "
         << "\"is_warning\": " << ArgValueTransform(warning_flagged_) << ", "
         << "\"file\": \"" << file_name << "\", "
@@ -771,9 +756,9 @@ void AsyncLog::LogDetail(const std::string& message, const Args... args) {
     detail_streams.pop_back();
   }
   for (auto os : detail_streams) {
-    *os << "\"pid\": " << current_pid_ << ", "
-        << "\"tid\": " << current_tid_ << ", "
-        << "\"ts\": " << (log_detail_time_ - log_origin_).count() << "ns : ";
+    *os << "\"pid\": " << current_pid_ << ", " << "\"tid\": " << current_tid_
+        << ", " << "\"ts\": " << (log_detail_time_ - log_origin_).count()
+        << "ns : ";
     if (error_flagged_) {
       *os << "ERROR : ";
     } else if (warning_flagged_) {

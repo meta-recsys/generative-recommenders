@@ -33,10 +33,10 @@ class QSL : public mlperf::QuerySampleLibrary {
   const std::string& Name() override { return mName; }
   size_t TotalSampleCount() override { return 1000000; }
   size_t PerformanceSampleCount() override { return TotalSampleCount(); }
-  void LoadSamplesToRam(
-      const std::vector<mlperf::QuerySampleIndex>& samples) override {}
+  void LoadSamplesToRam(const std::vector<mlperf::QuerySampleIndex>&) override {
+  }
   void UnloadSamplesFromRam(
-      const std::vector<mlperf::QuerySampleIndex>& samples) override {}
+      const std::vector<mlperf::QuerySampleIndex>&) override {}
 
  private:
   std::string mName{"Dummy QSL"};
@@ -51,14 +51,14 @@ class BasicSUT : public mlperf::SystemUnderTest {
   ~BasicSUT() override {}
   const std::string& Name() override { return mName; }
   void IssueQuery(const std::vector<mlperf::QuerySample>& samples) override {
-    int n = samples.size();
+    size_t n = samples.size();
     if (n > mResponses.size()) {
       std::cerr << "Warning: reallocating response buffer in BasicSUT. Maybe "
                    "you should initResponse with larger value!?"
                 << std::endl;
       initResponse(samples.size());
     }
-    for (int i = 0; i < n; i++) {
+    for (size_t i = 0; i < n; i++) {
       mResponses[i].id = samples[i].id;
     }
     mlperf::QuerySamplesComplete(mResponses.data(), n);
@@ -122,7 +122,7 @@ class QueueSUT : public mlperf::SystemUnderTest {
         }
 
         actualSize = std::min(maxSize, mIdQueue.size());
-        for (int i = 0; i < actualSize; i++) {
+        for (size_t i = 0; i < actualSize; i++) {
           responses[i].id = mIdQueue.front();
           mIdQueue.pop_front();
         }
@@ -166,7 +166,7 @@ class MultiBasicSUT : public mlperf::SystemUnderTest {
   const std::string& Name() override { return mName; }
   void IssueQuery(const std::vector<mlperf::QuerySample>& samples) override {
     int thread_idx = mThreadMap[std::this_thread::get_id()];
-    int n = samples.size();
+    size_t n = samples.size();
     auto& reponses = mResponses[thread_idx];
     if (n > reponses.size()) {
       std::cout
@@ -175,7 +175,7 @@ class MultiBasicSUT : public mlperf::SystemUnderTest {
           << std::endl;
       initResponse(samples.size());
     }
-    for (int i = 0; i < n; i++) {
+    for (size_t i = 0; i < n; i++) {
       reponses[i].id = samples[i].id;
     }
     mlperf::QuerySamplesComplete(reponses.data(), n);
