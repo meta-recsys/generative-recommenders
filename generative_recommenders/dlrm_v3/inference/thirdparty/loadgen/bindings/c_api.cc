@@ -155,15 +155,14 @@ void QuerySamplesCompleteResponseCb(QuerySampleResponse* responses,
       });
 }
 
-void FirstTokenComplete(QuerySampleResponse* responses,
-                          size_t response_count) {
+void FirstTokenComplete(QuerySampleResponse* responses, size_t response_count) {
   mlperf::FirstTokenComplete(responses, response_count);
 }
 
 void FirstTokenCompleteResponseCb(QuerySampleResponse* responses,
-                                    size_t response_count,
-                                    ResponseCallback response_cb,
-                                    ClientData client_data) {
+                                  size_t response_count,
+                                  ResponseCallback response_cb,
+                                  ClientData client_data) {
   mlperf::FirstTokenComplete(
       responses, response_count,
       [client_data, response_cb](QuerySampleResponse* response) {

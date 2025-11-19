@@ -180,10 +180,10 @@ struct TestSettings {
   double offline_expected_qps = 1;
   /// \brief Affects the order in which the samples of the dataset are chosen.
   /// If false it concatenates a single permutation of the dataset (or part
-  /// of it depending on QSL->PerformanceSampleCount()) several times up to the 
+  /// of it depending on QSL->PerformanceSampleCount()) several times up to the
   /// number of samples requested.
-  /// If true it concatenates a multiple permutation of the dataset (or a 
-  /// part of it depending on QSL->PerformanceSampleCount()) several times  
+  /// If true it concatenates a multiple permutation of the dataset (or a
+  /// part of it depending on QSL->PerformanceSampleCount()) several times
   /// up to the number of samples requested.
   bool sample_concatenate_permutation = false;
   /**@}*/
@@ -228,7 +228,8 @@ struct TestSettings {
   uint64_t accuracy_log_sampling_target = 0;
 
   /// \brief Variables for running test05 from native config. A boolean that
-  /// determines whether or not to run test05 and three random seed to run the test
+  /// determines whether or not to run test05 and three random seed to run the
+  /// test
   bool test05 = false;
   uint64_t test05_qsl_rng_seed = 0;
   uint64_t test05_sample_index_rng_seed = 0;
@@ -236,7 +237,7 @@ struct TestSettings {
 
   /// \brief Load mlperf parameter config from file.
   int FromConfig(const std::string &path, const std::string &model,
-                 const std::string &scenario);
+                 const std::string &scenario, int conf_type = 1);
   /**@}*/
 
   // ==================================

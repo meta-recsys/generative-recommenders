@@ -71,8 +71,8 @@ struct ResponseDelegate {
                               PerfClock::time_point,
                               const ResponseCallback&) = 0;
   virtual void TokenComplete(SampleMetadata*, QuerySampleResponse*,
-                              PerfClock::time_point,
-                              const ResponseCallback&) = 0;
+                             PerfClock::time_point,
+                             const ResponseCallback&) = 0;
   virtual void QueryComplete() = 0;
   std::atomic<size_t> queries_completed{0};
 };

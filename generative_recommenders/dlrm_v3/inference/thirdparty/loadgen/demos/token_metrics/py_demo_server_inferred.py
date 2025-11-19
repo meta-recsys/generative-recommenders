@@ -27,15 +27,20 @@ import numpy as np
 from absl import app
 import mlperf_loadgen
 
-def f(x, y):
-    return (4 + 3*x*y + x**3 + y**2)
 
-def create_responses(n, m, mod = 4):
+def f(x, y):
+    return 4 + 3 * x * y + x**3 + y**2
+
+
+def create_responses(n, m, mod=4):
     r = []
     for i in range(n):
-        r.append([f(i,j) for j in range(m + (i%mod))])
+        r.append([f(i, j) for j in range(m + (i % mod))])
     return r
-responses = create_responses(1024, 20, mod = 3)
+
+
+responses = create_responses(1024, 20, mod=3)
+
 
 def load_samples_to_ram(query_samples):
     del query_samples
@@ -53,12 +58,12 @@ def process_query_async(query_samples):
     for s in query_samples:
         response_array = np.array(responses[s.index], np.int32)
         token = response_array[0]
-        time.sleep(.0002)
+        time.sleep(0.0002)
         response_token = array.array("B", token.tobytes())
         response_token_info = response_token.buffer_info()
         response_token_data = response_token_info[0]
         response_token_size = response_token_info[1] * response_token.itemsize
-        time.sleep(.02)
+        time.sleep(0.02)
         n_tokens = len(response_array)
         response_array = array.array("B", response_array.tobytes())
         response_info = response_array.buffer_info()
@@ -67,26 +72,30 @@ def process_query_async(query_samples):
         # print(f"Reported size python: {n_tokens}")
         query_responses.append(
             mlperf_loadgen.QuerySampleResponse(
-                s.id, response_data, response_size))
+                s.id, response_data, response_size)
+        )
     mlperf_loadgen.QuerySamplesComplete(query_responses)
 
 
 def issue_query(query_samples):
-    threading.Thread(target=process_query_async,
-                     args=[query_samples]).start()
+    threading.Thread(target=process_query_async, args=[query_samples]).start()
 
 
 def flush_queries():
     pass
 
+
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["performance", "accuracy"], default="performance")
+    parser.add_argument(
+        "--mode", choices=["performance", "accuracy"], default="performance"
+    )
     parser.add_argument("--target-qps", type=int, default=100)
     parser.add_argument("--target-latency-ns", type=int, default=100000000)
     parser.add_argument("--min-query-count", type=int, default=100)
     parser.add_argument("--min-duration-ms", type=int, default=30000)
     return parser.parse_args()
+
 
 def main():
     args = get_args()
@@ -105,7 +114,8 @@ def main():
 
     sut = mlperf_loadgen.ConstructSUT(issue_query, flush_queries)
     qsl = mlperf_loadgen.ConstructQSL(
-        1024, 128, load_samples_to_ram, unload_samples_from_ram)
+        1024, 128, load_samples_to_ram, unload_samples_from_ram
+    )
     mlperf_loadgen.StartTest(sut, qsl, settings)
     mlperf_loadgen.DestroyQSL(qsl)
     mlperf_loadgen.DestroySUT(sut)
@@ -113,4 +123,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

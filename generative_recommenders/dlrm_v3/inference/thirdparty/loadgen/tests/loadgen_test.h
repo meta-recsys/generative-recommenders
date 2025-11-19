@@ -30,10 +30,10 @@ limitations under the License.
   static Test::StaticRegistrant t##name##scenario(        \
       #name "_" #scenario, test, __VA_ARGS__, mlperf::TestScenario::scenario)
 
-#define REGISTER_TEST_ALL_SCENARIOS(name, test, ...)                \
-  REGISTER_TEST_SCENARIO(name, SingleStream, test, __VA_ARGS__);    \
-  REGISTER_TEST_SCENARIO(name, MultiStream, test, __VA_ARGS__);     \
-  REGISTER_TEST_SCENARIO(name, Server, test, __VA_ARGS__);          \
+#define REGISTER_TEST_ALL_SCENARIOS(name, test, ...)             \
+  REGISTER_TEST_SCENARIO(name, SingleStream, test, __VA_ARGS__); \
+  REGISTER_TEST_SCENARIO(name, MultiStream, test, __VA_ARGS__);  \
+  REGISTER_TEST_SCENARIO(name, Server, test, __VA_ARGS__);       \
   REGISTER_TEST_SCENARIO(name, Offline, test, __VA_ARGS__);
 
 #define FAIL_IF(exp)                                              \

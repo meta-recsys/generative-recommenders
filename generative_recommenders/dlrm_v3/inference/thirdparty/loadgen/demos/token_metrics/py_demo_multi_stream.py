@@ -30,17 +30,22 @@ from datetime import datetime
 
 # Global var
 NUM_AGENTS = 8
-LOOPBACK_LATENCY_S = .001
+LOOPBACK_LATENCY_S = 0.001
+
 
 def f(x, y):
-    return (4 + 3*x*y + x**3 + y**2)
+    return 4 + 3 * x * y + x**3 + y**2
 
-def create_responses(n, m, mod = 4):
+
+def create_responses(n, m, mod=4):
     r = []
     for i in range(n):
-        r.append([f(i,j) for j in range(m + (i%mod))])
+        r.append([f(i, j) for j in range(m + (i % mod))])
     return r
+
+
 responses = create_responses(1024, 20)
+
 
 def load_samples_to_ram(query_samples):
     del query_samples
@@ -56,17 +61,24 @@ def unload_samples_from_ram(query_samples):
 def process_query_async(query_samples, i_slice):
     time.sleep(LOOPBACK_LATENCY_S * (i_slice + 1))
     query_responses = []
-    samples_to_complete = query_samples[i_slice:len(query_samples):NUM_AGENTS]
+    samples_to_complete = query_samples[i_slice: len(
+        query_samples): NUM_AGENTS]
     for j, s in enumerate(samples_to_complete):
         response_array = np.array(responses[s.index], np.int32)
         token = response_array[0]
-        time.sleep(.0002)
+        time.sleep(0.0002)
         response_token = array.array("B", token.tobytes())
         response_token_info = response_token.buffer_info()
         response_token_data = response_token_info[0]
         response_token_size = response_token_info[1] * response_token.itemsize
-        mlperf_loadgen.FirstTokenComplete([mlperf_loadgen.QuerySampleResponse(s.id, response_token_data, response_token_size)])
-        time.sleep(.02)
+        mlperf_loadgen.FirstTokenComplete(
+            [
+                mlperf_loadgen.QuerySampleResponse(
+                    s.id, response_token_data, response_token_size
+                )
+            ]
+        )
+        time.sleep(0.02)
         n_tokens = len(response_array)
         response_array = array.array("B", response_array.tobytes())
         response_info = response_array.buffer_info()
@@ -74,14 +86,17 @@ def process_query_async(query_samples, i_slice):
         response_size = response_info[1] * response_array.itemsize
         query_responses.append(
             mlperf_loadgen.QuerySampleResponse(
-                s.id, response_data, response_size, n_tokens))
+                s.id, response_data, response_size, n_tokens
+            )
+        )
     mlperf_loadgen.QuerySamplesComplete(query_responses)
 
 
 def issue_query(query_samples):
     for i in range(8):
-        threading.Thread(target=process_query_async,
-                         args=(query_samples, i)).start()
+        threading.Thread(
+            target=process_query_async, args=(
+                query_samples, i)).start()
 
 
 def flush_queries():
@@ -90,7 +105,9 @@ def flush_queries():
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["performance", "accuracy"], default="performance")
+    parser.add_argument(
+        "--mode", choices=["performance", "accuracy"], default="performance"
+    )
     parser.add_argument("--expected-latency", type=int, default=8000000)
     parser.add_argument("--samples-per-query", type=int, default=8)
     parser.add_argument("--min-query-count", type=int, default=100)
@@ -114,7 +131,8 @@ def main():
 
     sut = mlperf_loadgen.ConstructSUT(issue_query, flush_queries)
     qsl = mlperf_loadgen.ConstructQSL(
-        1024, 128, load_samples_to_ram, unload_samples_from_ram)
+        1024, 128, load_samples_to_ram, unload_samples_from_ram
+    )
     mlperf_loadgen.StartTest(sut, qsl, settings)
     mlperf_loadgen.DestroyQSL(qsl)
     mlperf_loadgen.DestroySUT(sut)

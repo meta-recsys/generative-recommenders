@@ -168,3 +168,56 @@ It is not specified here how the QDL would query and configure the SUT to execut
 ### Example
 
 Refer to [LON demo](demos/lon) for a reference example illustrating usage of Loadgen over the network.
+
+## Find Peak Performance Mode
+
+The Find Peak Performance mode can be used to find the optimal queries per second (QPS) for the server scenario.
+
+### Setup
+
+You can setup loadgen to run this mode by setting the `mode` variable in the `test_settings` used to run the test. Using the Python API:
+
+```python
+settings = mlperf_loadgen.TestSettings()
+settings.server_target_qps = 100
+settings.scenario = mlperf_loadgen.TestScenario.Server
+settings.mode = mlperf_loadgen.TestMode.FindPeakPerformance
+...
+
+mlperf_loadgen.StartTest(sut, qsl, settings)
+```
+
+Using the C/C++ API:
+```CPP
+mlperf::TestSettings settings;
+setting.server_target_qps = 100;
+settings.scenario = mlperf::TestScenario::Server;
+settings.mode = mlperf::TestMode::FindPeakPerformance;
+mlperf::LogSettings log_settings;
+/*
+Construct QSL and SUT
+*/
+mlperf::StartTest(&sut, &qsl, settings, log_settings);
+```
+
+**Note:** Make sure you are setting the TestScenario to server and you are providing an initial target QPS.
+
+### Description
+
+The Find Peak Performance mode works by finding a lower and upper boundary for the optimal QPS. Then performing a binary search between the lower and upper bound to find the optimal QPS.
+
+#### Finding lower and upper boundary
+
+LoadGen begins by running performance mode at the specified target QPS. If the test passes, this value is used as the lower bound; otherwise, an error is raised. The algorithm then guesses the upper bound as twice the target QPS. 
+
+Then LoadGen will run performance mode using the upper bound guess. If the test is successful, both the lower bound and upper bound will be doubled. This repeats until the upper bound guess fails the test.
+
+```
+[initial_target_qps, 2*initial_target_qps] -> [2*initial_target_qps, 4*initial_target_qps] -> [4*initial_target_qps, 8*initial_target_qps]...
+```
+
+Finally, the final lower bound and upper bound are set to their current values. This process assures that the lower bound passes the performance mode, but the upper bound doesn’t.
+
+#### Binary Search
+
+Once the lower and upper bounds are set, binary search can be performed over the range `[lower, upper]`` to find the optimal QPS. If a given QPS fails in performance mode, the optimal value lies below it; if it passes, the optimal is higher.

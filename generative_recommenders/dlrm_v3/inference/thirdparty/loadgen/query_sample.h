@@ -21,6 +21,7 @@ limitations under the License.
 
 #include <stddef.h>
 #include <stdint.h>
+
 #include <iostream>
 
 namespace mlperf {
@@ -51,28 +52,33 @@ struct QuerySampleResponse {
   uintptr_t data;
   size_t size;  ///< Size in bytes.
   int64_t n_tokens;
-  public:
-    QuerySampleResponse(ResponseId id, uintptr_t data, size_t size, int64_t n_tokens)
-    : id(id), 
-    data(data), 
-    size(size), 
-    n_tokens(n_tokens){
-      //std::cout << "Initialized with 4 arguments, n_tokens: " << n_tokens <<"\n";
-    };
-    QuerySampleResponse(ResponseId id, uintptr_t data, size_t size)
-    : id(id), 
-    data(data), 
-    size(size), 
-    n_tokens(0){
-      //std::cout << "Initialized with 3 arguments, n_tokens: " << n_tokens <<"\n";
-    };
-    QuerySampleResponse()
-    : id(0), 
-    data(0), 
-    size(0), 
-    n_tokens(0){
-      //std::cout << "Initialized with 0 arguments, n_tokens: " << n_tokens <<"\n";
-    };
+
+ public:
+  QuerySampleResponse(ResponseId id, uintptr_t data, size_t size,
+                      int64_t n_tokens)
+      : id(id),
+        data(data),
+        size(size),
+        n_tokens(n_tokens){
+            // std::cout << "Initialized with 4 arguments, n_tokens: " <<
+            // n_tokens <<"\n";
+        };
+  QuerySampleResponse(ResponseId id, uintptr_t data, size_t size)
+      : id(id),
+        data(data),
+        size(size),
+        n_tokens(0){
+            // std::cout << "Initialized with 3 arguments, n_tokens: " <<
+            // n_tokens <<"\n";
+        };
+  QuerySampleResponse()
+      : id(0),
+        data(0),
+        size(0),
+        n_tokens(0){
+            // std::cout << "Initialized with 0 arguments, n_tokens: " <<
+            // n_tokens <<"\n";
+        };
 };
 
 /// \brief A latency in nanoseconds, as recorded by the loadgen.

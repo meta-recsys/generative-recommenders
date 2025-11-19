@@ -19,9 +19,8 @@ limitations under the License.
 
 #include <cstddef>
 #include <functional>
-#include <string>
 #include <numeric>
-
+#include <string>
 
 /// \brief Contains the loadgen API.
 namespace mlperf {
@@ -66,7 +65,7 @@ void QuerySamplesComplete(QuerySampleResponse* responses, size_t response_count,
                           const ResponseCallback& response_cb = {});
 
 void FirstTokenComplete(QuerySampleResponse* responses, size_t response_count,
-                          const ResponseCallback& response_cb = {});
+                        const ResponseCallback& response_cb = {});
 
 ///
 /// \brief Starts the test against SUT with the specified settings.

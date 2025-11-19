@@ -102,7 +102,7 @@ TestSettingsInternal MidOfBoundaries(
     const TestSettingsInternal &lower_bound_settings,
     const TestSettingsInternal &upper_bound_settings) {
   TestSettingsInternal mid_settings = lower_bound_settings;
-if (scenario == TestScenario::Server) {
+  if (scenario == TestScenario::Server) {
     assert(lower_bound_settings.target_qps < upper_bound_settings.target_qps);
     mid_settings.target_qps =
         lower_bound_settings.target_qps +
@@ -122,7 +122,7 @@ if (scenario == TestScenario::Server) {
 template <TestScenario scenario>
 bool IsFinished(const TestSettingsInternal &lower_bound_settings,
                 const TestSettingsInternal &upper_bound_settings) {
-if (scenario == TestScenario::Server) {
+  if (scenario == TestScenario::Server) {
     uint8_t precision = lower_bound_settings.requested
                             .server_find_peak_qps_decimals_of_precision;
     double l =

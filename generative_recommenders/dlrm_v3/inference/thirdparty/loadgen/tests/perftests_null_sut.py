@@ -50,7 +50,8 @@ def main(argv):
 
     sut = mlperf_loadgen.ConstructSUT(issue_query, flush_queries)
     qsl = mlperf_loadgen.ConstructQSL(
-        1024 * 1024, 1024, load_samples_to_ram, unload_samples_from_ram)
+        1024 * 1024, 1024, load_samples_to_ram, unload_samples_from_ram
+    )
     mlperf_loadgen.StartTest(sut, qsl, settings)
     mlperf_loadgen.DestroyQSL(qsl)
     mlperf_loadgen.DestroySUT(sut)

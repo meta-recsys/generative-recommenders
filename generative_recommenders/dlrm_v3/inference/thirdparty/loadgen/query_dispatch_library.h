@@ -25,8 +25,10 @@ namespace mlperf {
 /// \addtogroup LoadgenAPI
 /// @{
 
-/// \brief The interface a client implements for the LoadGen over the network to test. The API inherits the System_under_test.h API
-/// When working in LON mode the QueryDispatchLibrary class is used and natively Upcasted to the QueryDispatchLibrary class.
+/// \brief The interface a client implements for the LoadGen over the network to
+/// test. The API inherits the System_under_test.h API When working in LON mode
+/// the QueryDispatchLibrary class is used and natively Upcasted to the
+/// QueryDispatchLibrary class.
 
 class QueryDispatchLibrary : public SystemUnderTest {
  public:

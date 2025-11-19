@@ -32,8 +32,9 @@ import mlperf_loadgen
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_list('sut_server', 'http://localhost:8000',
-                    'Address of the server(s) under test.')
+flags.DEFINE_list(
+    "sut_server", "http://localhost:8000", "Address of the server(s) under test."
+)
 
 
 class QSL:
@@ -41,9 +42,14 @@ class QSL:
 
     def __init__(self, total_sample_count, performance_sample_count):
         self.eval_features = {
-            i: f"what_is_my_dummy_feature_{i}?" for i in range(total_sample_count)}
+            i: f"what_is_my_dummy_feature_{i}?" for i in range(total_sample_count)
+        }
         self.qsl = mlperf_loadgen.ConstructQSL(
-            total_sample_count, performance_sample_count, self.load_samples_to_ram, self.unload_samples_from_ram)
+            total_sample_count,
+            performance_sample_count,
+            self.load_samples_to_ram,
+            self.unload_samples_from_ram,
+        )
 
     def get_features(self, sample_id):
         """Returns the feature for a given sample id."""
@@ -81,10 +87,11 @@ class QDL:
             sut_server_addr: A list of addresses of the SUT.
         """
         self.qsl = qsl
- 
+
         # Construct QDL from the python binding
         self.qdl = mlperf_loadgen.ConstructQDL(
-            self.issue_query, self.flush_queries, self.client_get_name)
+            self.issue_query, self.flush_queries, self.client_get_name
+        )
         self.sut_server_addr = sut_server_addr
         self.num_nodes = len(sut_server_addr)
 
@@ -94,8 +101,9 @@ class QDL:
 
     def issue_query(self, query_samples):
         """Process the query to send to the SUT"""
-        threading.Thread(target=self.process_query_async,
-                         args=[query_samples]).start()
+        threading.Thread(
+            target=self.process_query_async,
+            args=[query_samples]).start()
 
     def flush_queries(self):
         """Flush the queries. Dummy implementation."""
@@ -120,15 +128,16 @@ class QDL:
             # Read features from the QSL
             features = self.qsl.get_features(s.index)
 
-            time.sleep(.001)  # Ensure a maximal rate of queries to the SUT
+            time.sleep(0.001)  # Ensure a maximal rate of queries to the SUT
 
             # Send the query to SUT in round robin
             # Wait for a response
             sut_result = self.client_predict(features, s.index)
-            response_array = array.array('B', sut_result.encode('utf-8'))
+            response_array = array.array("B", sut_result.encode("utf-8"))
             bi = response_array.buffer_info()
-            responses.append(mlperf_loadgen.QuerySampleResponse(
-                s.id, bi[0], bi[1]))
+            responses.append(
+                mlperf_loadgen.QuerySampleResponse(
+                    s.id, bi[0], bi[1]))
         mlperf_loadgen.QuerySamplesComplete(responses)
 
     def get_sut_id_round_robin(self):
@@ -140,17 +149,22 @@ class QDL:
 
     def client_predict(self, query, id):
         """Serialize the query, send it to the SUT in round robin, and return the deserialized response."""
-        url = '{}/predict/'.format(self.sut_server_addr[self.get_sut_id_round_robin()])
-        response = requests.post(url, json={'query': query, id: id})
-        return response.json()['result']
+        url = "{}/predict/".format(
+            self.sut_server_addr[self.get_sut_id_round_robin()])
+        response = requests.post(url, json={"query": query, id: id})
+        return response.json()["result"]
 
     def client_get_name(self):
         """Get the name of the SUT from ALL the SUTS."""
         if len(self.sut_server_addr) == 1:
-            return requests.post(f'{self.sut_server_addr[0]}/getname/').json()['name']
-    
-        sut_names = [requests.post(f'{addr}/getname/').json()['name'] for addr in self.sut_server_addr]
-        return "Multi-node SUT: " + ', '.join(sut_names)
+            return requests.post(
+                f"{self.sut_server_addr[0]}/getname/").json()["name"]
+
+        sut_names = [
+            requests.post(f"{addr}/getname/").json()["name"]
+            for addr in self.sut_server_addr
+        ]
+        return "Multi-node SUT: " + ", ".join(sut_names)
 
     def __del__(self):
         mlperf_loadgen.DestroyQDL(self.qdl)

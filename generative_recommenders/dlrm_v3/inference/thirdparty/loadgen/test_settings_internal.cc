@@ -18,6 +18,7 @@ limitations under the License.
 #include <string>
 
 #include "logging.h"
+#include "mlperf_conf.h"
 #include "utils.h"
 
 namespace mlperf {
@@ -53,7 +54,7 @@ TestSettingsInternal::TestSettingsInternal(
       server_ttft_latency(requested.server_ttft_latency),
       server_tpot_latency(requested.server_tpot_latency),
       infer_token_latencies(requested.infer_token_latencies),
-      token_latency_scaling_factor(requested.token_latency_scaling_factor){
+      token_latency_scaling_factor(requested.token_latency_scaling_factor) {
   // Target QPS, target latency, and max_async_queries.
   switch (requested.scenario) {
     case TestScenario::SingleStream:
@@ -158,14 +159,15 @@ TestSettingsInternal::TestSettingsInternal(
   // performance_sample_count == 0 makes it to be equal to loaded_samples.size()
   if (sample_concatenate_permutation &&
       requested.scenario == TestScenario::SingleStream) {
-    // set slack larger for 3D-UNet KiTS19 distribution, i.e. 50% latency << 90% latency
+    // set slack larger for 3D-UNet KiTS19 distribution, i.e. 50% latency << 90%
+    // latency
     constexpr double kSlack = 2.0;
-    uint64_t expected_queries = kSlack * DurationToSeconds(target_duration) * target_qps;
-    min_query_count = min_query_count > expected_queries 
-                      ? min_query_count
-                      : expected_queries;
-    min_query_count += 
-        qsl_performance_sample_count - (min_query_count  % qsl_performance_sample_count);
+    uint64_t expected_queries =
+        kSlack * DurationToSeconds(target_duration) * target_qps;
+    min_query_count =
+        min_query_count > expected_queries ? min_query_count : expected_queries;
+    min_query_count += qsl_performance_sample_count -
+                       (min_query_count % qsl_performance_sample_count);
   }
 
   min_sample_count = min_query_count * samples_per_query;
@@ -335,13 +337,16 @@ void LogRequestedTestSettings(const TestSettings &s) {
     MLPERF_LOG(detail, "requested_performance_sample_count_override",
                s.performance_sample_count_override);
     MLPERF_LOG(detail, "requested_sample_concatenate_permutation",
-            s.sample_concatenate_permutation);
+               s.sample_concatenate_permutation);
     // Token latencies specific values
-    if (s.use_token_latencies){
-      MLPERF_LOG(detail, "requested_use_token_latencies", s.use_token_latencies);
-      if (s.scenario != TestScenario::Offline){
-        MLPERF_LOG(detail, "requested_server_ttft_latency", s.server_ttft_latency);
-        MLPERF_LOG(detail, "requested_server_tpot_latency", s.server_tpot_latency);
+    if (s.use_token_latencies) {
+      MLPERF_LOG(detail, "requested_use_token_latencies",
+                 s.use_token_latencies);
+      if (s.scenario != TestScenario::Offline) {
+        MLPERF_LOG(detail, "requested_server_ttft_latency",
+                   s.server_ttft_latency);
+        MLPERF_LOG(detail, "requested_server_tpot_latency",
+                   s.server_tpot_latency);
       }
     }
 #else
@@ -488,7 +493,7 @@ void TestSettingsInternal::LogAllSettings() const {
 void TestSettingsInternal::LogSummary(AsyncSummary &summary) const {
   summary("samples_per_query : ", samples_per_query);
   summary("target_qps : ", target_qps);
-  if (!use_token_latencies){
+  if (!use_token_latencies) {
     summary("target_latency (ns): ", target_latency.count());
   } else {
     summary("ttft_latency (ns): ", server_ttft_latency);
@@ -510,17 +515,41 @@ void TestSettingsInternal::LogSummary(AsyncSummary &summary) const {
   summary("performance_issue_same : ", performance_issue_same);
   summary("performance_issue_same_index : ", performance_issue_same_index);
   summary("performance_sample_count : ", performance_sample_count);
+  if (sample_concatenate_permutation) {
+    summary(
+        "WARNING: sample_concatenate_permutation was set to true. \n"
+        "Generated samples per query might be different as the one in the "
+        "setting.\n"
+        "Check the generated_samples_per_query line in the detailed log for "
+        "the real\n"
+        "samples_per_query value");
+  }
 }
 
 }  // namespace loadgen
 
-/// \todo The TestSettings::FromConfig definition belongs in a test_settings.cc
-/// file which doesn't yet exist. To avoid churn so close to the submission
-/// deadline, adding a test_settings.cc file has been deferred to v0.6.
 int TestSettings::FromConfig(const std::string &path, const std::string &model,
-                             const std::string &scenario) {
-  // TODO: move this method to a new file test_settings.cc
+                             const std::string &scenario, int conf_type) {
   std::map<std::string, std::string> kv;
+  static int configCount = 0;
+
+  if (conf_type == 1) {
+    if (configCount == 0) {
+      // Only allow userConf as the single configFile and loadgen loads the
+      // mlperfConf automatically for perf and accuracy runs
+      FromConfig("", model, scenario, 0);
+    }
+
+    else {
+      LogDetail([](AsyncDetail &detail) {
+        std::stringstream ss;
+        ss << "Multiple conf files are used. This is not valid for official "
+              "submission.";
+        MLPERF_LOG_ERROR(detail, "error_invalid_config", ss.str());
+      });
+    }
+    configCount++;
+  }
 
   // lookup key/value pairs from config
   auto lookupkv = [&](const std::string &model, const std::string &scenario,
@@ -560,24 +589,33 @@ int TestSettings::FromConfig(const std::string &path, const std::string &model,
     return true;
   };
 
-  // dirt simple config parser
-  std::ifstream fss(path);
-  std::string line;
   int line_nr = 0;
   int errors = 0;
-  if (!fss.is_open()) {
-    LogDetail([p = path](AsyncDetail &detail) {
+  // Declare the input stream before the if-else block
+  std::unique_ptr<std::istream> fss;
+  std::string line;
+
+  if (conf_type != 0) {
+    // dirt simple config parser
+    fss = std::make_unique<std::ifstream>(path);
+    if (!static_cast<std::ifstream *>(fss.get())->is_open()) {
+      LogDetail([p = path](AsyncDetail &detail) {
 #if USE_NEW_LOGGING_FORMAT
-      std::stringstream ss;
-      ss << "can't open file " << p;
-      MLPERF_LOG_ERROR(detail, "error_invalid_config", ss.str());
+        std::stringstream ss;
+        ss << "can't open file " << p;
+        MLPERF_LOG_ERROR(detail, "error_invalid_config", ss.str());
 #else
-      detail.Error("can't open file ", p);
+        detail.Error("can't open file ", p);
 #endif
-    });
-    return -ENOENT;
+      });
+      return -ENOENT;
+    }
+  } else {
+    // Convert unsigned char array to std::string
+    std::string config_str(mlperf_conf);
+    fss = std::make_unique<std::istringstream>(config_str);
   }
-  while (std::getline(fss, line)) {
+  while (std::getline(*fss, line)) {
     line_nr++;
     std::istringstream iss(line);
     std::string s, k;
@@ -662,66 +700,53 @@ int TestSettings::FromConfig(const std::string &path, const std::string &model,
         break;
     }
   }
-  lookupkv(model, scenario, "min_duration", &min_duration_ms, nullptr);
-  lookupkv(model, scenario, "max_duration", &max_duration_ms, nullptr);
-  lookupkv(model, scenario, "min_query_count", &min_query_count, nullptr);
-  lookupkv(model, scenario, "max_query_count", &max_query_count, nullptr);
-  lookupkv(model, scenario, "qsl_rng_seed", &qsl_rng_seed, nullptr);
-  lookupkv(model, scenario, "sample_index_rng_seed", &sample_index_rng_seed,
-           nullptr);
-  lookupkv(model, scenario, "schedule_rng_seed", &schedule_rng_seed, nullptr);
-  lookupkv(model, scenario, "accuracy_log_rng_seed", &accuracy_log_rng_seed,
-           nullptr);
-  lookupkv(model, scenario, "accuracy_log_probability", nullptr,
-           &accuracy_log_probability, 0.01);
-  lookupkv(model, scenario, "accuracy_log_sampling_target",
-           &accuracy_log_sampling_target, nullptr);
-  if (lookupkv(model, scenario, "print_timestamps", &val, nullptr))
-    print_timestamps = (val == 0) ? false : true;
-  if (lookupkv(model, scenario, "performance_issue_unique", &val, nullptr))
-    performance_issue_unique = (val == 0) ? false : true;
-  if (lookupkv(model, scenario, "performance_issue_same", &val, nullptr))
-    performance_issue_same = (val == 0) ? false : true;
-  lookupkv(model, scenario, "performance_issue_same_index",
-           &performance_issue_same_index, nullptr);
-  lookupkv(model, scenario, "performance_sample_count_override",
-           &performance_sample_count_override, nullptr);
-  if (lookupkv(model, scenario, "sample_concatenate_permutation", &val, nullptr))
-    sample_concatenate_permutation = (val == 1) ? true : false;
-  if (lookupkv(model, scenario, "test05", &val, nullptr))
-    test05 = (val == 1) ? true : false;
-  lookupkv(model, scenario, "test05_qsl_rng_seed", &test05_qsl_rng_seed, nullptr);
-  lookupkv(model, scenario, "test05_sample_index_rng_seed", &test05_sample_index_rng_seed,
-           nullptr);
-  lookupkv(model, scenario, "test05_schedule_rng_seed", &test05_schedule_rng_seed, nullptr);
+
+  if (conf_type == 0) {
+    lookupkv(model, scenario, "qsl_rng_seed", &qsl_rng_seed, nullptr);
+    lookupkv(model, scenario, "sample_index_rng_seed", &sample_index_rng_seed,
+             nullptr);
+    lookupkv(model, scenario, "schedule_rng_seed", &schedule_rng_seed, nullptr);
+    lookupkv(model, scenario, "accuracy_log_probability", nullptr,
+             &accuracy_log_probability, 0.01);
+    if (lookupkv(model, scenario, "test05", &val, nullptr))
+      test05 = (val == 1) ? true : false;
+    lookupkv(model, scenario, "test05_qsl_rng_seed", &test05_qsl_rng_seed,
+             nullptr);
+    lookupkv(model, scenario, "test05_sample_index_rng_seed",
+             &test05_sample_index_rng_seed, nullptr);
+    lookupkv(model, scenario, "test05_schedule_rng_seed",
+             &test05_schedule_rng_seed, nullptr);
+  }
+
+  // keys that can be overriden in user.conf but will make the results eligible
+  // only for open submissions
 
   // keys to measure token metrics
-  if (lookupkv(model, scenario, "use_token_latencies", &val, nullptr)){
+  if (lookupkv(model, scenario, "use_token_latencies", &val, nullptr)) {
     use_token_latencies = (val == 1) ? true : false;
   }
-  if (use_token_latencies){
-    lookupkv(model, "Server", "ttft_latency", &server_ttft_latency, nullptr, 1000 * 1000);
-    lookupkv(model, "Server", "tpot_latency", &server_tpot_latency, nullptr, 1000 * 1000);
+  if (use_token_latencies) {
+    lookupkv(model, "Server", "ttft_latency", &server_ttft_latency, nullptr,
+             1000 * 1000);
+    lookupkv(model, "Server", "tpot_latency", &server_tpot_latency, nullptr,
+             1000 * 1000);
   }
 
   // keys to infer token metrics
-  if (lookupkv(model, scenario, "infer_token_latencies", &val, nullptr)){
+  if (lookupkv(model, scenario, "infer_token_latencies", &val, nullptr)) {
     infer_token_latencies = (val == 1) ? true : false;
   }
-  if (infer_token_latencies){
-    lookupkv(model, scenario, "token_latency_scaling_factor", &token_latency_scaling_factor, nullptr, 1);
+  if (infer_token_latencies) {
+    lookupkv(model, scenario, "token_latency_scaling_factor",
+             &token_latency_scaling_factor, nullptr, 1);
   }
   // keys that apply to SingleStream
   lookupkv(model, "SingleStream", "target_latency_percentile", nullptr,
            &single_stream_target_latency_percentile, 0.01);
-  lookupkv(model, "SingleStream", "target_latency", nullptr,
-           &single_stream_expected_latency_ns, 1000 * 1000);
 
   // keys that apply to MultiStream
   lookupkv(model, "MultiStream", "target_latency_percentile", nullptr,
            &multi_stream_target_latency_percentile, 0.01);
-  lookupkv(model, "MultiStream", "target_latency", nullptr,
-           &multi_stream_expected_latency_ns, 1000 * 1000);
   lookupkv(model, "MultiStream", "samples_per_query",
            &multi_stream_samples_per_query, nullptr, 1);
 
@@ -730,15 +755,45 @@ int TestSettings::FromConfig(const std::string &path, const std::string &model,
            &server_target_latency_percentile, 0.01);
   lookupkv(model, "Server", "target_latency", &server_target_latency_ns,
            nullptr, 1000 * 1000);
-  lookupkv(model, "Server", "target_qps", nullptr, &server_target_qps);
+
+  // keys that can be overriden in user.conf (the provided values still need to
+  // pass the submission checker rules)
+  if (lookupkv(model, scenario, "performance_issue_unique", &val, nullptr))
+    performance_issue_unique = (val == 0) ? false : true;
+  if (lookupkv(model, scenario, "performance_issue_same", &val, nullptr))
+    performance_issue_same = (val == 0) ? false : true;
+  lookupkv(model, scenario, "performance_issue_same_index",
+           &performance_issue_same_index, nullptr);
+
+  if (lookupkv(model, scenario, "sample_concatenate_permutation", &val,
+               nullptr))
+    sample_concatenate_permutation = (val == 1) ? true : false;
   if (lookupkv(model, "Server", "coalesce_queries", &val, nullptr))
     server_coalesce_queries = (val == 0) ? false : true;
   if (lookupkv(model, "Server", "max_async_queries", &val, nullptr))
     server_max_async_queries = int(val);
 
-  // keys that apply to Offline
-  lookupkv(model, "Offline", "target_qps", nullptr, &offline_expected_qps);
+  lookupkv(model, scenario, "min_duration", &min_duration_ms, nullptr);
+  lookupkv(model, scenario, "max_duration", &max_duration_ms, nullptr);
+  lookupkv(model, scenario, "min_query_count", &min_query_count, nullptr);
+  lookupkv(model, scenario, "max_query_count", &max_query_count, nullptr);
+  lookupkv(model, scenario, "performance_sample_count_override",
+           &performance_sample_count_override, nullptr);
+  lookupkv(model, "SingleStream", "target_latency", nullptr,
+           &single_stream_expected_latency_ns, 1000 * 1000);
+  lookupkv(model, "MultiStream", "target_latency", nullptr,
+           &multi_stream_expected_latency_ns, 1000 * 1000);
+  lookupkv(model, "Server", "target_qps", nullptr, &server_target_qps);
+  lookupkv(model, "Offline", "target_qps", 0, &offline_expected_qps);
 
+  if (lookupkv(model, scenario, "print_timestamps", &val, nullptr))
+    print_timestamps = (val == 0) ? false : true;
+
+  // keys that are used in audit.conf
+  lookupkv(model, scenario, "accuracy_log_rng_seed", &accuracy_log_rng_seed,
+           nullptr);
+  lookupkv(model, scenario, "accuracy_log_sampling_target",
+           &accuracy_log_sampling_target, nullptr);
   return 0;
 }
 
