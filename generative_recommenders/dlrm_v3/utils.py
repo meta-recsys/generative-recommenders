@@ -279,6 +279,7 @@ SUPPORTED_DATASETS = [
     "streaming-400m",
     "streaming-200b",
     "streaming-100b",
+    "sampled-streaming-100b",
 ]
 
 
@@ -373,6 +374,21 @@ def get_dataset(name: str, new_path_prefix: str = ""):
                 "total_ts": 100,
                 "num_files": 100,
                 "num_users": 5_000_000,
+                "num_items": 1_000_000_000,
+                "num_categories": 128,
+            },
+        )
+    if name == "sampled-streaming-100b":
+        return (
+            DLRMv3SyntheticStreamingDataset,
+            {
+                "ratings_file_prefix": os.path.join(
+                    new_path_prefix, "data/streaming-100b/sampled_data/"
+                ),
+                "train_ts": 90,
+                "total_ts": 100,
+                "num_files": 1,
+                "num_users": 50_000,
                 "num_items": 1_000_000_000,
                 "num_categories": 128,
             },

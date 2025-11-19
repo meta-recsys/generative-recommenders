@@ -240,6 +240,7 @@ class ModelFamilyDenseDist:
             max_hash_size=100,
             is_dense=True,
         ).to(torch.bfloat16)
+        model.set_training_dtype(torch.bfloat16)
         device = torch.device(f"cuda:{rank}")
         torch.cuda.set_device(f"cuda:{rank}")
         load_nonsparse_checkpoint(
@@ -399,6 +400,7 @@ class ModelFamilyDenseSingleWorker:
             .to(self.device)
             .to(torch.bfloat16)
         )
+        self.model.set_training_dtype(torch.bfloat16)
         load_nonsparse_checkpoint(
             model=self.model, device=self.device, optimizer=None, path=model_path
         )

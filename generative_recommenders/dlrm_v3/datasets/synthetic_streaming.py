@@ -14,13 +14,11 @@
 
 # pyre-strict
 import csv
-import linecache
 import logging
 import sys
 import time
 from typing import Any, Dict, List, Set, Tuple
 
-import numpy as np
 import pandas as pd
 import torch
 from generative_recommenders.dlrm_v3.datasets.dataset import DLRMv3RandomDataset
@@ -55,13 +53,12 @@ class DLRMv3SyntheticStreamingDataset(DLRMv3RandomDataset):
         self.file_to_offsets: Dict[int, List[int]] = {}
         with open(f"{self.ratings_file_prefix}offset.csv", "r") as file:
             reader = csv.reader(file)
-            size = 0
-            for row in reader:
+            for size in range(num_files):
+                row = next(reader)
                 assert len(row) == 1
                 offset = json_loads(row[0])
                 assert len(offset) == num_users // num_files
                 self.file_to_offsets[size] = offset
-                size += 1
         self.ts_requests_offsets: List[int] = []
         with open(f"{self.ratings_file_prefix}requests_per_ts_offset.csv", "r") as file:
             reader = csv.reader(file)
