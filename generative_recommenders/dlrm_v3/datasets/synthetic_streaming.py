@@ -21,7 +21,11 @@ from typing import Any, Dict, List, Set, Tuple
 
 import pandas as pd
 import torch
-from generative_recommenders.dlrm_v3.datasets.dataset import DLRMv3RandomDataset
+from generative_recommenders.dlrm_v3.datasets.dataset import (
+    collate_fn,
+    DLRMv3RandomDataset,
+    Samples,
+)
 from generative_recommenders.dlrm_v3.datasets.utils import (
     json_loads,
     maybe_truncate_seq,
@@ -116,6 +120,15 @@ class DLRMv3SyntheticStreamingDataset(DLRMv3RandomDataset):
 
     def get_sample(self, id: int) -> Tuple[KeyedJaggedTensor, KeyedJaggedTensor]:
         return self.items_in_memory[self.ts][id]
+
+    def get_sample_with_ts(
+        self, id: int, ts: int
+    ) -> Tuple[KeyedJaggedTensor, KeyedJaggedTensor]:
+        return self.items_in_memory[ts][id]
+
+    def get_samples_with_ts(self, id_list: List[int], ts: int) -> Samples:
+        list_samples = [self.get_sample_with_ts(ix, ts) for ix in id_list]
+        return collate_fn(list_samples)
 
     def _process_line(self, line: str, user_id: int) -> pd.Series:
         reader = csv.reader([line])

@@ -279,8 +279,9 @@ class StreamingQuerySampler:
             ts_idx += 1
         self.cnt += batch_size
         offset = 0 if ts_idx == 0 else self.num_requests_cumsum[ts_idx - 1]
-        return self.ds.get_samples(
-            self.run_order[ts_idx][self.cnt - batch_size - offset : self.cnt - offset]
+        return self.ds.get_samples_with_ts(
+            self.run_order[ts_idx][self.cnt - batch_size - offset : self.cnt - offset],
+            ts_idx + self.start_ts,
         )
 
     def get_item_count(self) -> int:
