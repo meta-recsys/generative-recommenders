@@ -31,7 +31,7 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("dlrmv3_dataset")
+logger: logging.Logger = logging.getLogger("dlrmv3_dataset")
 
 
 @dataclass
@@ -39,15 +39,13 @@ class Samples:
     uih_features_kjt: KeyedJaggedTensor
     candidates_features_kjt: KeyedJaggedTensor
 
-    def to(self, device: torch.device):
+    def to(self, device: torch.device) -> None:
         for attr in vars(self):
             setattr(self, attr, getattr(self, attr).to(device=device))
 
 
 def collate_fn(
-    samples: List[
-        Tuple[KeyedJaggedTensor, KeyedJaggedTensor, List[float], List[List[float]], int]
-    ],
+    samples: List[Tuple[KeyedJaggedTensor, KeyedJaggedTensor]],
 ) -> Samples:
     (
         uih_features_kjt_list,
