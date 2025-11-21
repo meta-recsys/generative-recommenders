@@ -22,6 +22,7 @@ from typing import List
 import torch
 from generative_recommenders.ops.pytorch.pt_layer_norm import (
     pytorch_layer_norm,
+    pytorch_rms_norm,
     pytorch_swish_layer_norm,
 )
 from generative_recommenders.ops.triton.triton_layer_norm import triton_rms_norm
@@ -30,6 +31,10 @@ try:
     from hammer.ops.triton.cc.swish_layer_norm.triton_cc_swish_layer_norm import (
         triton_cc_swish_layer_norm,
     )
+except ImportError:
+    pass
+try:
+    from hammer.ops.triton.cc.rms_norm.triton_cc_rms_norm import triton_cc_rms_norm
 except ImportError:
     pass
 from generative_recommenders.common import HammerKernel, HammerModule
@@ -72,6 +77,34 @@ def layer_norm(
             ],
             weight,
             bias,
+            eps,
+        )
+
+
+def rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-5,
+    kernel: HammerKernel = HammerKernel.PYTORCH,
+) -> torch.Tensor:
+    if kernel == HammerKernel.TRITON:
+        if not is_fx_tracing():
+            torch._assert(not x.is_cpu, "x must be device tensor")
+            torch._assert(not weight.is_cpu, "weight must be device tensor")
+        return triton_rms_norm(x, weight, eps)
+    elif kernel == HammerKernel.TRITON_CC:
+        return triton_cc_rms_norm(
+            x,
+            weight,
+            eps,
+        )
+    else:
+        return pytorch_rms_norm(
+            x,
+            [
+                x.shape[-1],
+            ],
+            weight,
             eps,
         )
 
@@ -147,15 +180,13 @@ class RMSNorm(HammerModule):
         self._eps = eps
         self.weight = torch.nn.Parameter(torch.ones(dim))
 
-    def _norm(self, x: torch.Tensor) -> torch.Tensor:
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self._eps)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.hammer_kernel() == HammerKernel.TRITON:
-            return triton_rms_norm(x, self.weight, self._eps)
-        else:
-            output = self._norm(x.float()).type_as(x)
-            return output * self.weight
+        return rms_norm(
+            x,
+            self.weight,
+            self._eps,
+            kernel=self.hammer_kernel(),
+        )
 
 
 class SwishLayerNorm(HammerModule):
