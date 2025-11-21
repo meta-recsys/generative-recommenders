@@ -141,10 +141,15 @@ class Runner:
                 assert mt_target_labels is not None
                 assert mt_target_weights is not None
                 assert self.metrics is not None
-                self.metrics.update(
+                candidates_features = qitem.samples.candidates_features_kjt
+                num_candidates = candidates_features.lengths().view(
+                    len(candidates_features.keys()), -1
+                )[0]
+                self.metrics.update(  # pyre-ignore [16]
                     predictions=mt_target_preds,
                     labels=mt_target_labels,
                     weights=mt_target_weights,
+                    num_candidates=num_candidates,
                 )
             self.result_timing.append(time.time() - t0)
             self.result_batches.append(len(qitem.query_ids))

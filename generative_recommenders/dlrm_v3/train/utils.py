@@ -459,6 +459,9 @@ def train_loop(
                 predictions=mt_target_preds,
                 labels=mt_target_labels,
                 weights=mt_target_weights,
+                num_candidates=sample.candidates_features_kjt.lengths().view(
+                    len(sample.candidates_features_kjt.keys()), -1
+                )[0],
             )
             if batch_idx % metric_log_frequency != 0:
                 metric_logger.compute_and_log(
@@ -520,6 +523,9 @@ def eval_loop(
                 predictions=mt_target_preds,
                 labels=mt_target_labels,
                 weights=mt_target_weights,
+                num_candidates=sample.candidates_features_kjt.lengths().view(
+                    len(sample.candidates_features_kjt.keys()), -1
+                )[0],
             )
             if batch_idx % metric_log_frequency != 0:
                 metric_logger.compute_and_log(mode="eval")
@@ -593,6 +599,9 @@ def train_eval_loop(
                 predictions=mt_target_preds,
                 labels=mt_target_labels,
                 weights=mt_target_weights,
+                num_candidates=sample.candidates_features_kjt.lengths().view(
+                    len(sample.candidates_features_kjt.keys()), -1
+                )[0],
             )
             if train_batch_idx % metric_log_frequency == 0:
                 metric_logger.compute_and_log(
@@ -640,6 +649,9 @@ def train_eval_loop(
                             predictions=mt_target_preds,
                             labels=mt_target_labels,
                             weights=mt_target_weights,
+                            num_candidates=sample.candidates_features_kjt.lengths().view(
+                                len(sample.candidates_features_kjt.keys()), -1
+                            )[0],
                         )
                         eval_batch_idx += 1
                         if output_trace:
@@ -712,6 +724,9 @@ def streaming_train_eval_loop(
                 predictions=mt_target_preds,
                 labels=mt_target_labels,
                 weights=mt_target_weights,
+                num_candidates=sample.candidates_features_kjt.lengths().view(
+                    len(sample.candidates_features_kjt.keys()), -1
+                )[0],
             )
             if train_batch_idx % metric_log_frequency == 0:
                 metric_logger.compute_and_log(
@@ -755,6 +770,9 @@ def streaming_train_eval_loop(
                     predictions=mt_target_preds,
                     labels=mt_target_labels,
                     weights=mt_target_weights,
+                    num_candidates=sample.candidates_features_kjt.lengths().view(
+                        len(sample.candidates_features_kjt.keys()), -1
+                    )[0],
                 )
                 eval_batch_idx += 1
                 if output_trace:
@@ -806,6 +824,9 @@ def streaming_train_eval_loop(
                 predictions=mt_target_preds,
                 labels=mt_target_labels,
                 weights=mt_target_weights,
+                num_candidates=sample.candidates_features_kjt.lengths().view(
+                    len(sample.candidates_features_kjt.keys()), -1
+                )[0],
             )
             eval_batch_idx += 1
             if output_trace:

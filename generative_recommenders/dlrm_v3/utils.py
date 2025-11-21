@@ -42,7 +42,7 @@ from generative_recommenders.modules.multitask_module import (
 from torch.profiler import profile, profiler, ProfilerActivity  # pyre-ignore [21]
 from torch.utils.tensorboard import SummaryWriter
 from torchrec.metrics.accuracy import AccuracyMetricComputation
-from torchrec.metrics.auc import AUCMetricComputation
+from torchrec.metrics.gauc import GAUCMetricComputation
 from torchrec.metrics.mae import MAEMetricComputation
 from torchrec.metrics.mse import MSEMetricComputation
 from torchrec.metrics.ne import NEMetricComputation
@@ -164,7 +164,7 @@ class MetricsLogger:
                     ).to(device)
                 )
                 self.class_metrics[mode].append(
-                    AUCMetricComputation(
+                    GAUCMetricComputation(
                         my_rank=rank,
                         batch_size=batch_size,
                         n_tasks=len(all_classification_tasks),
@@ -213,14 +213,23 @@ class MetricsLogger:
         predictions: torch.Tensor,
         weights: torch.Tensor,
         labels: torch.Tensor,
+        num_candidates: torch.Tensor,
         mode: str = "train",
     ) -> None:
         for metric in self.all_metrics[mode]:
-            metric.update(
-                predictions=predictions,
-                labels=labels,
-                weights=weights,
-            )
+            if isinstance(metric, GAUCMetricComputation):
+                metric.update(
+                    predictions=predictions,
+                    labels=labels,
+                    weights=weights,
+                    num_candidates=num_candidates,
+                )
+            else:
+                metric.update(
+                    predictions=predictions,
+                    labels=labels,
+                    weights=weights,
+                )
         self.global_step[mode] += 1
 
     def compute(self, mode: str = "train") -> Dict[str, float]:
