@@ -46,6 +46,27 @@ def _get_layer_norm_fwd_configs() -> List[triton.Config]:
     return configs
 
 
+def _bwd_pre_hook(nargs):
+    nargs["DW"].zero_()
+    if "DB" in nargs:
+        nargs["DB"].zero_()
+
+
+def _get_norm_bwd_configs() -> List[triton.Config]:
+    """Generate autotune configs for multi-row LayerNorm kernels."""
+    configs = []
+    for BLOCK_N in [1, 4, 8, 16]:
+        for num_warps in [2, 4]:
+            configs.append(
+                triton.Config(
+                    {"BLOCK_N": BLOCK_N},
+                    num_warps=num_warps,
+                    pre_hook=_bwd_pre_hook,
+                )
+            )
+    return configs
+
+
 @triton_autotune(
     configs=_get_layer_norm_fwd_configs(),
     key=["BLOCK_D"],
@@ -655,39 +676,85 @@ class LayerNormFunction(torch.autograd.Function):
         return dx, dweight, dbias, None
 
 
+def _get_rms_norm_fwd_configs() -> List[triton.Config]:
+    """Generate autotune configs for multi-row RMSNorm kernels."""
+    configs = []
+    for BLOCK_N in [1, 2, 4, 8, 16]:
+        for num_warps in [1, 2, 4]:
+            configs.append(
+                triton.Config(
+                    {"BLOCK_N": BLOCK_N},
+                    num_warps=num_warps,
+                )
+            )
+    return configs
+
+
+@triton.autotune(
+    configs=_get_rms_norm_fwd_configs(),
+    key=["BLOCK_D"],
+)
 @triton.jit
 def _weighted_rms_norm_fwd(
     X,
     Y,
     W,
     Rstd,
+    N,
     D,
     eps,
     stride_x,
     stride_y,
     BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    X += row.to(tl.int64) * stride_x
-    Y += row.to(tl.int64) * stride_y
-    cols = tl.arange(0, BLOCK_D)
-    x = tl.load(X + cols, mask=cols < D, other=0.0).to(tl.float32)
+    block_id = tl.program_id(0)
+    start_row = block_id * BLOCK_N
 
-    # Compute variance
-    _var = tl.zeros([BLOCK_D], dtype=tl.float32)
-    x_mean = tl.where(cols < D, x, 0.0)
-    _var += x_mean * x_mean
-    var = tl.sum(_var, axis=0) / D
+    # Load weight once (shared across all rows in this block)
+    cols = tl.arange(0, BLOCK_D)
+    col_mask = cols < D
+    w = tl.load(W + cols, mask=col_mask, other=0.0).to(tl.float32)
+
+    # Create block pointers for X and Y
+    X_block_ptr = tl.make_block_ptr(
+        base=X,
+        shape=(N, D),
+        strides=(stride_x, 1),
+        offsets=(start_row, 0),
+        block_shape=(BLOCK_N, BLOCK_D),
+        order=(1, 0),
+    )
+
+    Y_block_ptr = tl.make_block_ptr(
+        base=Y,
+        shape=(N, D),
+        strides=(stride_y, 1),
+        offsets=(start_row, 0),
+        block_shape=(BLOCK_N, BLOCK_D),
+        order=(1, 0),
+    )
+
+    x_block = tl.load(X_block_ptr, boundary_check=(0, 1), padding_option="zero").to(
+        tl.float32
+    )
+
+    rows = start_row + tl.arange(0, BLOCK_N)
+    row_mask = rows < N
+
+    # Compute variance (RMS norm uses x directly, not x - mean)
+    x_masked = tl.where(row_mask[:, None] & col_mask[None, :], x_block, 0.0)
+    _var = x_masked * x_masked
+    var = tl.sum(_var, axis=1) / D
     rstd = 1 / tl.sqrt(var + eps)
-    tl.store(Rstd + row, rstd)
+    tl.store(Rstd + rows, rstd, row_mask)
 
     # Normalize and apply linear transformation
-    mask = cols < D
-    y = x_mean * rstd
-    w = tl.load(W + cols, mask=mask).to(tl.float32)
-    y = y * w
-    # Write output
-    tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
+    rstd = tl.expand_dims(rstd, 1)
+    y = x_block * rstd
+    y = y * w[None, :]
+
+    tl.store(Y_block_ptr, y.to(Y.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.jit
@@ -752,6 +819,112 @@ def _weighted_rms_norm_bwd_dx(
 
 
 @triton_autotune(
+    configs=_get_norm_bwd_configs(),
+    key=["BLOCK_D"],
+)
+@triton.jit
+def _weighted_rms_norm_bwd(
+    DX,
+    DY,
+    DW,
+    X,
+    W,
+    Rstd,
+    stride_dx,
+    stride_dy,
+    stride_x,
+    D,
+    eps,
+    N,
+    BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    tile_num = tl.num_programs(0)
+    num_blocks = tl.cdiv(N, BLOCK_N)
+    blocks_per_tile = num_blocks // tile_num
+    if pid < num_blocks % tile_num:
+        blocks_per_tile += 1
+
+    cols = tl.arange(0, BLOCK_D)
+    col_mask = cols < D
+    w = tl.load(W + cols, mask=col_mask, other=0.0).to(tl.float32)
+
+    start_block = pid
+
+    acc_dw = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+    for idx in range(blocks_per_tile):
+        current_block = start_block + idx * tile_num
+        start_row = current_block * BLOCK_N
+
+        X_block_ptr = tl.make_block_ptr(
+            base=X,
+            shape=(N, D),
+            strides=(stride_x, 1),
+            offsets=(start_row, 0),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0),
+        )
+
+        DX_block_ptr = tl.make_block_ptr(
+            base=DX,
+            shape=(N, D),
+            strides=(stride_dx, 1),
+            offsets=(start_row, 0),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0),
+        )
+
+        DY_block_ptr = tl.make_block_ptr(
+            base=DY,
+            shape=(N, D),
+            strides=(stride_dy, 1),
+            offsets=(start_row, 0),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0),
+        )
+
+        # Load data blocks
+        x_block = tl.load(X_block_ptr, boundary_check=(0, 1), padding_option="zero").to(
+            tl.float32
+        )
+        dy_block = tl.load(
+            DY_block_ptr, boundary_check=(0, 1), padding_option="zero"
+        ).to(tl.float32)
+
+        # Load rstd for all rows in this block
+        rows = start_row + tl.arange(0, BLOCK_N)
+        row_mask = rows < N
+        rstd = tl.load(Rstd + rows, row_mask, other=0.0)
+
+        # Expand dimensions for broadcasting
+        rstd = tl.expand_dims(rstd, 1)
+
+        # Compute dx
+        xhat = x_block * rstd
+
+        wdy = w[None, :] * dy_block
+
+        c1 = tl.sum(xhat * wdy, axis=1) / D
+        c1 = tl.expand_dims(c1, 1)
+        dx = (wdy - (xhat * c1)) * rstd
+
+        # Write dx
+        tl.store(DX_block_ptr, dx.to(DX.dtype.element_ty), boundary_check=(0, 1))
+
+        # Accumulate partial sums for dw
+        # Compute dw for all rows, then sum locally before atomic operation
+        partial_dw_block = dy_block * xhat
+        # Local reduction: sum across all rows in this block
+        partial_dw = tl.sum(partial_dw_block, axis=0)
+        acc_dw += partial_dw
+
+    DW_ptr = DW + cols
+    tl.atomic_add(DW_ptr, acc_dw, col_mask)
+
+
+@triton_autotune(
     configs=_get_bwd_dwdb_configs(),
     key=["D"],
 )
@@ -803,25 +976,28 @@ class RMSNormFunction(torch.autograd.Function):
         if D > BLOCK_D:
             raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
 
-        num_warps = min(max(BLOCK_D // 256, 1), 8)
+        ctx.save_for_backward(x, weight, rstd)
+        if N == 0:
+            return y
 
         # pyre-ignore[28]
-        _weighted_rms_norm_fwd[(N,)](
+        grid = lambda meta: (  # noqa E731
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+        _weighted_rms_norm_fwd[grid](
             x,
             y,
             weight,
             rstd,
+            N,
             D,
             eps,
             x.stride(0),
             y.stride(0),
             BLOCK_D=BLOCK_D,
-            num_warps=num_warps,
         )
-        ctx.save_for_backward(x, weight, rstd)
 
         ctx.BLOCK_D = BLOCK_D
-        ctx.num_warps = num_warps
         ctx.eps = eps
         return y
 
@@ -842,41 +1018,28 @@ class RMSNormFunction(torch.autograd.Function):
         else:
             GROUP_N = 64 * 8
         GROUP_N = N if GROUP_N > N else GROUP_N
-        locks = torch.zeros(2 * GROUP_N, dtype=torch.int32, device=x.device)
-        _dweight = torch.empty((GROUP_N, D), dtype=torch.float32, device=x.device)
-        dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
-        # pyre-ignore[28]
-        _weighted_rms_norm_bwd_dx[(N,)](
+        dweight = torch.zeros((D,), dtype=weight.dtype, device=x.device)
+        if N == 0:
+            dweight.zero_()
+            return dx, dweight, None
+
+        sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+        tile_num = max(1, min(sms * 8, N // 4))
+
+        _weighted_rms_norm_bwd[(tile_num,)](
             dx,
             dy,
-            _dweight,
+            dweight,
             x,
             weight,
             rstd,
-            locks,
             dx.stride(0),
             dy.stride(0),
             x.stride(0),
             D,
             ctx.eps,
-            GROUP_N=GROUP_N,
+            N=N,
             BLOCK_D=ctx.BLOCK_D,
-            num_warps=ctx.num_warps,
-        )
-
-        def grid(META):
-            return (triton.cdiv(D, META["BLOCK_D"]),)
-
-        sms = torch.cuda.get_device_properties(x.device).multi_processor_count
-        blocks = triton.next_power_of_2(sms * 4)
-        BLOCK_D = triton.next_power_of_2(triton.cdiv(D, blocks))
-        BLOCK_D = min(max(BLOCK_D, 4), 128)
-        _rms_norm_bwd_dwdb[grid](
-            _dweight,
-            dweight,
-            GROUP_N,
-            D,
-            BLOCK_D=BLOCK_D,
         )
 
         return dx, dweight, None
