@@ -86,17 +86,19 @@ def rms_norm(
     weight: torch.Tensor,
     eps: float = 1e-5,
     kernel: HammerKernel = HammerKernel.PYTORCH,
+    silu: bool = False,
 ) -> torch.Tensor:
     if kernel == HammerKernel.TRITON:
         if not is_fx_tracing():
             torch._assert(not x.is_cpu, "x must be device tensor")
             torch._assert(not weight.is_cpu, "weight must be device tensor")
-        return triton_rms_norm(x, weight, eps)
+        return triton_rms_norm(x, weight, eps, silu)
     elif kernel == HammerKernel.TRITON_CC:
         return triton_cc_rms_norm(
             x,
             weight,
             eps,
+            silu=silu,
         )
     else:
         return pytorch_rms_norm(
@@ -106,6 +108,7 @@ def rms_norm(
             ],
             weight,
             eps,
+            silu,
         )
 
 
@@ -185,6 +188,28 @@ class RMSNorm(HammerModule):
             x,
             self.weight,
             self._eps,
+            silu=False,
+            kernel=self.hammer_kernel(),
+        )
+
+
+class RMSNormSilu(HammerModule):
+    def __init__(
+        self,
+        dim: int,
+        eps: float = 1e-5,
+        is_inference: bool = False,
+    ) -> None:
+        super().__init__(is_inference=is_inference)
+        self._eps = eps
+        self.weight = torch.nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return rms_norm(
+            x,
+            self.weight,
+            self._eps,
+            silu=True,
             kernel=self.hammer_kernel(),
         )
 
