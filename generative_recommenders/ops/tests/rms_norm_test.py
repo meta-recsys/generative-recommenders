@@ -38,6 +38,7 @@ class LayerNormTest(unittest.TestCase):
             if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
             else [torch.float32]
         ),
+        silu=st.booleans(),
     )
     @settings(
         deadline=None,
@@ -64,6 +65,7 @@ class LayerNormTest(unittest.TestCase):
             if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
             else [torch.float32]
         ),
+        silu=st.booleans(),
     )
     @settings(
         deadline=None,
@@ -90,6 +92,7 @@ class LayerNormTest(unittest.TestCase):
             else [torch.float32]
         ),
         triton_cc_version=st.sampled_from(["", "repkg"]),
+        silu=st.booleans(),
     )
     @settings(
         deadline=None,
@@ -112,6 +115,7 @@ class LayerNormTest(unittest.TestCase):
         N: int,
         D: int,
         dtype: torch.dtype,
+        silu: bool,
         ref_kernel: HammerKernel,
         real_kernel: HammerKernel,
         skip_comparisons: bool = False,
@@ -131,10 +135,10 @@ class LayerNormTest(unittest.TestCase):
             .requires_grad_()
         )
         # ref
-        ref_out = rms_norm(x, weight, eps=1e-6, kernel=ref_kernel)
+        ref_out = rms_norm(x, weight, eps=1e-6, silu=silu, kernel=ref_kernel)
         opt_x = x.detach().clone().requires_grad_()
         opt_weight = weight.detach().clone().requires_grad_()
-        opt_out = rms_norm(opt_x, opt_weight, eps=1e-6, kernel=real_kernel)
+        opt_out = rms_norm(opt_x, opt_weight, eps=1e-6, silu=silu, kernel=real_kernel)
         torch.testing.assert_close(ref_out, opt_out)
 
         if not test_backward:
