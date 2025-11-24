@@ -1818,6 +1818,420 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
         )
 
 
+@triton.autotune(
+    configs=_get_layer_norm_mul_dropout_fwd_multirow_configs(),
+    key=["BLOCK_D"],
+)
+@triton.jit
+def _rms_norm_mul_fwd(
+    X,
+    U,
+    Y,
+    W,
+    Rstd,
+    N,
+    D,
+    eps,
+    stride_x,
+    stride_u,
+    stride_y,
+    SILU_U: tl.constexpr,
+    CONCAT_UA: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    block_id = tl.program_id(0)
+    start_row = block_id * BLOCK_N
+
+    # Create block pointers for X, U, and Y
+    X_block_ptr = tl.make_block_ptr(
+        base=X,
+        shape=(N, D),
+        strides=(stride_x, 1),
+        offsets=(start_row, 0),
+        block_shape=(BLOCK_N, BLOCK_D),
+        order=(1, 0),
+    )
+
+    U_block_ptr = tl.make_block_ptr(
+        base=U,
+        shape=(N, D),
+        strides=(stride_u, 1),
+        offsets=(start_row, 0),
+        block_shape=(BLOCK_N, BLOCK_D),
+        order=(1, 0),
+    )
+
+    # Load data blocks
+    x_block = tl.load(X_block_ptr, boundary_check=(0, 1), padding_option="zero").to(
+        tl.float32
+    )
+    u_block = tl.load(U_block_ptr, boundary_check=(0, 1), padding_option="zero").to(
+        tl.float32
+    )
+
+    cols = tl.arange(0, BLOCK_D)
+    col_mask = cols < D
+    rows = start_row + tl.arange(0, BLOCK_N)
+    row_mask = rows < N
+
+    # Compute RMS norm (no mean, just variance)
+    x_masked = tl.where(row_mask[:, None] & col_mask[None, :], x_block, 0.0)
+    _var = x_masked * x_masked
+    var = tl.sum(_var, axis=1) / D
+    rstd = 1 / tl.sqrt(var + eps)
+    tl.store(Rstd + rows, rstd, mask=row_mask)
+    rstd = tl.expand_dims(rstd, 1)
+
+    # Apply weight and normalize
+    a = x_block * rstd
+    w = tl.load(W + cols, mask=col_mask).to(tl.float32)
+    a = a * w[None, :]
+
+    # Apply SILU to U if needed
+    if SILU_U:
+        # pyre-fixme[16]
+        u_block = fast_dividef(u_block, 1.0 + tl.exp(-u_block))
+
+    if CONCAT_UA:
+        # Store U and A separately: [U, A]
+        Y_block_ptr_u = tl.make_block_ptr(
+            base=Y,
+            shape=(N, 2 * D),
+            strides=(stride_y, 1),
+            offsets=(start_row, 0),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0),
+        )
+        Y_block_ptr_a = tl.make_block_ptr(
+            base=Y,
+            shape=(N, 2 * D),
+            strides=(stride_y, 1),
+            offsets=(start_row, D),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0),
+        )
+        tl.store(Y_block_ptr_u, u_block.to(Y.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(Y_block_ptr_a, a.to(Y.dtype.element_ty), boundary_check=(0, 1))
+    else:
+        # Multiply with U
+        y = a * u_block
+        # Store output
+        Y_block_ptr = tl.make_block_ptr(
+            base=Y,
+            shape=(N, D),
+            strides=(stride_y, 1),
+            offsets=(start_row, 0),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0),
+        )
+        tl.store(Y_block_ptr, y.to(Y.dtype.element_ty), boundary_check=(0, 1))
+
+
+@triton.autotune(
+    configs=_get_layer_norm_mul_dropout_fwd_multirow_configs(),
+    key=["BLOCK_D"],
+)
+@triton.jit
+def _rms_norm_mul_bwd(
+    DX,
+    DU,
+    DY,
+    DW,
+    X,
+    U,
+    W,
+    Rstd,
+    stride_dx,
+    stride_du,
+    stride_dy,
+    stride_x,
+    stride_u,
+    D,
+    eps,
+    N,
+    SILU_U: tl.constexpr,
+    CONCAT_UA: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    tile_num = tl.num_programs(0)
+    num_blocks = tl.cdiv(N, BLOCK_N)
+    blocks_per_tile = num_blocks // tile_num
+    if pid < num_blocks % tile_num:
+        blocks_per_tile += 1
+
+    cols = tl.arange(0, BLOCK_D)
+    col_mask = cols < D
+    w = tl.load(W + cols, mask=col_mask, other=0.0).to(tl.float32)
+
+    start_block = pid
+    acc_dw = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+    for idx in range(blocks_per_tile):
+        current_block = start_block + idx * tile_num
+        start_row = current_block * BLOCK_N
+
+        X_block_ptr = tl.make_block_ptr(
+            base=X,
+            shape=(N, D),
+            strides=(stride_x, 1),
+            offsets=(start_row, 0),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0),
+        )
+
+        U_block_ptr = tl.make_block_ptr(
+            base=U,
+            shape=(N, D),
+            strides=(stride_u, 1),
+            offsets=(start_row, 0),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0),
+        )
+
+        DX_block_ptr = tl.make_block_ptr(
+            base=DX,
+            shape=(N, D),
+            strides=(stride_dx, 1),
+            offsets=(start_row, 0),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0),
+        )
+
+        DU_block_ptr = tl.make_block_ptr(
+            base=DU,
+            shape=(N, D),
+            strides=(stride_du, 1),
+            offsets=(start_row, 0),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0),
+        )
+
+        # Load data blocks
+        x_block = tl.load(X_block_ptr, boundary_check=(0, 1), padding_option="zero").to(
+            tl.float32
+        )
+        u_block = tl.load(U_block_ptr, boundary_check=(0, 1), padding_option="zero").to(
+            tl.float32
+        )
+
+        # pyre-fixme[9]: dy_u_block has type `Tensor`; used as `None`.
+        dy_u_block = None
+        # pyre-fixme[9]: dy_a_block has type `Tensor`; used as `None`.
+        dy_a_block = None
+        # pyre-fixme[9]: dy_block has type `Tensor`; used as `None`.
+        dy_block = None
+
+        if CONCAT_UA:
+            # Load gradients for U and A separately: dy = [dU, dA]
+            DY_block_ptr_u = tl.make_block_ptr(
+                base=DY,
+                shape=(N, 2 * D),
+                strides=(stride_dy, 1),
+                offsets=(start_row, 0),
+                block_shape=(BLOCK_N, BLOCK_D),
+                order=(1, 0),
+            )
+            DY_block_ptr_a = tl.make_block_ptr(
+                base=DY,
+                shape=(N, 2 * D),
+                strides=(stride_dy, 1),
+                offsets=(start_row, D),
+                block_shape=(BLOCK_N, BLOCK_D),
+                order=(1, 0),
+            )
+            dy_u_block = tl.load(
+                DY_block_ptr_u, boundary_check=(0, 1), padding_option="zero"
+            ).to(tl.float32)
+            dy_a_block = tl.load(
+                DY_block_ptr_a, boundary_check=(0, 1), padding_option="zero"
+            ).to(tl.float32)
+        else:
+            DY_block_ptr = tl.make_block_ptr(
+                base=DY,
+                shape=(N, D),
+                strides=(stride_dy, 1),
+                offsets=(start_row, 0),
+                block_shape=(BLOCK_N, BLOCK_D),
+                order=(1, 0),
+            )
+            dy_block = tl.load(
+                DY_block_ptr, boundary_check=(0, 1), padding_option="zero"
+            ).to(tl.float32)
+
+        # Load rstd for all rows in this block
+        rows = start_row + tl.arange(0, BLOCK_N)
+        row_mask = rows < N
+        rstd = tl.load(Rstd + rows, row_mask, other=0.0)
+        rstd = tl.expand_dims(rstd, 1)
+
+        # Compute normalized x
+        xhat = x_block * rstd
+
+        # Compute y before U multiplication (this is A)
+        y_before_u = xhat * w[None, :]
+
+        if CONCAT_UA:
+            # du = dy_u + dy_a * y_before_u (chain rule through multiplication)
+            du = dy_u_block + dy_a_block * y_before_u
+            # Use dy_a for dx computation
+            dy_for_dx = dy_a_block
+        else:
+            # Compute du
+            du = dy_block * y_before_u
+            dy_for_dx = dy_block * u_block
+
+        if SILU_U:
+            # pyre-fixme[16]
+            sig_u = fast_dividef(1.0, 1.0 + tl.exp(-u_block))
+            du = du * (sig_u + u_block * sig_u * (1.0 - sig_u))
+            u_block = u_block * sig_u
+
+        tl.store(DU_block_ptr, du.to(DU.dtype.element_ty), boundary_check=(0, 1))
+
+        # Compute dx
+        if CONCAT_UA:
+            # For concat mode, we need dy_a * u for dx
+            dy_u = dy_for_dx * u_block
+        else:
+            dy_u = dy_for_dx
+        wdy = w[None, :] * dy_u
+
+        c1 = tl.sum(xhat * wdy, axis=1) / D
+        c1 = tl.expand_dims(c1, 1)
+        dx = (wdy - (xhat * c1)) * rstd
+
+        tl.store(DX_block_ptr, dx.to(DX.dtype.element_ty), boundary_check=(0, 1))
+
+        # Accumulate partial sums for dw
+        partial_dw_block = dy_u * xhat
+        partial_dw = tl.sum(partial_dw_block, axis=0)
+        acc_dw += partial_dw
+
+    DW_ptr = DW + cols
+    tl.atomic_add(DW_ptr, acc_dw, col_mask)
+
+
+class RMSNormMulFunction(torch.autograd.Function):
+    @staticmethod
+    # pyre-ignore[14]
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        u: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        silu_u: bool,
+        concat_ua: bool,
+    ) -> torch.Tensor:
+        assert x.dim() == 2
+        assert u.dim() == 2
+        x = switch_to_contiguous_if_needed(x)
+        u = switch_to_contiguous_if_needed(u)
+        N, D = x.shape
+        assert u.shape == (N, D)
+        assert weight.dim() == 1
+        assert weight.numel() == D
+
+        if concat_ua:
+            y = torch.empty((N, 2 * D), dtype=x.dtype, device=x.device)
+        else:
+            y = torch.empty_like(x)
+        rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
+
+        MAX_FUSED_SIZE = 65536 // x.element_size()
+        BLOCK_D = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
+        if D > BLOCK_D:
+            raise RuntimeError("This RMS norm doesn't support feature dim >= 64KB.")
+
+        ctx.save_for_backward(x, u, weight, rstd)
+        ctx.silu_u = silu_u
+        ctx.concat_ua = concat_ua
+        ctx.BLOCK_D = BLOCK_D
+        ctx.eps = eps
+
+        if N == 0:
+            return y
+
+        # pyre-ignore[28]
+        grid = lambda meta: (  # noqa E731
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+        _rms_norm_mul_fwd[grid](
+            x,
+            u,
+            y,
+            weight,
+            rstd,
+            N,
+            D,
+            eps,
+            x.stride(0),
+            u.stride(0),
+            y.stride(0),
+            SILU_U=silu_u,
+            CONCAT_UA=concat_ua,
+            BLOCK_D=BLOCK_D,
+        )
+
+        return y
+
+    @staticmethod
+    # pyre-ignore[14]
+    def backward(
+        ctx, dy: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None, None]:
+        x, u, weight, rstd = ctx.saved_tensors
+        N, D = x.shape
+        dx = torch.empty_like(x)
+        du = torch.empty_like(u)
+        dweight = torch.zeros((D,), dtype=weight.dtype, device=x.device)
+
+        if N == 0:
+            return dx, du, dweight, None, None, None
+
+        sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+        tile_num = max(1, min(sms * 8, N // 4))
+
+        _rms_norm_mul_bwd[(tile_num,)](
+            dx,
+            du,
+            dy,
+            dweight,
+            x,
+            u,
+            weight,
+            rstd,
+            dx.stride(0),
+            du.stride(0),
+            dy.stride(0),
+            x.stride(0),
+            u.stride(0),
+            D,
+            ctx.eps,
+            N=N,
+            SILU_U=ctx.silu_u,
+            CONCAT_UA=ctx.concat_ua,
+            BLOCK_D=ctx.BLOCK_D,
+        )
+
+        return dx, du, dweight, None, None, None
+
+
+@torch.fx.wrap
+def triton_rms_norm_mul(
+    x: torch.Tensor,
+    u: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-5,
+    silu_u: bool = False,
+    concat_ua: bool = False,
+) -> torch.Tensor:
+    return RMSNormMulFunction.apply(x, u, weight, eps, silu_u, concat_ua)
+
+
 @torch.fx.wrap
 def triton_norm_mul_dropout(
     x: torch.Tensor,
