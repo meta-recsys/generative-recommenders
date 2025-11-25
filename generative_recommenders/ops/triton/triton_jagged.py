@@ -32,6 +32,7 @@ from generative_recommenders.common import (
     triton_autotune,
 )
 from generative_recommenders.ops.utils import is_sm100
+from torch._inductor.runtime import triton_helpers
 
 
 def _triton_concat_2D_jagged_internal(
@@ -1992,3 +1993,217 @@ def triton_jagged_dense_broadcast_add(
     return _JaggedDenseBroadcastAddFunction.apply(
         max_seq_len, seq_offsets, jagged, dense
     )
+
+
+@triton.jit
+def _helion_split_2d_jagged_kernel(
+    offsets_a,
+    offsets_b,
+    values_flat,
+    out_a_flat,
+    out_b_flat,
+    max_seq_len,
+    D: tl.constexpr,
+    _BLOCK_SIZE_0: tl.constexpr,
+    _BLOCK_SIZE_1: tl.constexpr,
+) -> None:
+    # Get program ID and decompose to batch and sequence block coordinates
+    program_id = tl.program_id(0)
+    flat_program_id = program_id
+    batch_id = triton_helpers.div_floor_integer(
+        flat_program_id,
+        triton_helpers.div_floor_integer(
+            -1 + _BLOCK_SIZE_0 + max_seq_len, _BLOCK_SIZE_0
+        ),
+    )
+    seq_block_id = triton_helpers.remainder_integer(  # noqa: F841
+        flat_program_id,
+        triton_helpers.div_floor_integer(
+            -1 + _BLOCK_SIZE_0 + max_seq_len, _BLOCK_SIZE_0
+        ),
+    )
+    # Load output boundaries for part A
+    out_a_start = tl.load(offsets_a + batch_id * 1, None, eviction_policy="evict_last")
+    batch_id_plus_1 = 1 + triton_helpers.div_floor_integer(
+        flat_program_id,
+        triton_helpers.div_floor_integer(
+            -1 + _BLOCK_SIZE_0 + max_seq_len, _BLOCK_SIZE_0
+        ),
+    )
+    out_a_end = tl.load(
+        offsets_a + batch_id_plus_1 * 1, None, eviction_policy="evict_last"
+    )
+    len_a = out_a_end - out_a_start
+    # Load output boundaries for part B
+    out_b_start = tl.load(offsets_b + batch_id * 1, None)
+    out_b_end = tl.load(
+        offsets_b + batch_id_plus_1 * 1, None, eviction_policy="evict_last"
+    )
+    len_b = out_b_end - out_b_start
+    # Compute input start and total length for this batch
+    input_start = out_a_start + out_b_start
+    total_len = len_a + len_b
+    # Calculate sequence offset for this block
+    seq_offset = _BLOCK_SIZE_0 * triton_helpers.remainder_integer(
+        flat_program_id,
+        triton_helpers.div_floor_integer(
+            -1 + _BLOCK_SIZE_0 + max_seq_len, _BLOCK_SIZE_0
+        ),
+    )
+    has_work = total_len > seq_offset
+    if has_work:
+        # Generate row indices for this sequence block
+        seq_range = tl.arange(0, _BLOCK_SIZE_0)
+        seq_offset_i32 = tl.cast(seq_offset, tl.int32)
+        row_indices = seq_range + seq_offset_i32
+
+        # Create masks for valid rows and parts A/B
+        total_len_i32 = tl.cast(total_len[None], tl.int32)
+        len_a_i32 = tl.cast(len_a[None], tl.int32)
+        valid_mask = row_indices < total_len_i32
+        is_part_a = row_indices < len_a_i32
+        is_part_b = (row_indices >= len_a_i32) & valid_mask
+
+        # Extract scalar values once
+        input_start_i32 = tl.cast(input_start[None, None], tl.int32)
+        out_a_start_i32 = tl.cast(out_a_start[None, None], tl.int32)
+        out_b_start_i32 = tl.cast(out_b_start[None, None], tl.int32)
+
+        # Process features in smaller tiles
+        for feature_offset in tl.range(
+            0,
+            D,
+            _BLOCK_SIZE_1,
+            loop_unroll_factor=1,
+            num_stages=4,
+            disallow_acc_multi_buffer=True,
+            flatten=True,
+        ):
+            feature_indices = feature_offset + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
+
+            # Compute D constant and feature mask once per feature iteration
+            D_const = tl.full([], tl.cast(D, tl.int32), tl.int32)
+            D_i32 = tl.cast(D, tl.int32)
+            feature_mask = feature_indices < D_i32
+
+            # Compute indices for part A
+            row_subscript = row_indices[:, None]
+            input_row_a = input_start_i32 + row_subscript
+            input_idx_a = (
+                tl.cast(input_row_a * D_const, tl.int32) + feature_indices[None, :]
+            )
+
+            out_a_row = out_a_start_i32 + row_subscript
+            out_a_idx = (
+                tl.cast(out_a_row * D_const, tl.int32) + feature_indices[None, :]
+            )
+
+            mask_a = is_part_a[:, None] & valid_mask[:, None] & feature_mask[None, :]
+
+            # Load and store part A data
+            slice_a = tl.load(
+                values_flat + input_idx_a * 1,
+                mask_a,
+                other=0,
+                eviction_policy="evict_first",
+            )
+            tl.store(out_a_flat + out_a_idx * 1, slice_a, mask_a)
+
+            # Compute indices for part B
+            input_idx_b = (
+                tl.cast((input_start_i32 + row_subscript) * D_const, tl.int32)
+                + feature_indices[None, :]
+            )
+
+            row_minus_len_a = row_subscript - len_a_i32
+            out_b_row = out_b_start_i32 + row_minus_len_a
+            out_b_idx = (
+                tl.cast(out_b_row * D_const, tl.int32) + feature_indices[None, :]
+            )
+
+            mask_b = is_part_b[:, None] & feature_mask[None, :]
+
+            # Load and store part B data
+            slice_b = tl.load(
+                values_flat + input_idx_b * 1,
+                mask_b,
+                other=0,
+                eviction_policy="evict_first",
+            )
+            tl.store(out_b_flat + out_b_idx * 1, slice_b, mask_b)
+
+
+def helion_split_2D_jagged(
+    values: torch.Tensor,
+    max_seq_len: int,
+    offsets_a: torch.Tensor,
+    offsets_b: torch.Tensor,
+    dense_size: int = 0,  # noqa: F841
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    D = values.size(1)
+
+    # Select dtype-specific optimal parameters
+    if values.dtype == torch.float32:
+        # FP32-optimized parameters
+        block_size_0 = 64
+        block_size_1 = 64
+        num_warps = 4
+        num_stages = 4
+    else:
+        # BF16/FP16-optimized parameters
+        block_size_0 = 128
+        block_size_1 = triton.next_power_of_2(D)
+        num_warps = 32
+        num_stages = 7
+
+    return _helion_split_2d_jagged(
+        values,
+        max_seq_len,
+        offsets_a,
+        offsets_b,
+        dense_size,
+        block_size_0=block_size_0,
+        block_size_1=block_size_1,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+
+
+def _helion_split_2d_jagged(
+    values: torch.Tensor,
+    max_seq_len: int,
+    offsets_a: torch.Tensor,
+    offsets_b: torch.Tensor,
+    dense_size: int,  # noqa: F841
+    block_size_0: int = 64,
+    block_size_1: int = 64,
+    num_warps: int = 4,
+    num_stages: int = 4,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    num_batches = offsets_a.size(0) - 1
+    D = values.size(1)
+    num_seq_blocks = (max_seq_len + block_size_0 - 1) // block_size_0
+    total_len_a = int(offsets_a[-1].item())
+    total_len_b = int(offsets_b[-1].item())
+    out_a = torch.empty([total_len_a, D], dtype=values.dtype, device=values.device)
+    out_b = torch.empty([total_len_b, D], dtype=values.dtype, device=values.device)
+    values_flat = values.view(-1)
+    out_a_flat = out_a.view(-1)
+    out_b_flat = out_b.view(-1)
+    total_programs = num_batches * num_seq_blocks
+
+    # pyre-ignore[28]
+    _helion_split_2d_jagged_kernel[(total_programs,)](
+        offsets_a,
+        offsets_b,
+        values_flat,
+        out_a_flat,
+        out_b_flat,
+        max_seq_len,
+        D,
+        block_size_0,
+        block_size_1,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return (out_a, out_b)
