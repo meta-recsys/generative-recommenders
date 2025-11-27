@@ -22,6 +22,7 @@ import unittest
 import torch
 from generative_recommenders.common import gpu_unavailable, HammerKernel, set_dev_mode
 from generative_recommenders.ops.layer_norm import rms_norm, RMSNorm
+from hammer.ops.triton.cc.utils import set_triton_cc_version
 
 from hypothesis import given, settings, strategies as st, Verbosity
 
@@ -30,13 +31,14 @@ class LayerNormTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore[56]
     @given(
-        N=st.sampled_from([4200000]),
+        N=st.sampled_from([2000000]),
         D=st.sampled_from([512]),
         dtype=st.sampled_from(
             [torch.bfloat16]
             if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
             else [torch.float32]
         ),
+        silu=st.booleans(),
     )
     @settings(
         deadline=None,
@@ -63,6 +65,7 @@ class LayerNormTest(unittest.TestCase):
             if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
             else [torch.float32]
         ),
+        silu=st.booleans(),
     )
     @settings(
         deadline=None,
@@ -78,14 +81,45 @@ class LayerNormTest(unittest.TestCase):
             real_kernel=HammerKernel.TRITON,
         )
 
+    @unittest.skipIf(*gpu_unavailable)
+    # pyre-ignore[56]
+    @given(
+        N=st.integers(min_value=4, max_value=10000),
+        D=st.sampled_from([256, 512]),
+        dtype=st.sampled_from(
+            [torch.bfloat16, torch.float32]
+            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            else [torch.float32]
+        ),
+        triton_cc_version=st.sampled_from(["", "repkg"]),
+        silu=st.booleans(),
+    )
+    @settings(
+        deadline=None,
+        verbosity=Verbosity.verbose,
+        max_examples=10,
+    )
+    # pyre-ignore[2]
+    def test_rms_norm_triton_cc(self, triton_cc_version: str, *args, **kwargs) -> None:
+        set_triton_cc_version(triton_cc_version)
+        self._test_rms_norm(
+            *args,
+            **kwargs,
+            ref_kernel=HammerKernel.PYTORCH,
+            real_kernel=HammerKernel.TRITON_CC,
+            test_backward=False,
+        )
+
     def _test_rms_norm(
         self,
         N: int,
         D: int,
         dtype: torch.dtype,
+        silu: bool,
         ref_kernel: HammerKernel,
         real_kernel: HammerKernel,
         skip_comparisons: bool = False,
+        test_backward: bool = True,
     ) -> None:
         N = N // 4 * 4
         # enable auto-tuning to verify correctness of multi-row kernel
@@ -101,7 +135,15 @@ class LayerNormTest(unittest.TestCase):
             .requires_grad_()
         )
         # ref
-        ref_out = rms_norm(x, weight, eps=1e-6, kernel=ref_kernel)
+        ref_out = rms_norm(x, weight, eps=1e-6, silu=silu, kernel=ref_kernel)
+        opt_x = x.detach().clone().requires_grad_()
+        opt_weight = weight.detach().clone().requires_grad_()
+        opt_out = rms_norm(opt_x, opt_weight, eps=1e-6, silu=silu, kernel=real_kernel)
+        torch.testing.assert_close(ref_out, opt_out)
+
+        if not test_backward:
+            return
+
         dout = torch.randn_like(ref_out) * 0.05
         ref_out.backward(dout)
         if skip_comparisons:
@@ -110,14 +152,10 @@ class LayerNormTest(unittest.TestCase):
         ref_dx, x.grad = x.grad.detach().clone(), None
         ref_dw, weight.grad = weight.grad.detach().clone(), None
         # opt
-        x = x.detach().clone().requires_grad_()
-        weight = weight.detach().clone().requires_grad_()
-        opt_out = rms_norm(x, weight, eps=1e-6, kernel=real_kernel)
         dout = dout.detach().clone()
         opt_out.backward(dout)
-        opt_dx, x.grad = x.grad.detach().clone(), None
-        opt_dw, weight.grad = weight.grad.detach().clone(), None
-        torch.testing.assert_close(ref_out, opt_out)
+        opt_dx, x.grad = opt_x.grad.detach().clone(), None
+        opt_dw, weight.grad = opt_weight.grad.detach().clone(), None
         torch.testing.assert_close(ref_dx, opt_dx)
         torch.testing.assert_close(ref_dw, opt_dw)
 

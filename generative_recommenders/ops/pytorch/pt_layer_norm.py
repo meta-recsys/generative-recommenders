@@ -43,14 +43,19 @@ def pytorch_rms_norm(
     normalized_shape: List[int],
     weight: torch.Tensor,
     eps: float,
+    silu: bool = False,
 ) -> torch.Tensor:
     dtype = x.dtype
-    return torch.nn.functional.rms_norm(
-        x.to(torch.float32),
+    x_float = x.to(torch.float32)
+    normalized = torch.nn.functional.rms_norm(
+        x_float,
         normalized_shape,
         weight.to(torch.float32),
         eps,
-    ).to(dtype)
+    )
+    if silu:
+        normalized = torch.nn.functional.silu(normalized)
+    return normalized.to(dtype)
 
 
 def pytorch_swish_layer_norm(
