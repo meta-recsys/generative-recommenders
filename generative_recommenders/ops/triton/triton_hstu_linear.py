@@ -1025,6 +1025,9 @@ class LayerNormMulDropoutFunction(torch.autograd.Function):
         concat_ux: bool = False,
         seed: Optional[int] = None,
     ) -> torch.Tensor:
+        if dropout_ratio == 0.0:
+            # skip dropout computation if dropout ratio is 0
+            training = False
         y, mean, rstd, BLOCK_D, num_warps, seed = triton_layer_norm_mul_dropout_fwd(
             x=x,
             u=u,
@@ -1671,6 +1674,9 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
         seed: Optional[int] = None,
         recompute_y_in_backward: bool = False,
     ) -> torch.Tensor:
+        if dropout_ratio == 0.0:
+            training = False
+
         if group_norm:
             y, mean, rstd, BLOCK_D, BLOCK_H, num_warps, seed = (
                 triton_group_norm_mul_dropout_fwd(
