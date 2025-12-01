@@ -31,6 +31,18 @@ from generative_recommenders.common import (
 )
 from generative_recommenders.ops.utils import is_sm100
 
+try:
+    # @manual=//triton:triton
+    from triton.language.extra.libdevice import fast_dividef
+except ImportError:
+    try:
+        # @manual=//triton:triton
+        from triton.language.extra.cuda.libdevice import fast_dividef
+    except ImportError:
+        # pyre-ignore: Undefined import [21]
+        # @manual=//triton:triton
+        from triton.language.math import fast_dividef
+
 
 def _get_layer_norm_fwd_configs() -> List[triton.Config]:
     """Generate autotune configs for multi-row LayerNorm kernels."""
@@ -692,7 +704,7 @@ def _get_rms_norm_fwd_configs() -> List[triton.Config]:
 
 @triton.autotune(
     configs=_get_rms_norm_fwd_configs(),
-    key=["BLOCK_D"],
+    key=["BLOCK_D", "SILU"],
 )
 @triton.jit
 def _weighted_rms_norm_fwd(
@@ -705,6 +717,7 @@ def _weighted_rms_norm_fwd(
     eps,
     stride_x,
     stride_y,
+    SILU: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -753,6 +766,10 @@ def _weighted_rms_norm_fwd(
     rstd = tl.expand_dims(rstd, 1)
     y = x_block * rstd
     y = y * w[None, :]
+
+    if SILU:
+        # pyre-ignore[16]: Module `triton.language.math` has no attribute `fast_dividef`
+        y = fast_dividef(y, 1.0 + tl.exp(-y))
 
     tl.store(Y_block_ptr, y.to(Y.dtype.element_ty), boundary_check=(0, 1))
 
@@ -820,7 +837,7 @@ def _weighted_rms_norm_bwd_dx(
 
 @triton_autotune(
     configs=_get_norm_bwd_configs(),
-    key=["BLOCK_D"],
+    key=["BLOCK_D", "SILU"],
 )
 @triton.jit
 def _weighted_rms_norm_bwd(
@@ -836,6 +853,7 @@ def _weighted_rms_norm_bwd(
     D,
     eps,
     N,
+    SILU: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -904,6 +922,14 @@ def _weighted_rms_norm_bwd(
         # Compute dx
         xhat = x_block * rstd
 
+        # Apply SILU backward if enabled
+        if SILU:
+            y_before_silu = xhat * w[None, :]
+            # pyre-fixme[16]
+            sig_y = fast_dividef(1.0, 1.0 + tl.exp(-y_before_silu))
+            # SILU derivative: sigmoid(y) + y * sigmoid(y) * (1 - sigmoid(y))
+            dy_block = dy_block * (sig_y + y_before_silu * sig_y * (1.0 - sig_y))
+
         wdy = w[None, :] * dy_block
 
         c1 = tl.sum(xhat * wdy, axis=1) / D
@@ -960,6 +986,7 @@ class RMSNormFunction(torch.autograd.Function):
         x: torch.Tensor,
         weight: torch.Tensor,
         eps: float,
+        silu: bool,
     ) -> torch.Tensor:
         assert x.dim() == 2
         x = switch_to_contiguous_if_needed(x)
@@ -977,6 +1004,7 @@ class RMSNormFunction(torch.autograd.Function):
             raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
 
         ctx.save_for_backward(x, weight, rstd)
+        ctx.silu = silu
         if N == 0:
             return y
 
@@ -994,6 +1022,7 @@ class RMSNormFunction(torch.autograd.Function):
             eps,
             x.stride(0),
             y.stride(0),
+            SILU=silu,
             BLOCK_D=BLOCK_D,
         )
 
@@ -1005,7 +1034,7 @@ class RMSNormFunction(torch.autograd.Function):
     # pyre-ignore[14]
     def backward(
         ctx, dy: torch.Tensor
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], None]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], None, None]:
         x, weight, rstd = ctx.saved_tensors
         N, D = x.shape
         dx = torch.empty_like(x)
@@ -1021,7 +1050,7 @@ class RMSNormFunction(torch.autograd.Function):
         dweight = torch.zeros((D,), dtype=weight.dtype, device=x.device)
         if N == 0:
             dweight.zero_()
-            return dx, dweight, None
+            return dx, dweight, None, None
 
         sms = torch.cuda.get_device_properties(x.device).multi_processor_count
         tile_num = max(1, min(sms * 8, N // 4))
@@ -1039,10 +1068,11 @@ class RMSNormFunction(torch.autograd.Function):
             D,
             ctx.eps,
             N=N,
+            SILU=ctx.silu,
             BLOCK_D=ctx.BLOCK_D,
         )
 
-        return dx, dweight, None
+        return dx, dweight, None, None
 
 
 class SwishLayerNormFunction(torch.autograd.Function):
@@ -1176,8 +1206,9 @@ def triton_rms_norm(
     x: torch.Tensor,
     weight: Optional[torch.Tensor],
     eps: float,
+    silu: bool = False,
 ) -> torch.Tensor:
-    return RMSNormFunction.apply(x, weight, eps)
+    return RMSNormFunction.apply(x, weight, eps, silu)
 
 
 @torch.fx.wrap
