@@ -25,6 +25,7 @@ import torch
 
 # @manual=//triton:triton
 import triton
+from generative_recommenders.ops.utils import is_sm100
 
 # @manual=//triton:triton
 from triton.runtime.autotuner import Autotuner
@@ -34,6 +35,14 @@ try:
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops_cpu")
 except OSError:
     pass
+
+try:
+    # @manual=//triton:triton
+    import triton.language.extra.tlx  # type: ignore
+
+    HAS_TLX = True
+except ImportError:
+    HAS_TLX = False
 
 try:
     from generative_recommenders.fb.triton_cc.utils import triton_cc
@@ -235,6 +244,11 @@ gpu_unavailable: Tuple[bool, str] = (
 )
 
 gpu_available: bool = not gpu_unavailable[0]
+
+blackwell_tlx_unavailable: Tuple[bool, str] = (
+    not is_sm100() or not HAS_TLX,
+    "Skip TLX and blackwell only tests",
+)
 
 
 def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
