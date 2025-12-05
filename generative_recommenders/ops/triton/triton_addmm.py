@@ -571,6 +571,181 @@ def _addmm_fwd_tma_ws(
             tlx.async_descriptor_store_wait(0)
 
 
+@triton_autotune(
+    configs=get_mm_configs(pre_hook=_addmm_tma_set_block_size_hook),
+    key=["N", "K"],
+)
+@triton.jit
+def _addmm_fwd_tma_ws_persistent(
+    x_desc,
+    w_desc,
+    y_desc,
+    z_desc,
+    M,
+    N,
+    K,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
+    BROADCAST_Y: tl.constexpr,
+    NUM_SMEM_BUFFERS: tl.constexpr,
+    NUM_TMEM_BUFFERS: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+):
+    # Allocate buffers once for all tiles
+    x_buffers = tlx.local_alloc((BLOCK_M, BLOCK_K), x_desc.dtype, NUM_SMEM_BUFFERS)
+    w_buffers = tlx.local_alloc((BLOCK_K, BLOCK_N), w_desc.dtype, NUM_SMEM_BUFFERS)
+    tmem_buffers = tlx.local_alloc(
+        (BLOCK_M, BLOCK_N), tl.float32, NUM_TMEM_BUFFERS, tlx.storage_kind.tmem
+    )
+
+    # Barriers for producer <-> MMA
+    smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
+    smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
+    # Barriers for MMA <-> Epilogue
+    tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
+    tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
+
+    with tlx.async_tasks():
+        # Epilogue consumer: loads Y, adds bias, stores Z
+        with tlx.async_task("default"):
+            start_pid = tl.program_id(axis=0)
+            num_pid_m = tl.cdiv(M, BLOCK_M)
+            num_pid_n = tl.cdiv(N, BLOCK_N)
+            num_pid_in_group = GROUP_M * num_pid_n
+            num_tiles = num_pid_m * num_pid_n
+
+            tmem_read_phase = 0
+            cur_tmem_buf = 0
+
+            for tile_id in range(start_pid, num_tiles, NUM_SMS):
+                pid_m, pid_n = _compute_pid(
+                    tile_id, num_pid_in_group, num_pid_m, GROUP_M, NUM_SMS
+                )
+                offs_xm = pid_m * BLOCK_M
+                offs_wn = pid_n * BLOCK_N
+
+                # Wait for MMA to finish computing this tile
+                tlx.barrier_wait(tmem_full_bars[cur_tmem_buf], tmem_read_phase)
+                tmem_read_phase = tmem_read_phase ^ (
+                    cur_tmem_buf == int(NUM_TMEM_BUFFERS) - 1
+                )
+
+                # Load Y synchronously
+                if BROADCAST_Y:
+                    y = y_desc.load([0, offs_wn])
+                else:
+                    y = y_desc.load([offs_xm, offs_wn])
+
+                # Load result from TMEM and add bias
+                acc_tmem = tmem_buffers[cur_tmem_buf]
+                result = tlx.local_load(acc_tmem)
+                z = (result + y.to(tl.float32)).to(z_desc.dtype)
+
+                # Store result directly via TMA
+                z_desc.store([offs_xm, offs_wn], z)
+
+                # Signal MMA that this TMEM buffer is now free
+                tlx.barrier_arrive(tmem_empty_bars[cur_tmem_buf], 1)
+
+                cur_tmem_buf = (cur_tmem_buf + 1) % int(NUM_TMEM_BUFFERS)
+
+        # MMA consumer: performs matrix multiplication
+        with tlx.async_task(num_warps=4, num_regs=232):
+            start_pid = tl.program_id(axis=0)
+            num_pid_m = tl.cdiv(M, BLOCK_M)
+            num_pid_n = tl.cdiv(N, BLOCK_N)
+            num_pid_in_group = GROUP_M * num_pid_n
+            num_tiles = num_pid_m * num_pid_n
+            k_tiles = tl.cdiv(K, BLOCK_K)
+
+            dot_phase = 0
+            tmem_write_phase = 1
+            cur_tmem_buf = 0
+            processed_k_iters = 0
+
+            for tile_id in range(start_pid, num_tiles, NUM_SMS):
+                pid_m, pid_n = _compute_pid(
+                    tile_id, num_pid_in_group, num_pid_m, GROUP_M, NUM_SMS
+                )
+
+                # Wait for epilogue to finish with this TMEM buffer
+                tlx.barrier_wait(tmem_empty_bars[cur_tmem_buf], tmem_write_phase)
+                tmem_write_phase = tmem_write_phase ^ (
+                    cur_tmem_buf == int(NUM_TMEM_BUFFERS) - 1
+                )
+
+                # Perform K-dimension reduction
+                for k in range(0, k_tiles):
+                    buf = (processed_k_iters + k) % int(NUM_SMEM_BUFFERS)
+                    tlx.barrier_wait(smem_full_bars[buf], dot_phase)
+
+                    tlx.async_dot(
+                        x_buffers[buf],
+                        w_buffers[buf],
+                        tmem_buffers[cur_tmem_buf],
+                        use_acc=(k > 0),
+                        mBarriers=[smem_empty_bars[buf]],
+                        out_dtype=tl.float32,
+                    )
+
+                    dot_phase = dot_phase ^ (buf == int(NUM_SMEM_BUFFERS) - 1)
+
+                # Wait for last MMA to complete
+                last_buf = (processed_k_iters + k_tiles - 1) % int(NUM_SMEM_BUFFERS)
+                last_dot_phase = dot_phase ^ (last_buf == int(NUM_SMEM_BUFFERS) - 1)
+                tlx.barrier_wait(smem_empty_bars[last_buf], last_dot_phase)
+
+                # Signal epilogue that result is ready
+                tlx.barrier_arrive(tmem_full_bars[cur_tmem_buf], 1)
+
+                cur_tmem_buf = (cur_tmem_buf + 1) % int(NUM_TMEM_BUFFERS)
+                processed_k_iters += k_tiles
+
+        # Producer: TMA loads for X and W
+        with tlx.async_task(num_warps=1, num_regs=24):
+            start_pid = tl.program_id(axis=0)
+            num_pid_m = tl.cdiv(M, BLOCK_M)
+            num_pid_n = tl.cdiv(N, BLOCK_N)
+            num_pid_in_group = GROUP_M * num_pid_n
+            num_tiles = num_pid_m * num_pid_n
+            k_tiles = tl.cdiv(K, BLOCK_K)
+
+            load_phase = 0
+            processed_k_iters = 0
+
+            for tile_id in range(start_pid, num_tiles, NUM_SMS):
+                pid_m, pid_n = _compute_pid(
+                    tile_id, num_pid_in_group, num_pid_m, GROUP_M, NUM_SMS
+                )
+                offs_xm = pid_m * BLOCK_M
+                offs_wn = pid_n * BLOCK_N
+
+                for k in range(0, k_tiles):
+                    buf = (processed_k_iters + k) % int(NUM_SMEM_BUFFERS)
+
+                    # Wait for buffer to be free
+                    tlx.barrier_wait(smem_empty_bars[buf], load_phase ^ 1)
+
+                    offs_k = k * BLOCK_K
+                    tlx.barrier_expect_bytes(
+                        smem_full_bars[buf],
+                        2 * (BLOCK_M + BLOCK_N) * BLOCK_K,
+                    )
+                    tlx.async_descriptor_load(
+                        x_desc, x_buffers[buf], [offs_xm, offs_k], smem_full_bars[buf]
+                    )
+                    tlx.async_descriptor_load(
+                        w_desc, w_buffers[buf], [offs_k, offs_wn], smem_full_bars[buf]
+                    )
+
+                    load_phase = load_phase ^ (buf == int(NUM_SMEM_BUFFERS) - 1)
+
+                processed_k_iters += k_tiles
+
+
 @torch.fx.wrap
 def triton_addmm_fwd_tma_persistent(
     x: torch.Tensor,
@@ -688,6 +863,69 @@ def triton_addmm_fwd_tma_ws_tlx(
 
 
 @torch.fx.wrap
+def triton_addmm_fwd_tma_ws_persistent_tlx(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    y: torch.Tensor,
+) -> torch.Tensor:
+    M, K = x.shape
+    _, N = w.shape
+
+    is_y_1d = y.dim() == 1
+
+    # Allocate output
+    z = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    if M == 0 or N == 0:
+        return z
+
+    NUM_SMEM_BUFFERS = 2
+    NUM_TMEM_BUFFERS = 2
+    NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+
+    # A dummy block value that will be overwritten by the hook
+    dummy_block = [1, 1]
+    # pyre-ignore[6]: In call `TensorDescriptor.__init__`, for 2nd positional
+    # argument, expected `List[int]` but got `Size`
+    x_desc = TensorDescriptor(x, x.shape, x.stride(), dummy_block)
+    # pyre-ignore[6]: In call `TensorDescriptor.__init__`, for 2nd positional
+    # argument, expected `List[int]` but got `Size`
+    w_desc = TensorDescriptor(w, w.shape, w.stride(), dummy_block)
+    y = y.reshape(1, -1) if is_y_1d else y
+    # pyre-ignore[6]: In call `TensorDescriptor.__init__`, for 2nd positional
+    # argument, expected `List[int]` but got `Size`
+    y_desc = TensorDescriptor(y, y.shape, y.stride(), dummy_block)
+    # pyre-ignore[6]: In call `TensorDescriptor.__init__`, for 2nd positional
+    # argument, expected `List[int]` but got `Size`
+    z_desc = TensorDescriptor(z, z.shape, z.stride(), dummy_block)
+
+    def grid(meta):
+        BLOCK_M = meta["BLOCK_M"]
+        BLOCK_N = meta["BLOCK_N"]
+        return (
+            min(
+                NUM_SMS,
+                triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
+            ),
+        )
+
+    _addmm_fwd_tma_ws_persistent[grid](
+        x_desc,
+        w_desc,
+        y_desc,
+        z_desc,
+        M,
+        N,
+        K,
+        ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+        BROADCAST_Y=is_y_1d,
+        NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
+        NUM_TMEM_BUFFERS=NUM_TMEM_BUFFERS,
+        NUM_SMS=NUM_SMS,
+    )
+    return z
+
+
+@torch.fx.wrap
 def triton_addmm_fwd(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -779,7 +1017,7 @@ class _AddMmFunction(torch.autograd.Function):
                 # use TMA persistent kernel on sm100
                 return triton_addmm_fwd_tma_persistent(x, w, y, warp_specialize=True)
             else:
-                return triton_addmm_fwd_tma_ws_tlx(
+                return triton_addmm_fwd_tma_ws_persistent_tlx(
                     x, w, y
                 )  # tlx.async_dot doesn't support fp32 inputs because of WGMMA requirements
         else:
