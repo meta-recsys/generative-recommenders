@@ -87,6 +87,7 @@ class Dataset:
         return collate_fn(list_samples)
 
 
+@torch.jit.script
 def kjt_batch_func(
     kjt_list: List[KeyedJaggedTensor],
 ) -> KeyedJaggedTensor:

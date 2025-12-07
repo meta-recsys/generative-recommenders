@@ -18,7 +18,7 @@ import logging
 import threading
 import time
 from queue import Queue
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from generative_recommenders.dlrm_v3.datasets.dataset import Dataset, Samples
@@ -30,10 +30,19 @@ logger: logging.Logger = logging.getLogger("data_producer")
 class QueryItem:
     """An item that we queue for processing by the thread pool."""
 
-    def __init__(self, query_ids: List[int], samples: Samples) -> None:
+    def __init__(
+        self,
+        query_ids: List[int],
+        samples: Samples,
+        start: float,
+        dt_queue: float,
+        dt_batching: float,
+    ) -> None:
         self.query_ids = query_ids
         self.samples = samples
-        self.start: float = time.time()
+        self.start: float = start
+        self.dt_queue: float = dt_queue
+        self.dt_batching: float = dt_batching
 
 
 class SingleThreadDataProducer:
@@ -41,10 +50,21 @@ class SingleThreadDataProducer:
         self.ds = ds
         self.run_one_item = run_one_item  # pyre-ignore [4]
 
-    def enqueue(self, query_ids: List[int], content_ids: List[int]) -> None:
+    def enqueue(
+        self, query_ids: List[int], content_ids: List[int], t0: float, dt_queue: float
+    ) -> None:
         with torch.profiler.record_function("data batching"):
+            t0_batching: float = time.time()
             samples = self.ds.get_samples(content_ids)
-            self.run_one_item(QueryItem(query_ids, samples))
+            dt_batching: float = time.time() - t0_batching
+            query = QueryItem(
+                query_ids=query_ids,
+                samples=samples,
+                start=t0,
+                dt_queue=dt_queue,
+                dt_batching=dt_batching,
+            )
+            self.run_one_item(query)
 
     def finish(self) -> None:
         pass
@@ -61,7 +81,7 @@ class MultiThreadDataProducer:
         self.ds = ds
         self.threads = threads
         self.run_one_item = run_one_item  # pyre-ignore [4]
-        self.tasks: Queue[Optional[QueryItem]] = Queue(
+        self.tasks: Queue[Optional[Tuple[List[int], List[int], float, float]]] = Queue(
             maxsize=threads * queue_size_multiplier
         )
         self.workers: List[threading.Thread] = []
@@ -71,21 +91,35 @@ class MultiThreadDataProducer:
             self.workers.append(worker)
             worker.start()
 
-    def handle_tasks(self, tasks_queue: Queue[Optional[QueryItem]]) -> None:
+    def handle_tasks(
+        self, tasks_queue: Queue[Optional[Tuple[List[int], List[int], float, float]]]
+    ) -> None:
         stream = torch.cuda.Stream()
         while True:
-            qitem = tasks_queue.get()
-            if qitem is None:
+            query_and_content_ids = tasks_queue.get()
+            if query_and_content_ids is None:
                 tasks_queue.task_done()
                 break
+            query_ids, content_ids, t0, dt_queue = query_and_content_ids
+            t0_batching: float = time.time()
+            samples = self.ds.get_samples(content_ids)
+            dt_batching: float = time.time() - t0_batching
+            qitem = QueryItem(
+                query_ids=query_ids,
+                samples=samples,
+                start=t0,
+                dt_queue=dt_queue,
+                dt_batching=dt_batching,
+            )
             with torch.inference_mode(), torch.cuda.stream(stream):
                 self.run_one_item(qitem)
             tasks_queue.task_done()
 
-    def enqueue(self, query_ids: List[int], content_ids: List[int]) -> None:
+    def enqueue(
+        self, query_ids: List[int], content_ids: List[int], t0: float, dt_queue: float
+    ) -> None:
         with torch.profiler.record_function("data batching"):
-            samples = self.ds.get_samples(content_ids)
-            self.tasks.put(QueryItem(query_ids, samples))
+            self.tasks.put((query_ids, content_ids, t0, dt_queue))
 
     def finish(self) -> None:
         for _ in self.workers:

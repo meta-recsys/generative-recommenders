@@ -1,20 +1,16 @@
-run.model_path = "/home/linjianma/ckpts/streaming_100b/89/"
+# run.model_path = "/home/linjianma/ckpts/streaming_100b/89/"
 run.scenario_name = "Server"
-run.batchsize = 5
+run.batchsize = 20
 run.out_dir = ""
 run.output_trace = False
-run.data_producer_threads = 8
-run.compute_eval = True
+run.data_producer_threads = 16
+run.compute_eval = False
 run.find_peak_performance = False
-run.train_split_percentage = 0.75
 run.dev_mode = False
 run.sparse_quant = False
-
-# below will override mlperf rules compliant settings - don't use for official submission
-run.duration = None
-run.target_qps = 5000
-run.max_latency = 0.06
-run.samples_per_query_multistream = 64
 run.numpy_rand_seed = 123
 run.new_path_prefix = "/home/linjianma"
-run.dataset_percentage = 0.0001
+run.dataset_percentage = 0.002
+run.warmup_ratio = 0.1
+# Needs to be tuned for different implementations to balance latency and throughput
+run.target_qps = 1500
