@@ -34,20 +34,6 @@ from generative_recommenders.common import (
 from generative_recommenders.ops.utils import is_sm100
 from torch._inductor.runtime import triton_helpers
 
-try:
-    torch.ops.load_library(
-        "//generative_recommenders/fb/ultra/ops/hopper/jagged_dense_bmm_add:jagged_dense_bmm_add"
-    )
-except OSError:
-    pass
-
-CUDA_JAGGED_DENSE_BMM_BWD = False
-
-
-def set_cuda_jagged_dense_bmm_bwd(value: bool) -> None:
-    global CUDA_JAGGED_DENSE_BMM_BWD
-    CUDA_JAGGED_DENSE_BMM_BWD = value
-
 
 def _triton_concat_2D_jagged_internal(
     values_a: torch.Tensor,
@@ -859,39 +845,27 @@ class _JaggedDenseBmmAddFunction(torch.autograd.Function):
         ctx, d_out: torch.Tensor
     ) -> Tuple[None, None, torch.Tensor, torch.Tensor, torch.Tensor, None]:
         seq_offsets, jagged, dense = ctx.saved_tensors
-        if CUDA_JAGGED_DENSE_BMM_BWD:
-            d_jagged, d_dense, d_bias = (
-                torch.ops.jagged_dense_bmm_broadcast_add.jagged_dense_bmm_broadcast_add_bwd(
-                    ctx.max_seq_len,
-                    d_out,
-                    seq_offsets.to(torch.int64),
-                    jagged,
-                    dense,
-                    ctx.elementwise,
-                )
-            )
-        else:
-            d_jagged = triton_jagged_dense_bmm_add_bwd_jagged(
-                ctx.max_seq_len,
-                seq_offsets,
-                torch.empty_like(jagged),
-                dense,
-                d_out,
-                ctx.K,
-                ctx.B,
-                ctx.N,
-            )
-            d_dense, d_bias = triton_jagged_dense_bmm_add_bwd_dense_bias(
-                ctx.max_seq_len,
-                seq_offsets,
-                jagged,
-                torch.empty_like(dense),
-                ctx.B,
-                ctx.K,
-                ctx.N,
-                d_out,
-                ctx.elementwise,
-            )
+        d_jagged = triton_jagged_dense_bmm_add_bwd_jagged(
+            ctx.max_seq_len,
+            seq_offsets,
+            torch.empty_like(jagged),
+            dense,
+            d_out,
+            ctx.K,
+            ctx.B,
+            ctx.N,
+        )
+        d_dense, d_bias = triton_jagged_dense_bmm_add_bwd_dense_bias(
+            ctx.max_seq_len,
+            seq_offsets,
+            jagged,
+            torch.empty_like(dense),
+            ctx.B,
+            ctx.K,
+            ctx.N,
+            d_out,
+            ctx.elementwise,
+        )
 
         return None, None, d_jagged, d_dense, d_bias, None
 
