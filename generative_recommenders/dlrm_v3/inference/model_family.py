@@ -17,6 +17,9 @@
 model_family for dlrm_v3.
 """
 
+import copy
+import functools
+import logging
 import os
 import time
 import uuid
@@ -35,13 +38,19 @@ from generative_recommenders.dlrm_v3.inference.inference_modules import (
     get_hstu_model,
     HSTUSparseInferenceModule,
     move_sparse_output_to_device,
+    set_is_inference,
 )
 from generative_recommenders.dlrm_v3.utils import Profiler
 from generative_recommenders.modules.dlrm_hstu import DlrmHSTUConfig, SequenceEmbedding
+from pyre_extensions import none_throws
 from torch import quantization as quant
 from torchrec.distributed.quant_embedding import QuantEmbeddingCollection
 from torchrec.modules.embedding_configs import EmbeddingConfig, QuantConfig
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
+from torchrec.sparse.tensor_dict import maybe_td_to_kjt
 from torchrec.test_utils import get_free_port
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 class HSTUModelFamily:
@@ -51,6 +60,7 @@ class HSTUModelFamily:
         table_config: Dict[str, EmbeddingConfig],
         output_trace: bool = False,
         sparse_quant: bool = False,
+        compute_eval: bool = False,
     ) -> None:
         self.hstu_config = hstu_config
         self.table_config = table_config
@@ -63,7 +73,7 @@ class HSTUModelFamily:
         assert torch.cuda.is_available(), "CUDA is required for this benchmark."
         ngpus = torch.cuda.device_count()
         self.world_size = int(os.environ.get("WORLD_SIZE", str(ngpus)))
-        print(f"Using {self.world_size} GPU(s)...")
+        logger.warning(f"Using {self.world_size} GPU(s)...")
         dense_model_family_clazz = (
             ModelFamilyDenseDist
             if self.world_size > 1
@@ -74,6 +84,7 @@ class HSTUModelFamily:
                 hstu_config=hstu_config,
                 table_config=table_config,
                 output_trace=output_trace,
+                compute_eval=compute_eval,
             )
         )
 
@@ -89,10 +100,15 @@ class HSTUModelFamily:
 
     def predict(
         self, samples: Optional[Samples]
-    ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]]:
+    ) -> Optional[
+        Tuple[
+            torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], float, float
+        ]
+    ]:
         with torch.no_grad():
             if samples is None:
-                return self.dense.predict(None, None, 0, None, 0, None)
+                self.dense.predict(None, None, 0, None, 0, None)
+                return None
             (
                 seq_embeddings,
                 payload_features,
@@ -100,8 +116,9 @@ class HSTUModelFamily:
                 uih_seq_lengths,
                 max_num_candidates,
                 num_candidates,
+                dt_sparse,
             ) = self.sparse.predict(samples)
-            return self.dense.predict(
+            out = self.dense.predict(
                 seq_embeddings,
                 payload_features,
                 max_uih_len,
@@ -109,6 +126,53 @@ class HSTUModelFamily:
                 max_num_candidates,
                 num_candidates,
             )
+            (  # pyre-ignore [23]
+                mt_target_preds,
+                mt_target_labels,
+                mt_target_weights,
+                dt_dense,
+            ) = out
+            return (
+                mt_target_preds,
+                mt_target_labels,
+                mt_target_weights,
+                dt_sparse,
+                dt_dense,
+            )
+
+
+def ec_patched_forward_wo_embedding_copy(
+    ec_module: torchrec.EmbeddingCollection,
+    features: KeyedJaggedTensor,  # can also take TensorDict as input
+) -> Dict[str, JaggedTensor]:
+    """
+    Run the EmbeddingBagCollection forward pass. This method takes in a `KeyedJaggedTensor`
+    and returns a `Dict[str, JaggedTensor]`, which is the result of the individual embeddings for each feature.
+
+    Args:
+        features (KeyedJaggedTensor): KJT of form [F X B X L].
+
+    Returns:
+        Dict[str, JaggedTensor]
+    """
+    features = maybe_td_to_kjt(features, None)
+    feature_embeddings: Dict[str, JaggedTensor] = {}
+    jt_dict: Dict[str, JaggedTensor] = features.to_dict()
+    for i, emb_module in enumerate(ec_module.embeddings.values()):
+        feature_names = ec_module._feature_names[i]
+        embedding_names = ec_module._embedding_names_by_table[i]
+        for j, embedding_name in enumerate(embedding_names):
+            feature_name = feature_names[j]
+            f = jt_dict[feature_name]
+            lookup = emb_module(
+                input=f.values()
+            )  # remove the dtype cast at https://github.com/meta-pytorch/torchrec/blob/0a2cebd5472a7edc5072b3c912ad8aaa4179b9d9/torchrec/modules/embedding_modules.py#L486
+            feature_embeddings[embedding_name] = JaggedTensor(
+                values=lookup,
+                lengths=f.lengths(),
+                weights=f.values() if ec_module._need_indices else None,
+            )
+    return feature_embeddings
 
 
 class ModelFamilySparseDist:
@@ -125,7 +189,7 @@ class ModelFamilySparseDist:
         self.quant: bool = quant
 
     def load(self, model_path: str) -> None:
-        print(f"Loading sparse module from {model_path}")
+        logger.warning(f"Loading sparse module from {model_path}")
 
         sparse_arch: HSTUSparseInferenceModule = HSTUSparseInferenceModule(
             table_config=self.table_config,
@@ -150,8 +214,14 @@ class ModelFamilySparseDist:
                 inplace=False,
             )
         else:
+            sparse_arch._hstu_model._embedding_collection.forward = (  # pyre-ignore[8]
+                functools.partial(
+                    ec_patched_forward_wo_embedding_copy,
+                    sparse_arch._hstu_model._embedding_collection,
+                )
+            )
             self.module = sparse_arch
-        print(f"sparse module is {self.module}")
+        logger.warning(f"sparse module is {self.module}")
 
     def predict(
         self, samples: Samples
@@ -162,11 +232,14 @@ class ModelFamilySparseDist:
         torch.Tensor,
         int,
         torch.Tensor,
+        float,
     ]:
         with torch.profiler.record_function("sparse forward"):
+            module: torch.nn.Module = none_throws(self.module)
             assert self.module is not None
             uih_features = samples.uih_features_kjt
             candidates_features = samples.candidates_features_kjt
+            t0: float = time.time()
             (
                 seq_embeddings,
                 payload_features,
@@ -174,10 +247,11 @@ class ModelFamilySparseDist:
                 uih_seq_lengths,
                 max_num_candidates,
                 num_candidates,
-            ) = self.module(
+            ) = module(
                 uih_features=uih_features,
                 candidates_features=candidates_features,
             )
+            dt_sparse: float = time.time() - t0
             return (
                 seq_embeddings,
                 payload_features,
@@ -185,6 +259,7 @@ class ModelFamilySparseDist:
                 uih_seq_lengths,
                 max_num_candidates,
                 num_candidates,
+                dt_sparse,
             )
 
 
@@ -194,11 +269,13 @@ class ModelFamilyDenseDist:
         hstu_config: DlrmHSTUConfig,
         table_config: Dict[str, EmbeddingConfig],
         output_trace: bool = False,
+        compute_eval: bool = False,
     ) -> None:
         super(ModelFamilyDenseDist, self).__init__()
         self.hstu_config = hstu_config
         self.table_config = table_config
         self.output_trace = output_trace
+        self.compute_eval = compute_eval
 
         ngpus = torch.cuda.device_count()
         self.world_size = int(os.environ.get("WORLD_SIZE", str(ngpus)))
@@ -215,7 +292,7 @@ class ModelFamilyDenseDist:
         self.main_lock: Event = ctx.Event()
 
     def load(self, model_path: str) -> None:
-        print(f"Loading dense module from {model_path}")
+        logger.warning(f"Loading dense module from {model_path}")
 
         ctx = mp.get_context("spawn")
         processes = []
@@ -233,6 +310,7 @@ class ModelFamilyDenseDist:
         self.main_lock.wait()
 
     def distributed_setup(self, rank: int, world_size: int, model_path: str) -> None:
+        set_is_inference(is_inference=not self.compute_eval)
         model = get_hstu_model(
             table_config=self.table_config,
             hstu_config=self.hstu_config,
@@ -256,23 +334,26 @@ class ModelFamilyDenseDist:
                 if self.samples_q[rank].empty():
                     time.sleep(0.001)
                     continue
-                item = self.samples_q[rank].get()
-                # If -1 is received terminate all subprocesses
-                if item == -1:
-                    break
-                (
-                    id,
-                    seq_embeddings,
-                    payload_features,
-                    max_uih_len,
-                    uih_seq_lengths,
-                    max_num_candidates,
-                    num_candidates,
-                ) = item
-                assert seq_embeddings is not None
                 if self.output_trace:
                     assert profiler is not None
                     profiler.step()
+                with torch.profiler.record_function("get_item_from_queue"):
+                    item = self.samples_q[rank].get()
+                    # Copy here to release data in the producer to avoid invalid cuda caching allocator release.
+                    item = copy.deepcopy(item)
+                    # If -1 is received terminate all subprocesses
+                    if item == -1:
+                        break
+                    (
+                        id,
+                        seq_embeddings,
+                        payload_features,
+                        max_uih_len,
+                        uih_seq_lengths,
+                        max_num_candidates,
+                        num_candidates,
+                    ) = item
+                    assert seq_embeddings is not None
                 with torch.profiler.record_function("dense forward"):
                     (
                         _,
@@ -290,17 +371,11 @@ class ModelFamilyDenseDist:
                         num_candidates=num_candidates,
                     )
                     assert mt_target_preds is not None
-                    mt_target_preds = mt_target_preds.detach().to(
-                        device="cpu", non_blocking=True
-                    )
+                    mt_target_preds = mt_target_preds.detach().to(device="cpu")
                     if mt_target_labels is not None:
-                        mt_target_labels = mt_target_labels.detach().to(
-                            device="cpu", non_blocking=True
-                        )
+                        mt_target_labels = mt_target_labels.detach().to(device="cpu")
                     if mt_target_weights is not None:
-                        mt_target_weights = mt_target_weights.detach().to(
-                            device="cpu", non_blocking=True
-                        )
+                        mt_target_weights = mt_target_weights.detach().to(device="cpu")
                     self.predictions_cache[rank][id] = (
                         mt_target_preds,
                         mt_target_labels,
@@ -330,7 +405,9 @@ class ModelFamilyDenseDist:
         uih_seq_lengths: Optional[torch.Tensor],
         max_num_candidates: int,
         num_candidates: Optional[torch.Tensor],
-    ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]]:
+    ) -> Optional[
+        Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], float]
+    ]:
         id = uuid.uuid4()
         # If none is received terminate all subprocesses
         if seq_embeddings is None:
@@ -344,6 +421,7 @@ class ModelFamilyDenseDist:
             and num_candidates is not None
             and uih_seq_lengths is not None
         )
+        t0: float = time.time()
         seq_embeddings, payload_features, uih_seq_lengths, num_candidates = (
             move_sparse_output_to_device(
                 seq_embeddings=seq_embeddings,
@@ -366,9 +444,17 @@ class ModelFamilyDenseDist:
                 num_candidates,
             )
         )
-        out = self.capture_output(id, rank)
+        (mt_target_preds, mt_target_labels, mt_target_weights) = self.capture_output(
+            id, rank
+        )
+        dt_dense = time.time() - t0
         self.main_lock.set()
-        return out
+        return (
+            mt_target_preds,
+            mt_target_labels,
+            mt_target_weights,
+            dt_dense,
+        )
 
 
 class ModelFamilyDenseSingleWorker:
@@ -377,6 +463,7 @@ class ModelFamilyDenseSingleWorker:
         hstu_config: DlrmHSTUConfig,
         table_config: Dict[str, EmbeddingConfig],
         output_trace: bool = False,
+        compute_eval: bool = False,
     ) -> None:
         self.model: Optional[torch.nn.Module] = None
         self.hstu_config = hstu_config
@@ -389,7 +476,7 @@ class ModelFamilyDenseSingleWorker:
         )
 
     def load(self, model_path: str) -> None:
-        print(f"Loading dense module from {model_path}")
+        logger.warning(f"Loading dense module from {model_path}")
         self.model = (
             get_hstu_model(
                 table_config=self.table_config,
@@ -415,7 +502,14 @@ class ModelFamilyDenseSingleWorker:
         uih_seq_lengths: Optional[torch.Tensor],
         max_num_candidates: int,
         num_candidates: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Optional[
+        Tuple[
+            torch.Tensor,
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+            float,
+        ]
+    ]:
         if self.output_trace:
             assert self.profiler is not None
             self.profiler.step()
@@ -425,6 +519,7 @@ class ModelFamilyDenseSingleWorker:
             and num_candidates is not None
             and seq_embeddings is not None
         )
+        t0: float = time.time()
         with torch.profiler.record_function("dense forward"):
             seq_embeddings, payload_features, uih_seq_lengths, num_candidates = (
                 move_sparse_output_to_device(
@@ -452,15 +547,10 @@ class ModelFamilyDenseSingleWorker:
                 num_candidates=num_candidates,
             )
             assert mt_target_preds is not None
-            mt_target_preds = mt_target_preds.detach().to(
-                device="cpu", non_blocking=True
-            )
+            mt_target_preds = mt_target_preds.detach().to(device="cpu")
             if mt_target_labels is not None:
-                mt_target_labels = mt_target_labels.detach().to(
-                    device="cpu", non_blocking=True
-                )
+                mt_target_labels = mt_target_labels.detach().to(device="cpu")
             if mt_target_weights is not None:
-                mt_target_weights = mt_target_weights.detach().to(
-                    device="cpu", non_blocking=True
-                )
-            return mt_target_preds, mt_target_labels, mt_target_weights
+                mt_target_weights = mt_target_weights.detach().to(device="cpu")
+            dt_dense: float = time.time() - t0
+            return mt_target_preds, mt_target_labels, mt_target_weights, dt_dense

@@ -54,7 +54,6 @@ from generative_recommenders.dlrm_v3.inference.inference_modules import set_is_i
 from generative_recommenders.dlrm_v3.inference.model_family import HSTUModelFamily
 from generative_recommenders.dlrm_v3.utils import (
     get_dataset,
-    MetricsLogger,
     profiler_or_nullcontext,
     SUPPORTED_DATASETS,
 )
@@ -66,7 +65,6 @@ torch.multiprocessing.set_start_method("spawn", force=True)
 
 NANO_SEC = 1e9
 
-MLPERF_CONF = f"{os.path.dirname(__file__)}/mlperf.conf"
 USER_CONF = f"{os.path.dirname(__file__)}/user.conf"
 
 SUPPORTED_CONFIGS = {
@@ -117,61 +115,118 @@ class Runner:
             )
         self.batchsize = batchsize
         self.compute_eval = compute_eval
-        self.result_timing: List[float] = []
+        self.init_states()
+
+    def init_states(self) -> None:
+        self.result_timing: List[Dict[str, float]] = []
         self.result_batches: List[int] = []
         self.current_query_ids: List[int] = []
         self.current_content_ids: List[int] = []
-        self.metrics: Optional[MetricsLogger] = None
-        if compute_eval:
-            self.metrics = MetricsLogger(
-                multitask_configs=model.hstu_config.multitask_configs,  # pyre-ignore [6]
-                batch_size=batchsize,
-                window_size=1000,
-                device=torch.device("cpu"),
-                rank=0,
-            )
+        self.current_t0: List[float] = []
 
     def run_one_item(self, qitem: QueryItem) -> None:
         try:
-            t0 = time.time()
+            t0_prediction: float = time.time()
             prediction_output = self.model.predict(qitem.samples)
+            dt_prediction: float = time.time() - t0_prediction
             assert prediction_output is not None
-            mt_target_preds, mt_target_labels, mt_target_weights = prediction_output
+            (
+                mt_target_preds,
+                mt_target_labels,
+                mt_target_weights,
+                dt_sparse,
+                dt_dense,
+            ) = prediction_output
             if self.compute_eval:
                 assert mt_target_labels is not None
                 assert mt_target_weights is not None
-                assert self.metrics is not None
-                candidates_features = qitem.samples.candidates_features_kjt
-                num_candidates = candidates_features.lengths().view(
-                    len(candidates_features.keys()), -1
-                )[0]
-                self.metrics.update(  # pyre-ignore [16]
-                    predictions=mt_target_preds,
-                    labels=mt_target_labels,
-                    weights=mt_target_weights,
-                    num_candidates=num_candidates,
-                )
-            self.result_timing.append(time.time() - t0)
+            self.result_timing.append(
+                {
+                    "total": time.time() - qitem.start,
+                    "prediction": dt_prediction,
+                    "queue": qitem.dt_queue,
+                    "batching": qitem.dt_batching,
+                    "sparse": dt_sparse,
+                    "dense": dt_dense,
+                }
+            )
             self.result_batches.append(len(qitem.query_ids))
         except Exception as ex:  # pylint: disable=broad-except
             logger.error("thread: failed, %s", ex)
         finally:
-            response = []
-            for query_id in qitem.query_ids:
-                response_array = array.array(
-                    "B", np.array([1]).astype(np.float32).tobytes()
-                )
-                bi = response_array.buffer_info()
-                response.append(lg.QuerySampleResponse(query_id, bi[0], bi[1]))
-            lg.QuerySamplesComplete(response)
+            candidate_size = mt_target_preds.size(1) // len(qitem.query_ids)
+            if not self.compute_eval:
+                for i, query_id in enumerate(qitem.query_ids):
+                    query_mt_target_preds = (
+                        mt_target_preds[  # pyre-ignore [61]
+                            0,
+                            candidate_size * i : candidate_size * (i + 1),
+                        ]
+                        .view(-1)
+                        .float()
+                        .numpy()
+                    )
+                    response_array = array.array("B", query_mt_target_preds.tobytes())
+                    bi = response_array.buffer_info()
+                    # since we send buffer to loadgen, needs `response_array` in memory during send
+                    lg.QuerySamplesComplete(
+                        [lg.QuerySampleResponse(query_id, bi[0], bi[1])]
+                    )
+            else:
+                for i, query_id in enumerate(qitem.query_ids):
+                    query_mt_target_preds = (
+                        mt_target_preds[  # pyre-ignore [61]
+                            0, candidate_size * i : candidate_size * (i + 1)
+                        ]
+                        .view(-1)
+                        .float()
+                        .numpy()
+                    )
+                    query_mt_target_labels = (
+                        mt_target_labels[  # pyre-ignore [16,61]
+                            0, candidate_size * i : candidate_size * (i + 1)
+                        ]
+                        .view(-1)
+                        .float()
+                        .numpy()
+                    )
+                    query_mt_target_weights = (
+                        mt_target_weights[  # pyre-ignore [61]
+                            0, candidate_size * i : candidate_size * (i + 1)
+                        ]
+                        .view(-1)
+                        .float()
+                        .numpy()
+                    )
+                    np_array = np.concatenate(
+                        [
+                            query_mt_target_preds,
+                            query_mt_target_labels,
+                            query_mt_target_weights,
+                            np.array([candidate_size]).astype(np.float32),
+                        ]
+                    )
+                    response_array = array.array("B", np_array.tobytes())
+                    bi = response_array.buffer_info()
+                    # since we send buffer to loadgen, needs `response_array` in memory during send
+                    lg.QuerySamplesComplete(
+                        [lg.QuerySampleResponse(query_id, bi[0], bi[1])]
+                    )
 
-    def enqueue(self, query_samples) -> None:  # pyre-ignore [2]
+    def enqueue(self, query_samples, t0: float) -> None:  # pyre-ignore [2]
         self.current_query_ids.extend([q.id for q in query_samples])
         self.current_content_ids.extend([q.index for q in query_samples])
+        self.current_t0.append(t0)
         if len(self.current_query_ids) >= self.batchsize:
-            self.data_producer.enqueue(self.current_query_ids, self.current_content_ids)
+            self.data_producer.enqueue(
+                query_ids=self.current_query_ids,
+                content_ids=self.current_content_ids,
+                t0=min(self.current_t0),
+                dt_queue=max(self.current_t0) - min(self.current_t0),
+            )
             self.current_query_ids = []
             self.current_content_ids = []
+            self.current_t0 = []
 
     def finish(self) -> None:
         self.data_producer.finish()
@@ -179,26 +234,25 @@ class Runner:
 
 def add_results(
     final_results: Dict[str, Any],
-    result_timing: List[float],
+    result_timing: List[Dict[str, float]],
     result_batches: List[int],
-    metrics: Optional[MetricsLogger],
 ) -> None:
-    percentiles = [50.0, 80.0, 90.0, 95.0, 99.0, 99.9]
-    buckets = np.percentile(result_timing, percentiles).tolist()
-    buckets_str = ",".join(
+    percentiles: list[float] = [50.0, 80.0, 90.0, 95.0, 99.0, 99.9]
+    total_timing: list[float] = [result["total"] for result in result_timing]
+    buckets = np.percentile(total_timing, percentiles).tolist()
+    buckets_str: str = ",".join(
         ["{}:{:.4f}".format(p, b) for p, b in zip(percentiles, buckets)]
     )
     total_batches = sum(result_batches)
 
-    final_results["good"] = len(result_timing)
-    final_results["avg_time"] = np.mean(result_timing)
+    final_results["good"] = len(total_timing)
+    final_results["avg_time"] = np.mean(total_timing)
     final_results["percentiles"] = {str(k): v for k, v in zip(percentiles, buckets)}
     final_results["qps"] = total_batches / final_results["took"]
     final_results["count"] = total_batches
 
-    if metrics is not None:
-        for k, v in metrics.compute().items():
-            logger.warning(f"{k}: {v}")
+    for i, timing in enumerate(result_timing):
+        logger.warning(f"timing of {i}: {timing}")
 
     logger.warning(
         "{} qps={:.2f}, avg_query_time={:.4f}, time={:.3f}, queries={}, tiles={}".format(
@@ -230,20 +284,28 @@ class StreamingQuerySampler:
         self.batchsize = batchsize
         self.inference_ts: int = self.ds.total_ts - self.ds.train_ts
         self.start_ts: int = self.ds.train_ts
-        self.num_requests: List[int] = [
-            int(
-                (self.ds.ts_to_users_cumsum[t][-1] * dataset_percentage)
-                // self.batchsize
-                * self.batchsize
-            )
-            for t in range(self.start_ts, self.start_ts + self.inference_ts)
-        ]
+        self.dataset_percentage: float = dataset_percentage
+        self.num_requests: List[int] = self.get_num_requests(warmup_ratio=1.0)
         self.num_requests_cumsum: List[int] = np.cumsum(self.num_requests).tolist()
         self.total_requests: int = sum(self.num_requests)
         self.run_order: List[List[int]] = self.build_random_exec_order()
         self.ts: int = self.start_ts
         self.cnt: int = 0
         self.last_loaded: float = -1.0
+
+    def get_num_requests(self, warmup_ratio: float) -> List[int]:
+        return [
+            int(
+                (
+                    self.ds.ts_to_users_cumsum[t][-1]
+                    * self.dataset_percentage
+                    * warmup_ratio
+                )
+                // self.batchsize
+                * self.batchsize
+            )
+            for t in range(self.start_ts, self.start_ts + self.inference_ts)
+        ]
 
     def build_random_exec_order(self) -> List[List[int]]:
         order = []
@@ -306,6 +368,7 @@ def run(
     find_peak_performance: bool = False,
     new_path_prefix: str = "",
     train_split_percentage: float = 0.75,
+    warmup_ratio: float = 0.1,
     # below will override mlperf rules compliant settings - don't use for official submission
     duration: Optional[int] = None,
     target_qps: Optional[int] = None,
@@ -322,8 +385,6 @@ def run(
     if scenario_name not in SCENARIO_MAP:
         raise NotImplementedError("valid scanarios:" + str(list(SCENARIO_MAP.keys())))
     scenario = SCENARIO_MAP[scenario_name]
-    if scenario != lg.TestScenario.Server or compute_eval:
-        batchsize = 1
     np.random.seed(numpy_rand_seed)
 
     hstu_config = get_hstu_configs(dataset)
@@ -336,6 +397,7 @@ def run(
         table_config=table_config,
         sparse_quant=sparse_quant,
         output_trace=output_trace,
+        compute_eval=compute_eval,
     )
     is_streaming: bool = "streaming" in dataset
     dataset, kwargs = get_dataset(dataset, new_path_prefix)
@@ -350,10 +412,6 @@ def run(
         ds = StreamingQuerySampler(ds, batchsize, dataset_percentage)  # pyre-ignore
     model_family.load(model_path)
 
-    mlperf_conf = os.path.abspath(MLPERF_CONF)
-    if not os.path.exists(mlperf_conf):
-        logger.error("{} not found".format(mlperf_conf))
-        sys.exit(1)
     user_conf = os.path.abspath(USER_CONF)
     if not os.path.exists(user_conf):
         logger.error("{} not found".format(user_conf))
@@ -367,7 +425,7 @@ def run(
     # warmup
     warmup_ids = list(range(batchsize))
     ds.load_query_samples(warmup_ids)
-    for _ in range(5 * int(os.environ.get("WORLD_SIZE", 1))):
+    for _ in range(20 * int(os.environ.get("WORLD_SIZE", 1))):
         if is_streaming:
             ds.init_sut()  # pyre-ignore [16]
         sample = ds.get_samples(warmup_ids)
@@ -375,7 +433,7 @@ def run(
     ds.unload_query_samples(None)
     for h in logger.handlers:
         h.flush()
-    logger.info("warmup done")
+    logger.info("Model forward warmup done")
 
     count = int(
         ds.get_item_count() * dataset_percentage
@@ -385,7 +443,6 @@ def run(
     train_size: int = round(train_split_percentage * count) if not is_streaming else 0
 
     settings = lg.TestSettings()
-    settings.FromConfig(mlperf_conf, model_path, scenario_name)
     settings.FromConfig(user_conf, model_path, scenario_name)
     settings.scenario = scenario
     settings.mode = lg.TestMode.PerformanceOnly
@@ -393,7 +450,6 @@ def run(
     if compute_eval:
         settings.mode = lg.TestMode.AccuracyOnly
         count = count - train_size
-        data_producer_threads = 1  # during eval, using multiple threads can have concurrency issue due to Triton autotune.
 
     runner: Runner = Runner(
         model_family,
@@ -402,14 +458,12 @@ def run(
         batchsize=batchsize,
         compute_eval=compute_eval,
     )
-    if is_streaming:
-        ds.init_sut()
 
     def issue_queries(query_samples) -> None:  # pyre-ignore [2]
         if compute_eval:
             for sample in query_samples:
                 sample.index = sample.index + train_size
-        runner.enqueue(query_samples)
+        runner.enqueue(query_samples, time.time())
 
     def load_query_samples(query_ids: List[int]) -> None:
         if compute_eval:
@@ -430,14 +484,6 @@ def run(
         settings.server_target_qps = float(target_qps)
         settings.offline_expected_qps = float(target_qps)
 
-    if num_queries:
-        queries = math.ceil(num_queries / batchsize) * batchsize
-        settings.min_query_count = queries
-        settings.max_query_count = queries
-    else:
-        settings.min_query_count = count
-        settings.max_query_count = count
-
     if samples_per_query_multistream:
         settings.multi_stream_samples_per_query = samples_per_query_multistream
 
@@ -445,6 +491,57 @@ def run(
         settings.server_target_latency_ns = int(max_latency * NANO_SEC)
         settings.multi_stream_expected_latency_ns = int(max_latency * NANO_SEC)
 
+    # inference benchmark warmup
+    if is_streaming:
+        ds.init_sut()
+        warmup_count: int = sum(
+            ds.get_num_requests(warmup_ratio=warmup_ratio)  # pyre-ignore [16]
+        )
+    else:
+        warmup_count: int = int(count * warmup_ratio)
+    final_results = {
+        "runtime": model_family.name(),
+        "version": model_family.version(),
+        "time": int(time.time()),
+        "scenario": str(scenario),
+    }
+    if num_queries:
+        queries = math.ceil(num_queries / batchsize) * batchsize
+        settings.min_query_count = int(queries * warmup_ratio)
+        settings.max_query_count = int(queries * warmup_ratio)
+    else:
+        settings.min_query_count = warmup_count
+        settings.max_query_count = warmup_count
+    sut = lg.ConstructSUT(issue_queries, flush_queries)
+    qsl = lg.ConstructQSL(
+        warmup_count,
+        warmup_count,
+        load_query_samples,
+        ds.unload_query_samples,
+    )
+    with profiler_or_nullcontext(enabled=output_trace, with_stack=False):
+        logger.info(f"starting warmup {scenario} with {warmup_count} queries")
+        lg.StartTest(sut, qsl, settings)
+        lg.DestroyQSL(qsl)
+        lg.DestroySUT(sut)
+
+    # official run
+    if is_streaming:
+        ds.init_sut()
+    runner.init_states()
+    final_results = {
+        "runtime": model_family.name(),
+        "version": model_family.version(),
+        "time": int(time.time()),
+        "scenario": str(scenario),
+    }
+    if num_queries:
+        queries = math.ceil(num_queries / batchsize) * batchsize
+        settings.min_query_count = queries
+        settings.max_query_count = queries
+    else:
+        settings.min_query_count = count
+        settings.max_query_count = count
     sut = lg.ConstructSUT(issue_queries, flush_queries)
     qsl = lg.ConstructQSL(
         count,
@@ -452,16 +549,8 @@ def run(
         load_query_samples,
         ds.unload_query_samples,
     )
-
-    final_results = {
-        "runtime": model_family.name(),
-        "version": model_family.version(),
-        "time": int(time.time()),
-        "scenario": str(scenario),
-    }
-
     with profiler_or_nullcontext(enabled=output_trace, with_stack=False):
-        logger.info(f"starting {scenario}")
+        logger.info(f"starting {scenario} with {count} queries")
         lg.StartTest(sut, qsl, settings)
         runner.finish()
         final_results["took"] = time.time() - ds.last_loaded
@@ -472,7 +561,6 @@ def run(
         final_results,
         runner.result_timing,
         runner.result_batches,
-        runner.metrics,
     )
     # If multiple subprocesses are running the model send a signal to stop them
     if int(os.environ.get("WORLD_SIZE", 1)) > 1:
