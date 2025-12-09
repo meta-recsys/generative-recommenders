@@ -286,10 +286,7 @@ class ModelFamilyDenseDist:
 
         ctx = mp.get_context("spawn")
         self.samples_q: List[mp.Queue] = [ctx.Queue() for _ in range(self.world_size)]
-        self.predictions_cache = [  # pyre-ignore[4]
-            mp.Manager().dict() for _ in range(self.world_size)
-        ]
-        self.main_lock: Event = ctx.Event()
+        self.result_q: List[mp.Queue] = [ctx.Queue() for _ in range(self.world_size)]
 
     def load(self, model_path: str) -> None:
         logger.warning(f"Loading dense module from {model_path}")
@@ -307,9 +304,12 @@ class ModelFamilyDenseDist:
             )
             p.start()
             processes.append(p)
-        self.main_lock.wait()
 
     def distributed_setup(self, rank: int, world_size: int, model_path: str) -> None:
+        nprocs_per_rank = 16
+        start_core: int = nprocs_per_rank * rank
+        cores: set[int] = set([start_core + i for i in range(nprocs_per_rank)])
+        os.sched_setaffinity(0, cores)
         set_is_inference(is_inference=not self.compute_eval)
         model = get_hstu_model(
             table_config=self.table_config,
@@ -324,26 +324,22 @@ class ModelFamilyDenseDist:
         load_nonsparse_checkpoint(
             model=model, device=device, optimizer=None, path=model_path
         )
-        self.main_lock.set()
         model = model.to(device)
         model.eval()
         profiler = Profiler(rank) if self.output_trace else None
 
         with torch.no_grad():
             while True:
-                if self.samples_q[rank].empty():
-                    time.sleep(0.001)
-                    continue
+                item = self.samples_q[rank].get()
+                # If -1 is received terminate all subprocesses
+                if item == -1:
+                    break
                 if self.output_trace:
                     assert profiler is not None
                     profiler.step()
                 with torch.profiler.record_function("get_item_from_queue"):
-                    item = self.samples_q[rank].get()
                     # Copy here to release data in the producer to avoid invalid cuda caching allocator release.
                     item = copy.deepcopy(item)
-                    # If -1 is received terminate all subprocesses
-                    if item == -1:
-                        break
                     (
                         id,
                         seq_embeddings,
@@ -376,21 +372,17 @@ class ModelFamilyDenseDist:
                         mt_target_labels = mt_target_labels.detach().to(device="cpu")
                     if mt_target_weights is not None:
                         mt_target_weights = mt_target_weights.detach().to(device="cpu")
-                    self.predictions_cache[rank][id] = (
-                        mt_target_preds,
-                        mt_target_labels,
-                        mt_target_weights,
+                    self.result_q[rank].put(
+                        (id, mt_target_preds, mt_target_labels, mt_target_weights)
                     )
 
     def capture_output(
         self, id: uuid.UUID, rank: int
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        out = None
-        while out is None:
-            time.sleep(0.001)
-            out = self.predictions_cache[rank].get(id, None)
-        self.predictions_cache[rank].pop(id)
-        return out
+        while True:
+            recv_id, preds, labels, weights = self.result_q[rank].get()
+            assert recv_id == id
+            return preds, labels, weights
 
     def get_rank(self) -> int:
         rank = self.rank
@@ -431,8 +423,6 @@ class ModelFamilyDenseDist:
                 device=device,
             )
         )
-        self.main_lock.wait()
-        self.main_lock.clear()
         self.samples_q[rank].put(
             (
                 id,
@@ -448,7 +438,6 @@ class ModelFamilyDenseDist:
             id, rank
         )
         dt_dense = time.time() - t0
-        self.main_lock.set()
         return (
             mt_target_preds,
             mt_target_labels,

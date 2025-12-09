@@ -266,6 +266,12 @@ def add_results(
     )
 
 
+def get_num_queries(input_size: Optional[int], one_pass_size: int) -> int:
+    if input_size is None:
+        return one_pass_size
+    return math.ceil(input_size / one_pass_size) * one_pass_size
+
+
 class StreamingQuerySampler:
     """
     Sampler for streaming dataset
@@ -278,6 +284,7 @@ class StreamingQuerySampler:
         ds: DLRMv3SyntheticStreamingDataset,
         batchsize: int,
         dataset_percentage: float,
+        input_queries: Optional[int] = None,
     ) -> None:
         self.ds: DLRMv3SyntheticStreamingDataset = ds
         self.ds.is_inference = True
@@ -292,6 +299,10 @@ class StreamingQuerySampler:
         self.ts: int = self.start_ts
         self.cnt: int = 0
         self.last_loaded: float = -1.0
+        self.num_repeats: int = (
+            get_num_queries(input_queries, self.total_requests) // self.total_requests
+        )
+        self.repeat: int = 0
 
     def get_num_requests(self, warmup_ratio: float) -> List[int]:
         return [
@@ -340,16 +351,20 @@ class StreamingQuerySampler:
         self.ds.unload_query_samples(sample_list)
 
     def get_samples(self, id_list: List[int]) -> Samples:
-        batch_size = len(id_list)
+        batch_size: int = len(id_list)
         ts_idx: int = 0
         while self.num_requests_cumsum[ts_idx] <= self.cnt:
             ts_idx += 1
-        self.cnt += batch_size
-        offset = 0 if ts_idx == 0 else self.num_requests_cumsum[ts_idx - 1]
-        return self.ds.get_samples_with_ts(
-            self.run_order[ts_idx][self.cnt - batch_size - offset : self.cnt - offset],
+        offset: int = 0 if ts_idx == 0 else self.num_requests_cumsum[ts_idx - 1]
+        output: Samples = self.ds.get_samples_with_ts(
+            self.run_order[ts_idx][self.cnt - offset : self.cnt + batch_size - offset],
             ts_idx + self.start_ts,
         )
+        self.repeat += 1
+        if self.repeat == self.num_repeats:
+            self.repeat = 0
+            self.cnt += batch_size
+        return output
 
     def get_item_count(self) -> int:
         return self.total_requests
@@ -409,7 +424,12 @@ def run(
         **kwargs,
     )
     if is_streaming:
-        ds = StreamingQuerySampler(ds, batchsize, dataset_percentage)  # pyre-ignore
+        ds = StreamingQuerySampler(  # pyre-ignore
+            ds=ds,  # pyre-ignore [6]
+            batchsize=batchsize,
+            dataset_percentage=dataset_percentage,
+            input_queries=num_queries,
+        )
     model_family.load(model_path)
 
     user_conf = os.path.abspath(USER_CONF)
@@ -505,13 +525,8 @@ def run(
         "time": int(time.time()),
         "scenario": str(scenario),
     }
-    if num_queries:
-        queries = math.ceil(num_queries / batchsize) * batchsize
-        settings.min_query_count = int(queries * warmup_ratio)
-        settings.max_query_count = int(queries * warmup_ratio)
-    else:
-        settings.min_query_count = warmup_count
-        settings.max_query_count = warmup_count
+    settings.min_query_count = warmup_count
+    settings.max_query_count = warmup_count
     sut = lg.ConstructSUT(issue_queries, flush_queries)
     qsl = lg.ConstructQSL(
         warmup_count,
@@ -535,13 +550,9 @@ def run(
         "time": int(time.time()),
         "scenario": str(scenario),
     }
-    if num_queries:
-        queries = math.ceil(num_queries / batchsize) * batchsize
-        settings.min_query_count = queries
-        settings.max_query_count = queries
-    else:
-        settings.min_query_count = count
-        settings.max_query_count = count
+    query_size: int = get_num_queries(num_queries, count)
+    settings.min_query_count = query_size
+    settings.max_query_count = query_size
     sut = lg.ConstructSUT(issue_queries, flush_queries)
     qsl = lg.ConstructQSL(
         count,
@@ -550,7 +561,9 @@ def run(
         ds.unload_query_samples,
     )
     with profiler_or_nullcontext(enabled=output_trace, with_stack=False):
-        logger.info(f"starting {scenario} with {count} queries")
+        logger.info(
+            f"starting {scenario} with {query_size} queries and {query_size // count} repeats"
+        )
         lg.StartTest(sut, qsl, settings)
         runner.finish()
         final_results["took"] = time.time() - ds.last_loaded

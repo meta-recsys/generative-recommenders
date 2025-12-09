@@ -1,4 +1,4 @@
-# run.model_path = "/home/linjianma/ckpts/streaming_100b/89/"
+run.model_path = "/home/linjianma/ckpts/streaming_100b/89/"
 run.scenario_name = "Server"
 run.batchsize = 20
 run.out_dir = ""
@@ -10,7 +10,8 @@ run.dev_mode = False
 run.sparse_quant = False
 run.numpy_rand_seed = 123
 run.new_path_prefix = "/home/linjianma"
-run.dataset_percentage = 0.002
+run.dataset_percentage = 0.001
 run.warmup_ratio = 0.1
+run.num_queries = 500000
 # Needs to be tuned for different implementations to balance latency and throughput
 run.target_qps = 1500
