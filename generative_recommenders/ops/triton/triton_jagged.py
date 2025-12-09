@@ -34,6 +34,8 @@ from generative_recommenders.common import (
 from generative_recommenders.ops.utils import is_sm100
 from torch._inductor.runtime import triton_helpers
 
+from triton_aot.main import triton_aot
+
 
 def _triton_concat_2D_jagged_internal(
     values_a: torch.Tensor,
@@ -991,6 +993,19 @@ def concat_2D_jagged(
         BLOCK_D,
         IS_REPLACE,
     )
+
+
+concat_2D_jagged = triton_aot(
+    annotations={
+        "OffsetsA": "*i64",
+        "DenseSize": "i32",
+        "D": "i32",
+        "stride_ad": "i32",
+        "stride_bd": "i32",
+        "stride_dense_batch": "i32",
+        "stride_od": "i32",
+    }
+)(concat_2D_jagged)
 
 
 @triton.jit
