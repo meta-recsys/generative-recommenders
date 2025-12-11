@@ -47,7 +47,8 @@ except ImportError:
 def _get_layer_norm_fwd_configs() -> List[triton.Config]:
     """Generate autotune configs for multi-row LayerNorm kernels."""
     configs = []
-    for BLOCK_N in [1, 2, 4, 8, 16]:
+    block_ns = [4, 8, 16] if is_sm100() else [1, 2]
+    for BLOCK_N in block_ns:
         for num_warps in [1, 2, 4]:
             configs.append(
                 triton.Config(
@@ -67,7 +68,8 @@ def _bwd_pre_hook(nargs):
 def _get_norm_bwd_configs() -> List[triton.Config]:
     """Generate autotune configs for multi-row LayerNorm kernels."""
     configs = []
-    for BLOCK_N in [1, 4, 8, 16]:
+    block_ns = [2, 4, 8] if is_sm100() else [1, 2]
+    for BLOCK_N in block_ns:
         for num_warps in [2, 4]:
             configs.append(
                 triton.Config(
@@ -691,8 +693,8 @@ class LayerNormFunction(torch.autograd.Function):
 def _get_rms_norm_fwd_configs() -> List[triton.Config]:
     """Generate autotune configs for multi-row RMSNorm kernels."""
     configs = []
-    for BLOCK_N in [1, 2, 4, 8, 16]:
-        for num_warps in [1, 2, 4]:
+    for BLOCK_N in [1, 4, 16]:
+        for num_warps in [2, 4]:
             configs.append(
                 triton.Config(
                     {"BLOCK_N": BLOCK_N},
