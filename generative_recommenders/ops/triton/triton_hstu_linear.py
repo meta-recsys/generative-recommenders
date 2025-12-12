@@ -1024,6 +1024,7 @@ class LayerNormMulDropoutFunction(torch.autograd.Function):
         eps: float,
         dropout_ratio: float,
         training: bool,
+        silu_u: bool = False,
         concat_ux: bool = False,
         seed: Optional[int] = None,
     ) -> torch.Tensor:
@@ -1038,6 +1039,7 @@ class LayerNormMulDropoutFunction(torch.autograd.Function):
             eps=eps,
             dropout_ratio=dropout_ratio,
             training=training,
+            silu_u=silu_u,
             concat_ux=concat_ux,
             seed=seed,
         )
@@ -1048,6 +1050,7 @@ class LayerNormMulDropoutFunction(torch.autograd.Function):
         ctx.seed = seed
         ctx.training = training
         ctx.concat_ux = concat_ux
+        ctx.silu_u = silu_u
         ctx.dropout_ratio = dropout_ratio
         return y
 
@@ -1060,6 +1063,7 @@ class LayerNormMulDropoutFunction(torch.autograd.Function):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        None,
         None,
         None,
         None,
@@ -1081,10 +1085,11 @@ class LayerNormMulDropoutFunction(torch.autograd.Function):
             training=ctx.training,
             dropout_ratio=ctx.dropout_ratio,
             seed=ctx.seed,
+            silu_u=ctx.silu_u,
             concat_ux=ctx.concat_ux,
             compute_y=False,
         )
-        return dx, du, dweight, dbias, None, None, None, None, None
+        return dx, du, dweight, dbias, None, None, None, None, None, None
 
 
 @triton.jit
@@ -1568,6 +1573,7 @@ class GroupNormMulDropoutFunction(torch.autograd.Function):
         eps: float,
         dropout_ratio: float,
         training: bool,
+        silu_u: bool = False,
         concat_ux: bool = False,
         num_heads: int = 1,
         linear_dim: int = -1,
@@ -1582,6 +1588,7 @@ class GroupNormMulDropoutFunction(torch.autograd.Function):
                 eps=eps,
                 dropout_ratio=dropout_ratio,
                 training=training,
+                silu_u=silu_u,
                 concat_ux=concat_ux,
                 num_heads=num_heads,
                 linear_dim=linear_dim,
@@ -1595,6 +1602,7 @@ class GroupNormMulDropoutFunction(torch.autograd.Function):
         ctx.eps = eps
         ctx.seed = seed
         ctx.training = training
+        ctx.silu_u = silu_u
         ctx.concat_ux = concat_ux
         ctx.dropout_ratio = dropout_ratio
         ctx.num_heads = num_heads
@@ -1610,6 +1618,7 @@ class GroupNormMulDropoutFunction(torch.autograd.Function):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        None,
         None,
         None,
         None,
@@ -1634,6 +1643,7 @@ class GroupNormMulDropoutFunction(torch.autograd.Function):
             training=ctx.training,
             dropout_ratio=ctx.dropout_ratio,
             seed=ctx.seed,
+            silu_u=ctx.silu_u,
             concat_ux=ctx.concat_ux,
             num_heads=ctx.num_heads,
             linear_dim=ctx.linear_dim,
@@ -1644,6 +1654,7 @@ class GroupNormMulDropoutFunction(torch.autograd.Function):
             du,
             dweight,
             dbias,
+            None,
             None,
             None,
             None,
@@ -1998,6 +2009,7 @@ def triton_norm_mul_dropout(
     eps: float,
     dropout_ratio: float,
     training: bool,
+    silu_u: bool = False,
     concat_ux: bool = False,
     group_norm: bool = False,
     num_heads: int = 1,
@@ -2013,6 +2025,7 @@ def triton_norm_mul_dropout(
             eps,
             dropout_ratio,
             training,
+            silu_u,
             concat_ux,
             num_heads,
             linear_dim,
@@ -2020,7 +2033,7 @@ def triton_norm_mul_dropout(
         )
     else:
         return LayerNormMulDropoutFunction.apply(
-            x, u, weight, bias, eps, dropout_ratio, training, concat_ux, seed
+            x, u, weight, bias, eps, dropout_ratio, training, silu_u, concat_ux, seed
         )
 
 
