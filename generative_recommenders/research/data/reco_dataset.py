@@ -137,7 +137,7 @@ def get_reco_dataset(
             ],
         )
         all_item_ids = []
-        for df_index, row in items.iterrows():
+        for _, row in items.iterrows():
             # print(f"index {df_index}: {row}")
             movie_id = int(row["movie_id"])
             genres = row["genres"].split("|")
