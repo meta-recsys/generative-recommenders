@@ -16,6 +16,7 @@ from generative_recommenders.ops.triton.triton_addmm import (
     triton_addmm_fwd_tma_ws_persistent_tlx,
     triton_addmm_fwd_tma_ws_tlx,
 )
+from generative_recommenders.ops.utils import is_sm100
 
 try:
     # @manual=//triton:triton
@@ -84,7 +85,7 @@ def main(
         ("orange", "-"),
         ("purple", "-"),
     ]
-    if HAS_TLX == True:
+    if is_sm100() and HAS_TLX:  # tmem is only supported on Blackwell
         line_vals.append("triton_tma_ws_tlx")
         line_names.append("Triton TMA WS TLX")
         styles.append(("cyan", "-"))
