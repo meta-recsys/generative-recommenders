@@ -17,7 +17,7 @@
 from typing import Optional
 
 import torch
-from generative_recommenders.ops.utils import is_sm100
+from generative_recommenders.ops.utils import is_sm100_plus
 
 try:
     # We need to import the CUDA kernels after importing torch
@@ -69,7 +69,7 @@ def cuda_hstu_mha(
     Arguments:
         q, k, v: (batch_size, seqlen, nheads, headdim) or (total_seqlen, nheads, headdim)
     """
-    if is_sm100() and not is_inference:
+    if is_sm100_plus() and not is_inference:
         return torch.ops.bw_hstu.bw_hstu_mha(
             max_seq_len,
             alpha,

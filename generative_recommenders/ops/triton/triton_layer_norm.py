@@ -29,7 +29,7 @@ from generative_recommenders.common import (
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
-from generative_recommenders.ops.utils import is_sm100
+from generative_recommenders.ops.utils import is_sm100_plus
 
 try:
     # @manual=//triton:triton
@@ -47,7 +47,7 @@ except ImportError:
 def _get_layer_norm_fwd_configs() -> List[triton.Config]:
     """Generate autotune configs for multi-row LayerNorm kernels."""
     configs = []
-    block_ns = [4, 8, 16] if is_sm100() else [1, 2]
+    block_ns = [4, 8, 16] if is_sm100_plus() else [1, 2]
     for BLOCK_N in block_ns:
         for num_warps in [1, 2, 4]:
             configs.append(
@@ -68,7 +68,7 @@ def _bwd_pre_hook(nargs):
 def _get_norm_bwd_configs() -> List[triton.Config]:
     """Generate autotune configs for multi-row LayerNorm kernels."""
     configs = []
-    block_ns = [2, 4, 8] if is_sm100() else [1, 2]
+    block_ns = [2, 4, 8] if is_sm100_plus() else [1, 2]
     for BLOCK_N in block_ns:
         for num_warps in [2, 4]:
             configs.append(
@@ -430,7 +430,7 @@ def _weighted_layer_norm_bwd_dx(
 def _get_bwd_dwdb_configs() -> List[triton.Config]:
     configs = []
     BLOCK_N_CHOICES = [32, 64, 128, 256]
-    if is_sm100():
+    if is_sm100_plus():
         BLOCK_N_CHOICES = [128, 256, 512, 1024]
     for BLOCK_N in BLOCK_N_CHOICES:
         for num_warps in [8, 16] + ([] if torch.ops.hip else [32]):

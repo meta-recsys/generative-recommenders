@@ -29,7 +29,7 @@ from generative_recommenders.common import (
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
-from generative_recommenders.ops.utils import is_sm100
+from generative_recommenders.ops.utils import is_sm100_plus
 
 
 def _triton_concat_2D_jagged_internal(
@@ -48,7 +48,7 @@ def _triton_concat_2D_jagged_internal(
     is_dense_b: bool,
     BLOCK_D: int,
 ) -> None:
-    if is_sm100():
+    if is_sm100_plus():
 
         def grid(meta):
             return (triton.cdiv(max_seq_len, meta["BLOCK_N"]), B)
@@ -106,7 +106,7 @@ def _triton_split_2D_jagged_internal(
     is_dense_b: bool,
     BLOCK_D: int,
 ) -> None:
-    if is_sm100():
+    if is_sm100_plus():
 
         def grid(meta):
             return (triton.cdiv(max_seq_len, meta["BLOCK_N"]), B)

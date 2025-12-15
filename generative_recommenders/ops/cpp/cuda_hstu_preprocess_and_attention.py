@@ -26,7 +26,7 @@ from generative_recommenders.ops.triton.triton_addmm import (
 from generative_recommenders.ops.triton.triton_layer_norm import (
     triton_weighted_layer_norm_bwd,
 )
-from generative_recommenders.ops.utils import is_sm100
+from generative_recommenders.ops.utils import is_sm100_plus
 from torch.nn import functional as F
 
 try:
@@ -41,7 +41,7 @@ try:
         triton_apply_rope_fwd,
     )
 
-    if is_sm100():
+    if is_sm100_plus():
         torch.ops.load_library(
             "//generative_recommenders/fb/ultra/ops/blackwell/hstu_attention:hstu_flash_attention"
         )
@@ -147,7 +147,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             u = F.silu(u)
         elif recompute_uvqk_in_backward:
             u = u.clone()  # otherwise the whole uvqk will be saved
-        if is_sm100():
+        if is_sm100_plus():
             out = torch.ops.bw_hstu.bw_hstu_mha_fwd(
                 max_seq_len,
                 alpha,
@@ -381,7 +381,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         dk = dk.view(-1, ctx.num_heads, ctx.attn_dim)
         dv = dv.view(-1, ctx.num_heads, ctx.hidden_dim)
         # Note: the two operations below update duvqk in place
-        if is_sm100():
+        if is_sm100_plus():
             _dq, _dk, _dv = torch.ops.bw_hstu.bw_hstu_mha_bwd(
                 ctx.max_seq_len,
                 ctx.alpha,

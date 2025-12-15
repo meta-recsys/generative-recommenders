@@ -25,7 +25,7 @@ import torch
 
 # @manual=//triton:triton
 import triton
-from generative_recommenders.ops.utils import is_sm100
+from generative_recommenders.ops.utils import is_sm100_plus
 
 # @manual=//triton:triton
 from triton.runtime.autotuner import Autotuner
@@ -246,7 +246,7 @@ gpu_unavailable: Tuple[bool, str] = (
 gpu_available: bool = not gpu_unavailable[0]
 
 blackwell_tlx_unavailable: Tuple[bool, str] = (
-    not is_sm100() or not HAS_TLX,
+    not is_sm100_plus() or not HAS_TLX,
     "Skip TLX and blackwell only tests",
 )
 

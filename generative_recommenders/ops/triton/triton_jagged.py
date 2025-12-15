@@ -31,7 +31,7 @@ from generative_recommenders.common import (
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
-from generative_recommenders.ops.utils import is_sm100
+from generative_recommenders.ops.utils import is_sm100_plus
 from torch._inductor.runtime import triton_helpers
 
 
@@ -53,7 +53,7 @@ def _triton_concat_2D_jagged_internal(
     BLOCK_D: int,
 ) -> None:
     if n_prefix != 0:
-        if is_sm100():
+        if is_sm100_plus():
 
             def grid(meta):
                 return (triton.cdiv(max_seq_len, meta["BLOCK_N"]), B)
@@ -86,7 +86,7 @@ def _triton_concat_2D_jagged_internal(
                 BLOCK_D=BLOCK_D,  # pyre-ignore[6]
             )
     else:
-        if is_sm100():
+        if is_sm100_plus():
 
             def grid(meta):
                 return (triton.cdiv(max_seq_len, meta["BLOCK_N"]), B)
@@ -1180,7 +1180,7 @@ def _triton_split_2D_jagged_internal(
     BLOCK_D: int,
 ) -> None:
     if n_prefix != 0:
-        if is_sm100():
+        if is_sm100_plus():
 
             def grid(meta):
                 return (triton.cdiv(max_seq_len, meta["BLOCK_N"]), B)
@@ -1213,7 +1213,7 @@ def _triton_split_2D_jagged_internal(
                 BLOCK_D=BLOCK_D,  # pyre-ignore[6]
             )
     else:
-        if is_sm100():
+        if is_sm100_plus():
 
             def grid(meta):
                 return (triton.cdiv(max_seq_len, meta["BLOCK_N"]), B)
