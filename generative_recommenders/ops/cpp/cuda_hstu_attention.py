@@ -98,7 +98,7 @@ def cuda_hstu_mha(
             num_groups,
         )
     else:
-        return torch.ops.hstu.hstu_mha(
+        return cuda_hstu_mha_inference_wrapper(
             max_seq_len,
             alpha,
             q,
@@ -127,3 +127,66 @@ def cuda_hstu_mha(
             min_full_attn_seq_len_tensor,
             num_groups,
         )
+
+
+@torch.fx.wrap
+def cuda_hstu_mha_inference_wrapper(
+    max_seq_len: int,
+    alpha: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_offsets: Optional[torch.Tensor] = None,
+    causal: bool = False,
+    num_targets: Optional[torch.Tensor] = None,
+    attn_scale: Optional[torch.Tensor] = None,
+    max_attn_len: int = 0,
+    min_full_attn_seq_len: int = 0,
+    contextual_seq_len: int = 0,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
+    sort_by_length: bool = False,
+    deterministic: bool = False,
+    sm_margin: int = 0,
+    max_q_len: int = 0,
+    seq_offsets_q: Optional[torch.Tensor] = None,
+    num_softmax_heads: int = 0,
+    training: bool = True,
+    max_seq_len_tensor: Optional[torch.Tensor] = None,
+    contextual_seq_len_tensor: Optional[torch.Tensor] = None,
+    max_attn_len_tensor: Optional[torch.Tensor] = None,
+    min_full_attn_seq_len_tensor: Optional[torch.Tensor] = None,
+    num_groups: int = 1,
+) -> torch.Tensor:
+    attn_scale = attn_scale.to(torch.float32) if attn_scale is not None else attn_scale
+
+    return torch.ops.hstu.hstu_mha(
+        max_seq_len,
+        alpha,
+        q,
+        k,
+        v,
+        seq_offsets,
+        causal,
+        num_targets,
+        attn_scale,
+        max_attn_len,
+        min_full_attn_seq_len,
+        contextual_seq_len,
+        q_descale,
+        k_descale,
+        v_descale,
+        sort_by_length,
+        deterministic,
+        sm_margin,
+        max_q_len,
+        seq_offsets_q,
+        num_softmax_heads,
+        training,
+        max_seq_len_tensor,
+        contextual_seq_len_tensor,
+        max_attn_len_tensor,
+        min_full_attn_seq_len_tensor,
+        num_groups,
+    )
