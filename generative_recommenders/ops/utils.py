@@ -19,11 +19,15 @@
 import torch
 
 
-def is_sm100() -> bool:
+def is_sm100_plus() -> bool:
+    """
+    Check if this is a Blackwell Datacenter GPU.
+    These are between 100 and 103 for B200-GB300.
+    """
     if not torch.cuda.is_available():
         return False
     props = torch.cuda.get_device_properties(0)
-    return props.major == 10 and props.minor == 0
+    return props.major == 10 and (props.minor >= 0 and props.minor <= 3)
 
 
 def is_sm90() -> bool:

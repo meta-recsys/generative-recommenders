@@ -36,7 +36,7 @@ except ImportError:
     HAS_TLX = False
 
 from generative_recommenders.common import triton_autotune, triton_cc
-from generative_recommenders.ops.utils import is_sm100
+from generative_recommenders.ops.utils import is_sm100_plus
 
 try:
     # @manual=//triton:triton
@@ -161,7 +161,7 @@ def get_mm_configs(pre_hook=None) -> List[triton.Config]:
         block_k_range = [32, 64]
         group_m_range = [4, 8]
         # WARP_SPECIALIZE only works with num_warps >=4
-        num_warps_range = [4, 8] if is_sm100() else [2, 4, 8]
+        num_warps_range = [4, 8] if is_sm100_plus() else [2, 4, 8]
         num_stage_range = [2, 3, 4, 5]
         if ENABLE_FULL_TURNING_SPACE:
             return [
@@ -274,7 +274,7 @@ def get_mm_configs(pre_hook=None) -> List[triton.Config]:
                     pre_hook=pre_hook,
                 ),
             ]
-            if is_sm100():
+            if is_sm100_plus():
                 configs += [
                     triton.Config(
                         {
@@ -1212,7 +1212,7 @@ def maybe_triton_addmm_fwd(
 ) -> torch.Tensor:
     # triton addmm is slower than torch (cublas) on AMD/Blackwell.
     # Default to pytorch addmm on AMD/Blackwell for now.
-    if is_sm100() or torch.version.hip is not None:
+    if is_sm100_plus() or torch.version.hip is not None:
         return torch.addmm(y, x, w)
     else:
         return triton_addmm_fwd(x=x, w=w, y=y)
@@ -1229,7 +1229,7 @@ class _AddMmFunction(torch.autograd.Function):
     ) -> torch.Tensor:
         ctx.save_for_backward(x, w)
         ctx.is_y_1d = y.dim() == 1
-        if is_sm100() and TMA_AVAILABLE and _check_tma_alignment(x, w, y):
+        if is_sm100_plus() and TMA_AVAILABLE and _check_tma_alignment(x, w, y):
             if x.dtype == torch.float32 or HAS_TLX == False:
                 # use TMA persistent kernel on sm100
                 return triton_addmm_fwd_tma_persistent(x, w, y, warp_specialize=True)

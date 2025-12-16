@@ -46,7 +46,7 @@ def _get_layer_norm_mul_dropout_fwd_multirow_configs() -> List[triton.Config]:
     return configs
 
 
-from generative_recommenders.ops.utils import is_sm100
+from generative_recommenders.ops.utils import is_sm100_plus
 
 # @manual=//triton:triton
 from triton.language.extra import libdevice
@@ -801,7 +801,12 @@ def triton_layer_norm_mul_dropout_fwd(
     # Benchmark shows separating RNG from ln_mul_dropout kernel only benefits on
     # blackwell when CONCAT_UX is enabled. (fused RNG kernel can benefit from rand3x fast
     # dropout)
-    if not FUSE_OUTPUT_LN_RNG_BLACKWELL and is_sm100() and not concat_ux and training:
+    if (
+        not FUSE_OUTPUT_LN_RNG_BLACKWELL
+        and is_sm100_plus()
+        and not concat_ux
+        and training
+    ):
         random_mask = torch.empty([N, D], dtype=torch.bool, device=x.device)
 
         _generate_random_mask[(triton.cdiv(N, 4),)](
@@ -912,7 +917,12 @@ def triton_layer_norm_mul_dropout_bwd(
     dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
     dbias = torch.empty((D,), dtype=weight.dtype, device=x.device)
 
-    if not FUSE_OUTPUT_LN_RNG_BLACKWELL and is_sm100() and not concat_ux and training:
+    if (
+        not FUSE_OUTPUT_LN_RNG_BLACKWELL
+        and is_sm100_plus()
+        and not concat_ux
+        and training
+    ):
         random_mask = torch.empty([N, D], dtype=torch.bool, device=x.device)
 
         _generate_random_mask[(triton.cdiv(N, 4),)](
