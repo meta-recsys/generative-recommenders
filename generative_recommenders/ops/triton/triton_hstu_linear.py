@@ -211,8 +211,7 @@ def _ln_mul_dropout_fwd_rng(
     y = y * w[None, :] + b[None, :]
 
     if SILU_U:
-        # pyre-fixme[16]
-        u_block = fast_dividef(u_block, 1.0 + tl.exp(-u_block))
+        u_block = u_block * tl.sigmoid(u_block)
 
     y = y * u_block
 
@@ -342,8 +341,7 @@ def _ln_mul_dropout_fwd(
     y = y * w + b
     u = tl.load(U + cols, mask=cols < D, other=0.0).to(tl.float32)
     if SILU_U:
-        # pyre-fixme[16]
-        u = fast_dividef(u, 1.0 + tl.exp(-u))
+        u = u * tl.sigmoid(u)
     y = y * u
 
     if TRAINING:
@@ -483,10 +481,12 @@ def _ln_mul_dropout_bwd_dx_du_rng(
         ln = xhat * w + b
         du += dy * ln
         if SILU_U:
-            # pyre-ignore[16]
-            sig_u = fast_dividef(1.0, 1.0 + tl.exp(-u))
-            du = du * (sig_u + u * sig_u * (1.0 - sig_u))
-            u = u * sig_u
+            # The recomputation of silu_u should be consistent with the forward pass
+            # for NE.
+            sig_u = tl.sigmoid(u)
+            silu_u = u * sig_u
+            du = du * sig_u * (1 + u - silu_u)
+            u = silu_u
         tl.store(DU + cols, du.to(DU.dtype.element_ty), mask=mask)
         dy = dy * u
         wdy = w * dy
@@ -650,10 +650,12 @@ def _ln_mul_dropout_bwd_dx_du(
         ln = xhat * w + b
         du += dy * ln
         if SILU_U:
-            # pyre-ignore[16]
-            sig_u = fast_dividef(1.0, 1.0 + tl.exp(-u))
-            du = du * (sig_u + u * sig_u * (1.0 - sig_u))
-            u = u * sig_u
+            # The recomputation of silu_u should be consistent with the forward pass
+            # for NE.
+            sig_u = tl.sigmoid(u)
+            silu_u = u * sig_u
+            du = du * sig_u * (1 + u - silu_u)
+            u = silu_u
         tl.store(DU + cols, du.to(DU.dtype.element_ty), mask=mask)
         dy = dy * u
         wdy = w * dy
@@ -1159,8 +1161,7 @@ def _group_norm_mul_dropout_fwd(
     y = y * w[:, None] + b[:, None]
     u = tl.load(U + offsets, mask=mask, other=0.0).to(tl.float32)
     if SILU_U:
-        # pyre-fixme[16]
-        u = fast_dividef(u, 1.0 + tl.exp(-u))
+        u = u * tl.sigmoid(u)
     y = y * u
 
     if TRAINING:
@@ -1283,10 +1284,10 @@ def _group_norm_mul_dropout_bwd_dx_du(
     ln = xhat * w[:, None] + b[:, None]
     du += dy * ln
     if SILU_U:
-        # pyre-ignore[16]
-        sig_u = fast_dividef(1.0, 1.0 + tl.exp(-u))
-        du = du * (sig_u + u * sig_u * (1.0 - sig_u))
-        u = u * sig_u
+        sig_u = tl.sigmoid(u)
+        silu_u = u * sig_u
+        du = du * sig_u * (1 + u - silu_u)
+        u = silu_u
     tl.store(DU + offsets, du.to(DU.dtype.element_ty), mask=mask)
     dy = dy * u
     wdy = w[:, None] * dy
@@ -1905,8 +1906,7 @@ def _helion_ln_mul_dropout_fwd(
     # Load u and optionally apply SiLU activation
     u_val = tl.load(u + cols, mask=mask, other=0.0).to(tl.float32)
     if SILU_U:
-        # pyre-fixme[16]
-        u_processed = fast_dividef(u_val, 1.0 + tl.exp(-u_val))
+        u_processed = u_val * tl.sigmoid(u_val)
     else:
         u_processed = u_val
 
