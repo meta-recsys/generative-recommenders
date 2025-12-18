@@ -248,6 +248,10 @@ def _weighted_layer_norm_fwd(
     tl.store(Y_block_ptr, y.to(Y.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton_autotune(
+    configs=_get_layer_norm_fwd_configs(),
+    key=["BLOCK_D"],
+)
 @triton.jit
 def _layer_norm_bwd_dx(
     DX,
@@ -260,30 +264,85 @@ def _layer_norm_bwd_dx(
     stride_x,
     D,
     eps,
+    N,
     BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    pid = tl.program_id(0)
+    tile_num = tl.num_programs(0)
+    num_blocks = tl.cdiv(N, BLOCK_N)
+    blocks_per_tile = num_blocks // tile_num
+    if pid < num_blocks % tile_num:
+        blocks_per_tile += 1
+
     cols = tl.arange(0, BLOCK_D)
-    mask = cols < D
-    X += row.to(tl.int64) * stride_x
-    DY += row.to(tl.int64) * stride_dy
-    DX += row.to(tl.int64) * stride_dx
+    col_mask = cols < D
 
-    # Load data to SRAM
-    x = tl.load(X + cols, mask=mask, other=0).to(tl.float32)
-    dy = tl.load(DY + cols, mask=mask, other=0).to(tl.float32)
-    mean = tl.load(Mean + row)
-    rstd = tl.load(Rstd + row)
+    start_block = pid
 
-    # Compute dx
-    xhat = (x - mean) * rstd
-    xhat = tl.where(mask, xhat, 0.0)
-    dy = tl.where(mask, dy, 0.0)
-    c1 = tl.sum(xhat * dy, axis=0) / D
-    c2 = tl.sum(dy, axis=0) / D
-    dx = (dy - (xhat * c1 + c2)) * rstd
-    # Write dx
-    tl.store(DX + cols, dx, mask=mask)
+    for idx in range(blocks_per_tile):
+        current_block = start_block + idx * tile_num
+        start_row = current_block * BLOCK_N
+
+        X_block_ptr = tl.make_block_ptr(
+            base=X,
+            shape=(N, D),
+            strides=(stride_x, 1),
+            offsets=(start_row, 0),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0),
+        )
+
+        DX_block_ptr = tl.make_block_ptr(
+            base=DX,
+            shape=(N, D),
+            strides=(stride_dx, 1),
+            offsets=(start_row, 0),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0),
+        )
+
+        DY_block_ptr = tl.make_block_ptr(
+            base=DY,
+            shape=(N, D),
+            strides=(stride_dy, 1),
+            offsets=(start_row, 0),
+            block_shape=(BLOCK_N, BLOCK_D),
+            order=(1, 0),
+        )
+
+        # Load data blocks
+        x_block = tl.load(X_block_ptr, boundary_check=(0, 1), padding_option="zero").to(
+            tl.float32
+        )
+        dy_block = tl.load(
+            DY_block_ptr, boundary_check=(0, 1), padding_option="zero"
+        ).to(tl.float32)
+
+        # Load mean and rstd for all rows in this block
+        rows = start_row + tl.arange(0, BLOCK_N)
+        row_mask = rows < N
+        mean = tl.load(Mean + rows, row_mask, other=0.0)
+        rstd = tl.load(Rstd + rows, row_mask, other=0.0)
+
+        # Expand dimensions for broadcasting
+        mean = tl.expand_dims(mean, 1)
+        rstd = tl.expand_dims(rstd, 1)
+
+        xhat = (x_block - mean) * rstd
+
+        xhat = tl.where(row_mask[:, None] & col_mask[None, :], xhat, 0.0)
+        dy_block = tl.where(row_mask[:, None] & col_mask[None, :], dy_block, 0.0)
+
+        # Compute dx
+        c1 = tl.sum(xhat * dy_block, axis=1) / D
+        c2 = tl.sum(dy_block, axis=1) / D
+        c1 = tl.expand_dims(c1, 1)
+        c2 = tl.expand_dims(c2, 1)
+        dx = (dy_block - (xhat * c1 + c2)) * rstd
+
+        # Write dx
+        tl.store(DX_block_ptr, dx.to(DX.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton_autotune(
@@ -622,8 +681,10 @@ def triton_weighted_layer_norm_bwd(
         dx = torch.empty_like(x)
         if N == 0:
             return dx, None, None
+        sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+        tile_num = max(1, min(sms * 8, N // 4))
         # pyre-ignore[28]
-        _layer_norm_bwd_dx[(N,)](
+        _layer_norm_bwd_dx[(tile_num,)](
             dx,
             dy,
             x,
@@ -634,8 +695,8 @@ def triton_weighted_layer_norm_bwd(
             x.stride(0),
             D,
             eps,
+            N=N,
             BLOCK_D=BLOCK_D,
-            num_warps=num_warps,
         )
         return dx, None, None
 
