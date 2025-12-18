@@ -102,6 +102,8 @@ def _prune_configs_for_pair_cta(configs, named_args, **kwargs):  # noqa
         pair_cta_compatible = (num_tiles_m % 2 == 0) and (total_tiles % 2 == 0)
 
         c.kwargs["PAIR_CTA"] = pair_cta_compatible
+        # Set ctas_per_cga for CUDA-native cluster launch semantics (TLX way)
+        c.ctas_per_cga = (2, 1, 1) if pair_cta_compatible else None
 
         pruned.append(c)
     return pruned
