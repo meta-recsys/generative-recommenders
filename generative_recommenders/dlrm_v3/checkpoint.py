@@ -13,6 +13,12 @@
 # limitations under the License.
 
 # pyre-strict
+"""
+Checkpoint utilities for saving and loading DLRMv3 model checkpoints.
+
+This module provides functions for saving and loading distributed model checkpoints,
+including both sparse (embedding) and dense (non-embedding) components.
+"""
 
 import gc
 import os
@@ -29,6 +35,17 @@ from torchrec.distributed.types import ShardedTensor
 
 
 class SparseState(Stateful):
+    """
+    Stateful wrapper for sparse (embedding) tensors in a model.
+
+    This class implements the Stateful interface for distributed checkpointing,
+    allowing sparse tensors to be saved and loaded separately from dense tensors.
+
+    Args:
+        model: The PyTorch model containing sparse tensors.
+        sparse_tensor_keys: Set of keys identifying sparse tensors in the model's state dict.
+    """
+
     def __init__(self, model: torch.nn.Module, sparse_tensor_keys: Set[str]) -> None:
         self.model = model
         self.sparse_tensor_keys = sparse_tensor_keys
@@ -79,6 +96,20 @@ def save_dmp_checkpoint(
     batch_idx: int,
     path: str = "",
 ) -> None:
+    """
+    Save a distributed model checkpoint including sparse and dense components.
+
+    Saves the model's sparse tensors using distributed checkpointing and dense
+    tensors, optimizer state, and metrics using standard PyTorch serialization.
+
+    Args:
+        model: The model to checkpoint.
+        optimizer: The optimizer whose state should be saved.
+        metric_logger: The metrics logger containing training/eval metrics.
+        rank: The current process rank in distributed training.
+        batch_idx: The current batch index (used for checkpoint naming).
+        path: Base path for saving the checkpoint. If empty, no checkpoint is saved.
+    """
     if path == "":
         return
     now = datetime.now()
@@ -161,6 +192,18 @@ def load_nonsparse_checkpoint(
     metric_logger: Optional[MetricsLogger] = None,
     path: str = "",
 ) -> None:
+    """
+    Load non-sparse (dense) components from a checkpoint.
+
+    Loads dense model parameters, and optionally optimizer state and metrics.
+
+    Args:
+        model: The model to load dense parameters into.
+        device: The device to load tensors onto.
+        optimizer: Optional optimizer to restore state for.
+        metric_logger: Optional metrics logger to restore state for.
+        path: Base path of the checkpoint. If empty, no loading is performed.
+    """
     if path == "":
         return
     non_sparse_ckpt = f"{path}/non_sparse.ckpt"
@@ -193,6 +236,19 @@ def load_dmp_checkpoint(
     device: torch.device,
     path: str = "",
 ) -> None:
+    """
+    Load a complete distributed model checkpoint (both sparse and dense components).
+
+    This is a convenience function that calls both load_sparse_checkpoint and
+    load_nonsparse_checkpoint.
+
+    Args:
+        model: The model to load the checkpoint into.
+        optimizer: The optimizer to restore state for.
+        metric_logger: The metrics logger to restore state for.
+        device: The device to load tensors onto.
+        path: Base path of the checkpoint. If empty, no loading is performed.
+    """
     load_sparse_checkpoint(model=model, path=path)
     load_nonsparse_checkpoint(
         model=model,

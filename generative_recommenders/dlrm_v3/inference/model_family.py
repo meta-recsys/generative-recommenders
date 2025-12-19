@@ -33,6 +33,7 @@ from generative_recommenders.dlrm_v3.checkpoint import (
     load_nonsparse_checkpoint,
     load_sparse_checkpoint,
 )
+from generative_recommenders.dlrm_v3.configs import HASH_SIZE_1B
 from generative_recommenders.dlrm_v3.datasets.dataset import Samples
 from generative_recommenders.dlrm_v3.inference.inference_modules import (
     get_hstu_model,
@@ -54,6 +55,20 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 class HSTUModelFamily:
+    """
+    High-level interface for the HSTU model family.
+
+    Manages both sparse (embedding) and dense (transformer) components of the
+    HSTU model, supporting distributed inference across multiple GPUs.
+
+    Args:
+        hstu_config: Configuration object for the HSTU model.
+        table_config: Dictionary of embedding table configurations.
+        output_trace: Whether to enable profiling trace output.
+        sparse_quant: Whether to quantize sparse embeddings.
+        compute_eval: Whether to compute evaluation metrics (includes labels).
+    """
+
     def __init__(
         self,
         hstu_config: DlrmHSTUConfig,
@@ -89,12 +104,20 @@ class HSTUModelFamily:
         )
 
     def version(self) -> str:
+        """Return the PyTorch version string."""
         return torch.__version__
 
     def name(self) -> str:
+        """Return the model family name identifier."""
         return "model-family-hstu"
 
     def load(self, model_path: str) -> None:
+        """
+        Load model checkpoints from disk.
+
+        Args:
+            model_path: Base path to the model checkpoint directory.
+        """
         self.sparse.load(model_path=model_path)
         self.dense.load(model_path=model_path)
 
@@ -105,6 +128,17 @@ class HSTUModelFamily:
             torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], float, float
         ]
     ]:
+        """
+        Run inference on a batch of samples.
+
+        Processes samples through sparse embeddings, then dense forward pass.
+
+        Args:
+            samples: Input samples containing features. If None, signals shutdown.
+
+        Returns:
+            Tuple of (predictions, labels, weights, sparse_time, dense_time) or None.
+        """
         with torch.no_grad():
             if samples is None:
                 self.dense.predict(None, None, 0, None, 0, None)
@@ -164,8 +198,9 @@ def ec_patched_forward_wo_embedding_copy(
         for j, embedding_name in enumerate(embedding_names):
             feature_name = feature_names[j]
             f = jt_dict[feature_name]
+            indices = torch.clamp(f.values(), min=0, max=HASH_SIZE_1B - 1)
             lookup = emb_module(
-                input=f.values()
+                input=indices
             )  # remove the dtype cast at https://github.com/meta-pytorch/torchrec/blob/0a2cebd5472a7edc5072b3c912ad8aaa4179b9d9/torchrec/modules/embedding_modules.py#L486
             feature_embeddings[embedding_name] = JaggedTensor(
                 values=lookup,
@@ -176,6 +211,18 @@ def ec_patched_forward_wo_embedding_copy(
 
 
 class ModelFamilySparseDist:
+    """
+    Sparse Arch module manager.
+
+    Handles loading and inference of sparse embedding lookups, optionally
+    with quantization for memory efficiency.
+
+    Args:
+        hstu_config: HSTU model configuration.
+        table_config: Embedding table configurations.
+        quant: Whether to apply dynamic quantization to embeddings.
+    """
+
     def __init__(
         self,
         hstu_config: DlrmHSTUConfig,
@@ -189,6 +236,12 @@ class ModelFamilySparseDist:
         self.quant: bool = quant
 
     def load(self, model_path: str) -> None:
+        """
+        Load sparse model checkpoint and optionally apply quantization.
+
+        Args:
+            model_path: Path to the model checkpoint directory.
+        """
         logger.warning(f"Loading sparse module from {model_path}")
 
         sparse_arch: HSTUSparseInferenceModule = HSTUSparseInferenceModule(
@@ -234,6 +287,16 @@ class ModelFamilySparseDist:
         torch.Tensor,
         float,
     ]:
+        """
+        Run sparse forward pass (embedding lookups).
+
+        Args:
+            samples: Input samples with feature tensors.
+
+        Returns:
+            Tuple of (seq_embeddings, payload_features, max_uih_len, uih_seq_lengths,
+            max_num_candidates, num_candidates, elapsed_time).
+        """
         with torch.profiler.record_function("sparse forward"):
             module: torch.nn.Module = none_throws(self.module)
             assert self.module is not None
@@ -264,6 +327,19 @@ class ModelFamilySparseDist:
 
 
 class ModelFamilyDenseDist:
+    """
+    Distributed dense module manager for multi-GPU inference.
+
+    Spawns worker processes for each GPU to run dense forward passes in parallel,
+    with samples distributed via inter-process queues.
+
+    Args:
+        hstu_config: HSTU model configuration.
+        table_config: Embedding table configurations.
+        output_trace: Whether to enable profiling traces.
+        compute_eval: Whether to compute evaluation metrics.
+    """
+
     def __init__(
         self,
         hstu_config: DlrmHSTUConfig,
@@ -289,6 +365,12 @@ class ModelFamilyDenseDist:
         self.result_q: List[mp.Queue] = [ctx.Queue() for _ in range(self.world_size)]
 
     def load(self, model_path: str) -> None:
+        """
+        Load dense model and spawn worker processes for distributed inference.
+
+        Args:
+            model_path: Path to the model checkpoint directory.
+        """
         logger.warning(f"Loading dense module from {model_path}")
 
         ctx = mp.get_context("spawn")
@@ -306,6 +388,17 @@ class ModelFamilyDenseDist:
             processes.append(p)
 
     def distributed_setup(self, rank: int, world_size: int, model_path: str) -> None:
+        """
+        Initialize and run a dense worker process.
+
+        Each worker loads the model, processes samples from its queue, and
+        returns results.
+
+        Args:
+            rank: Process rank (GPU index).
+            world_size: Total number of worker processes.
+            model_path: Path to model checkpoint.
+        """
         nprocs_per_rank = 16
         start_core: int = nprocs_per_rank * rank
         cores: set[int] = set([start_core + i for i in range(nprocs_per_rank)])
@@ -366,6 +459,9 @@ class ModelFamilyDenseDist:
                         max_num_candidates=max_num_candidates,
                         num_candidates=num_candidates,
                     )
+                    # mt_target_preds = torch.empty(1, 2048 * 20).to(device="cpu")
+                    # mt_target_labels = None
+                    # mt_target_weights = None
                     assert mt_target_preds is not None
                     mt_target_preds = mt_target_preds.detach().to(device="cpu")
                     if mt_target_labels is not None:
@@ -379,12 +475,28 @@ class ModelFamilyDenseDist:
     def capture_output(
         self, id: uuid.UUID, rank: int
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Retrieve inference results from a worker process.
+
+        Args:
+            id: Unique identifier for the request.
+            rank: Worker rank to retrieve from.
+
+        Returns:
+            Tuple of (predictions, labels, weights).
+        """
         while True:
             recv_id, preds, labels, weights = self.result_q[rank].get()
             assert recv_id == id
             return preds, labels, weights
 
     def get_rank(self) -> int:
+        """
+        Get the next worker rank for load balancing.
+
+        Returns:
+            Rank index, cycling through available workers.
+        """
         rank = self.rank
         self.rank = (self.rank + 1) % self.world_size
         return rank
@@ -400,6 +512,22 @@ class ModelFamilyDenseDist:
     ) -> Optional[
         Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], float]
     ]:
+        """
+        Run distributed dense forward pass.
+
+        Dispatches work to a worker process and collects results.
+
+        Args:
+            seq_embeddings: Sequence embeddings from sparse module.
+            payload_features: Additional feature tensors.
+            max_uih_len: Maximum UIH sequence length.
+            uih_seq_lengths: Per-sample UIH lengths.
+            max_num_candidates: Maximum candidates per sample.
+            num_candidates: Per-sample candidate counts.
+
+        Returns:
+            Tuple of (predictions, labels, weights, elapsed_time) or None if shutdown.
+        """
         id = uuid.uuid4()
         # If none is received terminate all subprocesses
         if seq_embeddings is None:
@@ -447,6 +575,18 @@ class ModelFamilyDenseDist:
 
 
 class ModelFamilyDenseSingleWorker:
+    """
+    Single-worker dense module manager for single-GPU inference.
+
+    Simpler alternative to ModelFamilyDenseDist for single-GPU setups.
+
+    Args:
+        hstu_config: HSTU model configuration.
+        table_config: Embedding table configurations.
+        output_trace: Whether to enable profiling traces.
+        compute_eval: Whether to compute evaluation metrics.
+    """
+
     def __init__(
         self,
         hstu_config: DlrmHSTUConfig,
@@ -465,6 +605,12 @@ class ModelFamilyDenseSingleWorker:
         )
 
     def load(self, model_path: str) -> None:
+        """
+        Load dense model for single-GPU inference.
+
+        Args:
+            model_path: Path to the model checkpoint directory.
+        """
         logger.warning(f"Loading dense module from {model_path}")
         self.model = (
             get_hstu_model(
@@ -499,6 +645,20 @@ class ModelFamilyDenseSingleWorker:
             float,
         ]
     ]:
+        """
+        Run dense forward pass on single GPU.
+
+        Args:
+            seq_embeddings: Sequence embeddings from sparse module.
+            payload_features: Additional feature tensors.
+            max_uih_len: Maximum UIH sequence length.
+            uih_seq_lengths: Per-sample UIH lengths.
+            max_num_candidates: Maximum candidates per sample.
+            num_candidates: Per-sample candidate counts.
+
+        Returns:
+            Tuple of (predictions, labels, weights, elapsed_time).
+        """
         if self.output_trace:
             assert self.profiler is not None
             self.profiler.step()

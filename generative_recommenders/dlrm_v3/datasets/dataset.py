@@ -14,9 +14,10 @@
 
 # pyre-unsafe
 """
-implementation of the dataset for dlrm_v3.
-Implementation borrowed from dlrm_v2 benchmark (https://github.com/mlcommons/inference/blob/master/recommendation/dlrm_v2/pytorch/python/dataset.py).
-TODO: use this as a template and implements the expanded MovieLens dataset
+Dataset implementations for DLRMv3.
+
+This module provides dataset classes for loading and processing recommendation
+data, including sample containers, collation functions, and random data generation.
 """
 
 import logging
@@ -36,17 +37,49 @@ logger: logging.Logger = logging.getLogger("dlrmv3_dataset")
 
 @dataclass
 class Samples:
+    """
+    Container for batched samples with user interaction history and candidate features.
+
+    Attributes:
+        uih_features_kjt: User interaction history features as KeyedJaggedTensor.
+        candidates_features_kjt: Candidate item features as KeyedJaggedTensor.
+    """
+
     uih_features_kjt: KeyedJaggedTensor
     candidates_features_kjt: KeyedJaggedTensor
 
     def to(self, device: torch.device) -> None:
+        """
+        Move all tensors to the specified device.
+
+        Args:
+            device: Target device to move tensors to.
+        """
         for attr in vars(self):
             setattr(self, attr, getattr(self, attr).to(device=device))
+
+    def batch_size(self) -> int:
+        """
+        Get the batch size of the samples.
+
+        Returns:
+            Number of samples in the batch.
+        """
+        return self.uih_features_kjt.stride()
 
 
 def collate_fn(
     samples: List[Tuple[KeyedJaggedTensor, KeyedJaggedTensor]],
 ) -> Samples:
+    """
+    Collate multiple samples into a batched Samples object.
+
+    Args:
+        samples: List of (uih_features, candidates_features) tuples.
+
+    Returns:
+        Batched Samples object with concatenated features.
+    """
     (
         uih_features_kjt_list,
         candidates_features_kjt_list,
@@ -59,6 +92,17 @@ def collate_fn(
 
 
 class Dataset:
+    """
+    Base dataset class for DLRMv3.
+
+    Provides the interface for loading, accessing, and managing samples
+    for recommendation model training and inference.
+
+    Args:
+        hstu_config: HSTU model configuration.
+        **args: Additional arguments (unused in base class).
+    """
+
     def __init__(self, hstu_config: DlrmHSTUConfig, **args):
         self.arrival = None
         self.image_list = []
@@ -67,22 +111,72 @@ class Dataset:
         self.last_loaded = -1.0
 
     def preprocess(self, use_cache=True):
+        """
+        Preprocess the dataset.
+
+        Args:
+            use_cache: Whether to use cached preprocessed data.
+
+        Raises:
+            NotImplementedError: Subclasses must implement this method.
+        """
         raise NotImplementedError("Dataset:preprocess")
 
     def get_item_count(self):
+        """
+        Get the total number of items in the dataset.
+
+        Returns:
+            Number of items.
+        """
         return len(self.image_list)
 
     def load_query_samples(self, sample_list):
+        """
+        Load specified samples into memory.
+
+        Args:
+            sample_list: List of sample indices to load.
+
+        Raises:
+            NotImplementedError: Subclasses must implement this method.
+        """
         raise NotImplementedError("Dataset:load_query_samples")
 
     def unload_query_samples(self, sample_list):
+        """
+        Unload specified samples from memory.
+
+        Args:
+            sample_list: List of sample indices to unload.
+
+        Raises:
+            NotImplementedError: Subclasses must implement this method.
+        """
         raise NotImplementedError("Dataset:unload_query_samples")
 
     def get_sample(self, id: int):
+        """
+        Get a single sample by ID.
+
+        Args:
+            id: Sample identifier.
+
+        Raises:
+            NotImplementedError: Subclasses must implement this method.
+        """
         raise NotImplementedError("Dataset:get_sample")
 
     def get_samples(self, id_list: List[int]) -> Samples:
-        # Collate multiple examples same for all classes
+        """
+        Get multiple samples and collate them into a batch.
+
+        Args:
+            id_list: List of sample identifiers.
+
+        Returns:
+            Collated Samples object containing the batch.
+        """
         list_samples = [self.get_sample(ix) for ix in id_list]
         return collate_fn(list_samples)
 
@@ -91,6 +185,18 @@ class Dataset:
 def kjt_batch_func(
     kjt_list: List[KeyedJaggedTensor],
 ) -> KeyedJaggedTensor:
+    """
+    Batch multiple KeyedJaggedTensors into a single tensor.
+
+    Uses FBGEMM operations for efficient batching and reordering of
+    jagged tensor data.
+
+    Args:
+        kjt_list: List of KeyedJaggedTensors to batch.
+
+    Returns:
+        Batched KeyedJaggedTensor with reordered indices and lengths.
+    """
     bs_list = [kjt.stride() for kjt in kjt_list]
     bs = sum(bs_list)
     batched_length = torch.cat([kjt.lengths() for kjt in kjt_list], dim=0)
@@ -122,6 +228,23 @@ def get_random_data(
     max_num_candidates: int,
     value_bound: int = 1000,
 ):
+    """
+    Generate random sample data for testing and debugging.
+
+    Creates synthetic user interaction history and candidate features
+    with random values.
+
+    Args:
+        contexual_features: List of contextual feature names.
+        hstu_uih_keys: List of UIH feature keys.
+        hstu_candidates_keys: List of candidate feature keys.
+        uih_max_seq_len: Maximum sequence length for UIH.
+        max_num_candidates: Maximum number of candidates.
+        value_bound: Upper bound for random values.
+
+    Returns:
+        Tuple of (uih_features_kjt, candidates_features_kjt).
+    """
     uih_non_seq_feature_keys = contexual_features
     uih_seq_feature_keys = [
         k for k in hstu_uih_keys if k not in uih_non_seq_feature_keys
@@ -167,6 +290,19 @@ def get_random_data(
 
 
 class DLRMv3RandomDataset(Dataset):
+    """
+    Dataset that generates random synthetic data for DLRMv3.
+
+    Useful for testing and benchmarking without real data dependencies.
+
+    Args:
+        hstu_config: HSTU model configuration.
+        num_aggregated_samples: Total number of samples to generate.
+        is_inference: Whether the dataset is used for inference mode.
+        *args: Additional positional arguments.
+        **kwargs: Additional keyword arguments.
+    """
+
     def __init__(
         self,
         hstu_config: DlrmHSTUConfig,
@@ -210,16 +346,42 @@ class DLRMv3RandomDataset(Dataset):
         self.items_in_memory = {}
 
     def get_sample(self, id: int) -> Tuple[KeyedJaggedTensor, KeyedJaggedTensor]:
+        """
+        Get a sample by ID from in-memory storage.
+
+        Args:
+            id: Sample identifier.
+
+        Returns:
+            Tuple of (uih_features_kjt, candidates_features_kjt).
+        """
         return self.items_in_memory[id]
 
     def get_item_count(self):
-        # get number of items in the dataset
+        """
+        Get the total number of samples in the dataset.
+
+        Returns:
+            Number of aggregated samples.
+        """
         return self.num_aggregated_samples
 
     def unload_query_samples(self, sample_list):
+        """
+        Clear all samples from memory.
+
+        Args:
+            sample_list: Ignored; clears all samples.
+        """
         self.items_in_memory = {}
 
     def load_query_samples(self, sample_list):
+        """
+        Generate and load random samples into memory.
+
+        Args:
+            sample_list: List of sample IDs to generate.
+        """
         max_num_candidates = (
             self._max_num_candidates_inference
             if self._is_inference

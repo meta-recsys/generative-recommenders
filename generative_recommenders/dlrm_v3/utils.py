@@ -56,6 +56,16 @@ logger = logging.getLogger("utils")
 def _on_trace_ready_fn(
     rank: Optional[int] = None,
 ) -> Callable[[torch.profiler.profile], None]:
+    """
+    Create a callback function for handling profiler trace output.
+
+    Args:
+        rank: Optional process rank for distributed training (included in filename).
+
+    Returns:
+        A callback function that exports profiler traces to Manifold storage.
+    """
+
     def handle_fn(p: torch.profiler.profile) -> None:
         bucket_name = "hammer_gpu_traces"
         pid = os.getpid()
@@ -78,6 +88,16 @@ def _on_trace_ready_fn(
 
 
 def profiler_or_nullcontext(enabled: bool, with_stack: bool):
+    """
+    Create a profiler context manager or null context based on enabled flag.
+
+    Args:
+        enabled: Whether to enable profiling.
+        with_stack: Whether to include stack traces in profile.
+
+    Returns:
+        Either a torch.profiler.profile context manager or nullcontext.
+    """
     return (
         profile(
             # pyre-fixme[16]: Module `profiler` has no attribute `ProfilerActivity`.
@@ -91,6 +111,17 @@ def profiler_or_nullcontext(enabled: bool, with_stack: bool):
 
 
 class Profiler:
+    """
+    Wrapper around PyTorch profiler with scheduled profiling.
+
+    Implements a wait-warmup-active schedule for controlled profiling that
+    avoids startup noise and captures representative performance data.
+
+    Args:
+        rank: Process rank for trace file naming.
+        active: Number of active profiling steps (default: 50).
+    """
+
     def __init__(self, rank, active: int = 50) -> None:
         self.rank = rank
         self._profiler: profiler.profile = torch.profiler.profile(
@@ -111,11 +142,27 @@ class Profiler:
         )
 
     def step(self) -> None:
+        """Advance the profiler to the next step."""
         self._profiler.step()
 
 
 @gin.configurable
 class MetricsLogger:
+    """
+    Logger for tracking and computing recommendation metrics.
+
+    Supports both classification metrics (NE, Accuracy, GAUC) and regression
+    metrics (MSE, MAE) based on multitask configuration.
+
+    Args:
+        multitask_configs: List of task configurations defining metric types.
+        batch_size: Batch size for metric computation.
+        window_size: Window size for running metric aggregation.
+        device: Device to place metric tensors on.
+        rank: Process rank for distributed training.
+        tensorboard_log_path: Optional path for TensorBoard logging.
+    """
+
     def __init__(
         self,
         multitask_configs: List[TaskConfig],
@@ -203,6 +250,12 @@ class MetricsLogger:
 
     @property
     def all_metrics(self) -> Dict[str, List[RecMetricComputation]]:
+        """
+        Get all metrics for train and eval modes.
+
+        Returns:
+            Dictionary mapping mode ('train'/'eval') to list of metric computations.
+        """
         return {
             "train": self.class_metrics["train"] + self.regression_metrics["train"],
             "eval": self.class_metrics["eval"] + self.regression_metrics["eval"],
@@ -216,6 +269,16 @@ class MetricsLogger:
         num_candidates: torch.Tensor,
         mode: str = "train",
     ) -> None:
+        """
+        Update metrics with new batch of predictions and labels.
+
+        Args:
+            predictions: Model prediction tensor.
+            weights: Sample weight tensor.
+            labels: Ground truth label tensor.
+            num_candidates: Number of candidates per sample (for GAUC).
+            mode: Either 'train' or 'eval'.
+        """
         for metric in self.all_metrics[mode]:
             if isinstance(metric, GAUCMetricComputation):
                 metric.update(
@@ -233,6 +296,15 @@ class MetricsLogger:
         self.global_step[mode] += 1
 
     def compute(self, mode: str = "train") -> Dict[str, float]:
+        """
+        Compute and return all metrics for the current window.
+
+        Args:
+            mode: Either 'train' or 'eval'.
+
+        Returns:
+            Dictionary mapping metric names to their computed values.
+        """
         all_computed_metrics = {}
 
         for metric in self.all_metrics[mode]:
@@ -253,6 +325,19 @@ class MetricsLogger:
         mode: str = "train",
         additional_logs: Optional[Dict[str, Dict[str, torch.Tensor]]] = None,
     ) -> Dict[str, float]:
+        """
+        Compute metrics and log to TensorBoard.
+
+        Args:
+            mode: Either 'train' or 'eval'.
+            additional_logs: Optional additional data to log.
+
+        Returns:
+            Dictionary mapping metric names to their computed values.
+
+        Raises:
+            AssertionError: If TensorBoard logger is not configured.
+        """
         assert self.tb_logger is not None
         all_computed_metrics = self.compute(mode)
         for k, v in all_computed_metrics.items():
@@ -273,6 +358,12 @@ class MetricsLogger:
         return all_computed_metrics
 
     def reset(self, mode: str = "train"):
+        """
+        Reset all metrics for a given mode.
+
+        Args:
+            mode: Either 'train' or 'eval'.
+        """
         for metric in self.all_metrics[mode]:
             metric.reset()
 
@@ -294,6 +385,19 @@ SUPPORTED_DATASETS = [
 
 @gin.configurable
 def get_dataset(name: str, new_path_prefix: str = ""):
+    """
+    Get dataset class and configuration by name.
+
+    Args:
+        name: Dataset identifier (must be in SUPPORTED_DATASETS).
+        new_path_prefix: Optional prefix to prepend to data paths.
+
+    Returns:
+        Tuple of (dataset_class, kwargs_dict) for dataset instantiation.
+
+    Raises:
+        AssertionError: If dataset name is not supported.
+    """
     assert name in SUPPORTED_DATASETS, f"dataset {name} not supported"
     if name == "debug":
         return DLRMv3RandomDataset, {}

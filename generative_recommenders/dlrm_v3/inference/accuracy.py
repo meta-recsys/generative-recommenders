@@ -42,6 +42,13 @@ def get_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """
+    Main function to calculate accuracy metrics from loadgen output.
+
+    Reads the mlperf_log_accuracy.json file, parses the results, and computes
+    accuracy metrics using the MetricsLogger. Each result entry contains
+    predictions, labels, and weights packed as float32 numpy arrays.
+    """
     args = get_args()
     logger.warning("Parsing loadgen accuracy log...")
     with open(args.path, "r") as f:

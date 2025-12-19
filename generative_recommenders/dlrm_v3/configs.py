@@ -13,6 +13,12 @@
 # limitations under the License.
 
 # pyre-strict
+"""
+Configuration module for DLRMv3 model.
+
+This module provides configuration functions for the HSTU model architecture and embedding table configurations.
+"""
+
 from typing import Dict
 
 from generative_recommenders.modules.dlrm_hstu import DlrmHSTUConfig
@@ -22,11 +28,25 @@ from generative_recommenders.modules.multitask_module import (
 )
 from torchrec.modules.embedding_configs import DataType, EmbeddingConfig
 
-HSTU_EMBEDDING_DIM = 256  # TODO: change to 512 for the final DLRMv3 model
+HSTU_EMBEDDING_DIM = 512  # final DLRMv3 model
 HASH_SIZE = 10_000_000
+HASH_SIZE_1B = 1_000_000_000
 
 
 def get_hstu_configs(dataset: str = "debug") -> DlrmHSTUConfig:
+    """
+    Create and return HSTU model configuration.
+
+    Builds a complete DlrmHSTUConfig with default hyperparameters for the HSTU
+    architecture including attention settings, embedding dimensions, dropout rates,
+    and feature name mappings.
+
+    Args:
+        dataset: Dataset identifier (currently unused, reserved for dataset-specific configs).
+
+    Returns:
+        DlrmHSTUConfig: Complete configuration object for the HSTU model.
+    """
     hstu_config = DlrmHSTUConfig(
         hstu_num_heads=4,
         hstu_attn_linear_dim=128,
@@ -359,6 +379,18 @@ def get_hstu_configs(dataset: str = "debug") -> DlrmHSTUConfig:
 
 
 def get_embedding_table_config(dataset: str = "debug") -> Dict[str, EmbeddingConfig]:
+    """
+    Create and return embedding table configurations.
+
+    Defines the embedding table configurations for item IDs, category IDs, and user IDs
+    with their respective dimensions and data types.
+
+    Args:
+        dataset: Dataset identifier (currently unused, reserved for dataset-specific configs).
+
+    Returns:
+        Dict mapping table names to their EmbeddingConfig objects.
+    """
     if "movielens" in dataset:
         assert dataset in [
             "movielens-1m",
@@ -414,7 +446,7 @@ def get_embedding_table_config(dataset: str = "debug") -> Dict[str, EmbeddingCon
             if dataset == "movielens-1m"
             else {
                 "movie_id": EmbeddingConfig(
-                    num_embeddings=1_000_000_000,
+                    num_embeddings=HASH_SIZE_1B,
                     embedding_dim=HSTU_EMBEDDING_DIM,
                     name="movie_id",
                     data_type=DataType.FP16,
@@ -432,7 +464,7 @@ def get_embedding_table_config(dataset: str = "debug") -> Dict[str, EmbeddingCon
     elif "streaming" in dataset:
         return {
             "item_id": EmbeddingConfig(
-                num_embeddings=1_000_000_000,
+                num_embeddings=HASH_SIZE_1B,
                 embedding_dim=HSTU_EMBEDDING_DIM,
                 name="item_id",
                 data_type=DataType.FP16,

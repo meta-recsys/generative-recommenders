@@ -1,4 +1,11 @@
 # pyre-strict
+"""
+Streaming synthetic data generator for DLRMv3.
+
+This module generates synthetic streaming recommendation data for benchmarking
+and testing purposes. It creates user-item interaction histories with timestamps,
+ratings, and category-based item distributions.
+"""
 
 import csv
 import logging
@@ -16,6 +23,28 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 class StreamingSyntheticDataGenerator:
+    """
+    Generator for streaming synthetic recommendation data.
+
+    Creates realistic user-item interaction data with temporal dynamics,
+    category preferences, and rating distributions for benchmarking
+    recommendation systems.
+
+    Args:
+        num_categories: Number of item categories.
+        categories_per_user: Number of categories each user is interested in.
+        num_users: Total number of users to generate.
+        num_items: Total number of items in the catalog.
+        num_timestamps: Number of time periods in the streaming data.
+        avg_samples_per_item: Average number of interactions per item.
+        train_ratio: Fraction of timestamps used for training.
+        user_sampling_ratio: Probability of sampling a user at each timestamp.
+        num_eval_candidates: Number of candidates for evaluation.
+        num_inference_candidates: Number of candidates for inference.
+        debug: If True, use deterministic ratings for debugging.
+        rank: Process rank for distributed generation.
+    """
+
     def __init__(
         self,
         num_categories: int,
@@ -75,7 +104,25 @@ class StreamingSyntheticDataGenerator:
         file_idx: int,
         ts_buffers: Dict[int, List[int]],
     ) -> Tuple[List[int], List[float], List[int], List[float], Dict[int, int]]:
-        # Buffer timestamp data in memory instead of writing immediately
+        """
+        Generate interaction data for a single user at one timestamp.
+
+        Args:
+            category_to_cnt: Running count of interactions per category.
+            categories: Categories this user is interested in.
+            t: Current timestamp index.
+            id: User ID.
+            output_folder: Output directory for files.
+            uih_seq_len: Length of user interaction history to generate.
+            eval: Whether this is for evaluation.
+            inference: Whether this is for inference.
+            file_idx: File index for output.
+            ts_buffers: Buffer for timestamp data.
+
+        Returns:
+            Tuple of (uih_item_ids, uih_ratings, candidate_ids, candidate_ratings,
+            updated_category_counts).
+        """
         if t >= 0 and (not eval):
             if t not in ts_buffers:
                 ts_buffers[t] = []
@@ -178,6 +225,12 @@ class StreamingSyntheticDataGenerator:
         )
 
     def gen_rand_seq_len(self) -> int:
+        """
+        Generate a random sequence length from a Gaussian distribution.
+
+        Returns:
+            Sequence length, guaranteed to be at least min_seq_len.
+        """
         seq_len = round(
             random.gauss(
                 self.avg_seq_len_per_timestamp, self.avg_seq_len_per_timestamp // 4
@@ -187,6 +240,15 @@ class StreamingSyntheticDataGenerator:
         return seq_len
 
     def get_timestamp_sample(self, t: int) -> int:
+        """
+        Determine if a user should be sampled at this timestamp.
+
+        Args:
+            t: Timestamp index. Base timestamp (-1) is always sampled.
+
+        Returns:
+            1 if the user should be sampled, 0 otherwise.
+        """
         if t == -1:
             sample = 1
         else:
@@ -204,6 +266,21 @@ class StreamingSyntheticDataGenerator:
         file_idx: int,
         ts_buffers: Dict[int, List[int]],
     ) -> List[str]:
+        """
+        Generate complete interaction history for one user.
+
+        Creates training, evaluation, and inference data for a single user
+        across all timestamps.
+
+        Args:
+            id: User ID.
+            output_folder: Output directory.
+            file_idx: File index for output.
+            ts_buffers: Buffer for timestamp metadata.
+
+        Returns:
+            List of CSV row values for this user's data.
+        """
         categories = random.sample(range(self.num_categories), self.categories_per_user)
         category_to_cnt = {c: 0 for c in categories}
         out_list: List[str] = []
@@ -318,6 +395,15 @@ class StreamingSyntheticDataGenerator:
     def write_dataset(
         self, output_folder: str, num_files: int, file_idx: int, seed: int
     ) -> None:
+        """
+        Write dataset for a single file partition.
+
+        Args:
+            output_folder: Output directory path.
+            num_files: Total number of files in the dataset.
+            file_idx: Index of this file partition.
+            seed: Random seed for reproducibility.
+        """
         t0 = time.time()
         num_users_per_file = self.num_users // num_files
         user_id: int = num_users_per_file * file_idx
@@ -369,6 +455,27 @@ def worker(
     user_sampling_ratio: float,
     output_folder: str,
 ) -> None:
+    """
+    Worker function for parallel data generation.
+
+    Each worker generates a subset of the dataset files.
+
+    Args:
+        rank: Worker rank.
+        world_size: Total number of workers.
+        num_files: Total files to generate.
+        num_users: Total users in dataset.
+        num_items: Total items in catalog.
+        num_categories: Number of item categories.
+        categories_per_user: Categories per user.
+        num_timestamps: Number of time periods.
+        avg_samples_per_item: Average interactions per item.
+        num_eval_candidates: Eval candidates count.
+        num_inference_candidates: Inference candidates count.
+        train_ratio: Training data fraction.
+        user_sampling_ratio: User sampling probability.
+        output_folder: Output directory.
+    """
     generator = StreamingSyntheticDataGenerator(
         num_categories=num_categories,
         categories_per_user=categories_per_user,
@@ -397,6 +504,17 @@ def worker(
 
 
 def write_offset(output_folder: str, num_files: int, num_users: int) -> None:
+    """
+    Write file byte offsets for random access to user data.
+
+    Creates an offset.csv file containing byte positions for each user
+    within their respective data files.
+
+    Args:
+        output_folder: Directory containing data files.
+        num_files: Number of data files.
+        num_users: Total number of users.
+    """
     with open(output_folder + "offset.csv", "a") as output_file:
         writer = csv.writer(output_file)
         for i in range(num_files):
@@ -417,6 +535,17 @@ def write_offset(output_folder: str, num_files: int, num_users: int) -> None:
 
 
 def write_ts_metadata(output_folder: str, total_ts: int, num_files: int) -> None:
+    """
+    Write timestamp metadata for streaming simulation.
+
+    Creates files tracking which users are active at each timestamp
+    and cumulative counts for efficient streaming access.
+
+    Args:
+        output_folder: Output directory path.
+        total_ts: Total number of timestamps.
+        num_files: Number of data files.
+    """
     with open(output_folder + "requests_per_ts.csv", "w") as file_requests:
         with open(output_folder + "users_cumsum_per_ts.csv", "w") as file_cumsum:
             requests_writer = csv.writer(file_requests)
@@ -456,6 +585,14 @@ def write_ts_metadata(output_folder: str, total_ts: int, num_files: int) -> None
 
 
 def copy_sub_dataset(src_folder: str) -> None:
+    """
+    Copy a subset of dataset files for quick testing.
+
+    Creates a sampled_data subdirectory with essential files.
+
+    Args:
+        src_folder: Source folder containing full dataset.
+    """
     dst_folder = src_folder + "sampled_data/"
     files_to_copy = [
         "0.csv",
@@ -473,6 +610,12 @@ def copy_sub_dataset(src_folder: str) -> None:
 
 
 def main() -> None:
+    """
+    Main entry point for synthetic data generation.
+
+    Configures and launches parallel workers to generate a complete
+    streaming recommendation dataset.
+    """
     processes = []
     num_files = 100
     num_users = 5_000_000
