@@ -13,12 +13,18 @@
 # limitations under the License.
 
 # pyre-strict
+"""
+Data producer module for DLRMv3 inference.
+
+This module provides classes for producing and managing query data during inference,
+supporting both single-threaded and multi-threaded data production modes.
+"""
 
 import logging
 import threading
 import time
 from queue import Queue
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 from generative_recommenders.dlrm_v3.datasets.dataset import Dataset, Samples
@@ -28,7 +34,16 @@ logger: logging.Logger = logging.getLogger("data_producer")
 
 
 class QueryItem:
-    """An item that we queue for processing by the thread pool."""
+    """
+    Container for a query item to be processed by the inference thread pool.
+
+    Attributes:
+        query_ids: List of unique identifiers for the queries in this batch.
+        samples: The sample data containing features for the queries.
+        start: Time when the query was first received.
+        dt_queue: Time spent in the queue before processing.
+        dt_batching: Time spent on batching the data.
+    """
 
     def __init__(
         self,
@@ -46,6 +61,17 @@ class QueryItem:
 
 
 class SingleThreadDataProducer:
+    """
+    Single-threaded data producer for synchronous query processing.
+
+    This producer processes queries on the main thread without any parallelism,
+    suitable for debugging or low-throughput scenarios.
+
+    Args:
+        ds: The dataset to fetch samples from.
+        run_one_item: Callback function to process a single QueryItem.
+    """
+
     def __init__(self, ds: Dataset, run_one_item) -> None:  # pyre-ignore [2]
         self.ds = ds
         self.run_one_item = run_one_item  # pyre-ignore [4]
@@ -53,24 +79,60 @@ class SingleThreadDataProducer:
     def enqueue(
         self, query_ids: List[int], content_ids: List[int], t0: float, dt_queue: float
     ) -> None:
+        """
+        Enqueue queries for immediate synchronous processing.
+
+        Args:
+            query_ids: List of unique query identifiers.
+            content_ids: List of content/sample identifiers to fetch.
+            t0: Timestamp when the query batch was created.
+            dt_queue: Time spent waiting in the queue.
+        """
         with torch.profiler.record_function("data batching"):
             t0_batching: float = time.time()
-            samples = self.ds.get_samples(content_ids)
+            samples: Union[Samples, List[Samples]] = self.ds.get_samples(content_ids)
             dt_batching: float = time.time() - t0_batching
-            query = QueryItem(
-                query_ids=query_ids,
-                samples=samples,
-                start=t0,
-                dt_queue=dt_queue,
-                dt_batching=dt_batching,
-            )
-            self.run_one_item(query)
+            if isinstance(samples, Samples):
+                query = QueryItem(
+                    query_ids=query_ids,
+                    samples=samples,
+                    start=t0,
+                    dt_queue=dt_queue,
+                    dt_batching=dt_batching,
+                )
+                self.run_one_item(query)
+            else:
+                start_idx = 0
+                for sample in samples:
+                    batch_size: int = sample.batch_size()
+                    query = QueryItem(
+                        query_ids=query_ids[start_idx : start_idx + batch_size],
+                        samples=sample,
+                        start=t0,
+                        dt_queue=dt_queue,
+                        dt_batching=dt_batching,
+                    )
+                    start_idx += batch_size
+                    self.run_one_item(query)
 
     def finish(self) -> None:
+        """Finalize the producer. No-op for single-threaded mode."""
         pass
 
 
 class MultiThreadDataProducer:
+    """
+    Multi-threaded data producer for parallel query processing.
+
+    Uses a thread pool to fetch and batch data in parallel with model inference,
+    improving throughput for high-load scenarios.
+
+    Args:
+        ds: The dataset to fetch samples from.
+        threads: Number of worker threads to use.
+        run_one_item: Callback function to process a single QueryItem.
+    """
+
     def __init__(
         self,
         ds: Dataset,
@@ -94,6 +156,14 @@ class MultiThreadDataProducer:
     def handle_tasks(
         self, tasks_queue: Queue[Optional[Tuple[List[int], List[int], float, float]]]
     ) -> None:
+        """
+        Worker thread main loop to process tasks from the queue.
+
+        Each worker maintains its own CUDA stream for parallel execution.
+
+        Args:
+            tasks_queue: Queue containing task tuples or None for termination.
+        """
         stream = torch.cuda.Stream()
         while True:
             query_and_content_ids = tasks_queue.get()
@@ -102,26 +172,55 @@ class MultiThreadDataProducer:
                 break
             query_ids, content_ids, t0, dt_queue = query_and_content_ids
             t0_batching: float = time.time()
-            samples = self.ds.get_samples(content_ids)
+            samples: Union[Samples, List[Samples]] = self.ds.get_samples(content_ids)
             dt_batching: float = time.time() - t0_batching
-            qitem = QueryItem(
-                query_ids=query_ids,
-                samples=samples,
-                start=t0,
-                dt_queue=dt_queue,
-                dt_batching=dt_batching,
-            )
-            with torch.inference_mode(), torch.cuda.stream(stream):
-                self.run_one_item(qitem)
+            if isinstance(samples, Samples):
+                qitem = QueryItem(
+                    query_ids=query_ids,
+                    samples=samples,
+                    start=t0,
+                    dt_queue=dt_queue,
+                    dt_batching=dt_batching,
+                )
+                with torch.inference_mode(), torch.cuda.stream(stream):
+                    self.run_one_item(qitem)
+            else:
+                start_idx = 0
+                for sample in samples:
+                    batch_size: int = sample.batch_size()
+                    qitem = QueryItem(
+                        query_ids=query_ids[start_idx : start_idx + batch_size],
+                        samples=sample,
+                        start=t0,
+                        dt_queue=dt_queue,
+                        dt_batching=dt_batching,
+                    )
+                    start_idx += batch_size
+                    with torch.inference_mode(), torch.cuda.stream(stream):
+                        self.run_one_item(qitem)
             tasks_queue.task_done()
 
     def enqueue(
         self, query_ids: List[int], content_ids: List[int], t0: float, dt_queue: float
     ) -> None:
+        """
+        Enqueue queries for asynchronous processing by worker threads.
+
+        Args:
+            query_ids: List of unique query identifiers.
+            content_ids: List of content/sample identifiers to fetch.
+            t0: Timestamp when the query batch was created.
+            dt_queue: Time spent waiting in the queue.
+        """
         with torch.profiler.record_function("data batching"):
             self.tasks.put((query_ids, content_ids, t0, dt_queue))
 
     def finish(self) -> None:
+        """
+        Signal all worker threads to terminate and wait for completion.
+
+        Sends None to each worker to trigger graceful shutdown.
+        """
         for _ in self.workers:
             self.tasks.put(None)
         for worker in self.workers:

@@ -1,20 +1,14 @@
 # run.model_path = "/home/linjianma/ckpts/kuairand_1k/2025_01_12_17_56_43/"
 run.scenario_name = "Server"
 run.batchsize = 16
-run.out_dir = ""
 run.output_trace = False
 run.data_producer_threads = 4
 run.compute_eval = False
 run.find_peak_performance = False
 run.train_split_percentage = 0.75
-run.dev_mode = False
 
 # below will override mlperf rules compliant settings - don't use for official submission
-run.duration = None
 run.target_qps = 2000
-run.max_latency = None
 run.num_queries = 10000
-run.samples_per_query_multistream = 64
-run.max_num_samples = 2048
 run.numpy_rand_seed = 123
-run.new_path_prefix = "/home/linjianma"
+run.dataset_path_prefix = "/home/linjianma"

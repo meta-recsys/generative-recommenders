@@ -13,6 +13,14 @@
 # limitations under the License.
 
 # pyre-strict
+"""
+Synthetic streaming dataset for DLRMv3 inference benchmarking.
+
+This module provides a streaming dataset implementation that loads user interaction
+data from pre-generated CSV files with temporal (timestamp) organization, suitable
+for simulating real-time recommendation scenarios.
+"""
+
 import csv
 import logging
 import sys
@@ -38,6 +46,26 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 class DLRMv3SyntheticStreamingDataset(DLRMv3RandomDataset):
+    """
+    Streaming dataset that loads pre-generated synthetic recommendation data.
+
+    Supports timestamp-based data organization for simulating streaming scenarios
+    where user interaction histories evolve over time.
+
+    Args:
+        hstu_config: HSTU model configuration.
+        ratings_file_prefix: Path prefix for rating data files.
+        is_inference: Whether dataset is used for inference.
+        train_ts: Number of timestamps used for training.
+        total_ts: Total number of timestamps in the data.
+        num_files: Number of data files (for parallelization).
+        num_users: Total number of users in the dataset.
+        num_items: Total number of items in the catalog.
+        num_categories: Number of item categories.
+        *args: Additional positional arguments.
+        **kwargs: Additional keyword arguments.
+    """
+
     def __init__(
         self,
         hstu_config: DlrmHSTUConfig,
@@ -124,13 +152,43 @@ class DLRMv3SyntheticStreamingDataset(DLRMv3RandomDataset):
     def get_sample_with_ts(
         self, id: int, ts: int
     ) -> Tuple[KeyedJaggedTensor, KeyedJaggedTensor]:
+        """
+        Get a sample for a specific timestamp.
+
+        Args:
+            id: Sample identifier.
+            ts: Timestamp index.
+
+        Returns:
+            Tuple of (uih_features_kjt, candidates_features_kjt).
+        """
         return self.items_in_memory[ts][id]
 
     def get_samples_with_ts(self, id_list: List[int], ts: int) -> Samples:
+        """
+        Get and collate multiple samples for a specific timestamp.
+
+        Args:
+            id_list: List of sample identifiers.
+            ts: Timestamp index.
+
+        Returns:
+            Collated Samples object.
+        """
         list_samples = [self.get_sample_with_ts(ix, ts) for ix in id_list]
         return collate_fn(list_samples)
 
     def _process_line(self, line: str, user_id: int) -> pd.Series:
+        """
+        Parse a CSV line into a pandas Series with user interaction data.
+
+        Args:
+            line: CSV line containing user data.
+            user_id: User identifier.
+
+        Returns:
+            pd.Series with parsed user interaction history and candidates.
+        """
         reader = csv.reader([line])
         parsed_line = next(reader)
         # total ts + one more eval ts + one base ts so that uih won't be zero
@@ -182,6 +240,15 @@ class DLRMv3SyntheticStreamingDataset(DLRMv3RandomDataset):
         )
 
     def iloc(self, idx: int) -> pd.Series:
+        """
+        Get user data by request index using file offsets for efficient access.
+
+        Args:
+            idx: Request index within the current timestamp.
+
+        Returns:
+            pd.Series with parsed user interaction data.
+        """
         cumsum: List[int] = self.ts_to_users_cumsum[self.ts]
         assert cumsum != []
         assert idx < cumsum[-1]
@@ -203,6 +270,12 @@ class DLRMv3SyntheticStreamingDataset(DLRMv3RandomDataset):
         return [1] * size
 
     def set_ts(self, ts: int) -> None:
+        """
+        Set the current timestamp and load associated request data.
+
+        Args:
+            ts: Timestamp index to set.
+        """
         logger.warning(f"Streaming dataset ts set to {ts}")
         if ts == self.ts:
             return
@@ -226,6 +299,19 @@ class DLRMv3SyntheticStreamingDataset(DLRMv3RandomDataset):
     def load_item(
         self, data: pd.Series, max_num_candidates: int
     ) -> Tuple[KeyedJaggedTensor, KeyedJaggedTensor]:
+        """
+        Load and process a single user's data into KeyedJaggedTensors.
+
+        Converts parsed user data into feature tensors suitable for model input,
+        including truncation to maximum sequence lengths.
+
+        Args:
+            data: pd.Series with user interaction history and candidates.
+            max_num_candidates: Maximum number of candidates to include.
+
+        Returns:
+            Tuple of (uih_features_kjt, candidates_features_kjt).
+        """
         ids_uih = json_loads(data.uih_item_ids)
         ids_candidates = json_loads(data.candidate_item_ids)
         ratings_uih = json_loads(data.uih_ratings)
