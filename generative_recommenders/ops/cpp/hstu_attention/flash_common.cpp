@@ -606,6 +606,13 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd(
         {total_seq_len_q, num_heads, v_head_size}, opts.dtype(out_type));
   }
   std::optional<at::Tensor> softmax_lse = std::nullopt;
+
+  // Early return for empty sequences to avoid TMA descriptor
+  // initialization failure
+  if (total_seq_len_kv == 0 || total_seq_len_q == 0) {
+    return {out, std::nullopt};
+  }
+
   if (num_softmax_heads > 0) {
     if (!is_jagged) {
       softmax_lse = torch::empty(
@@ -1072,6 +1079,12 @@ std::vector<at::Tensor> hstu_mha_bwd(
     softmax_lse_log2 = torch::empty(
         {num_softmax_heads, total_seq_len_q_padded_rounded},
         opts.dtype(at::kFloat));
+  }
+
+  // Early return for empty sequences; analog to TMA prevention guard
+  // in hstu_mha_fwd
+  if (total_seq_len_kv == 0 || total_seq_len_q == 0) {
+    return {dq, dk, dv};
   }
 
   hstu::Flash_bwd_params params;
