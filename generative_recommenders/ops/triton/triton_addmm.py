@@ -84,6 +84,7 @@ def _check_tma_alignment(
 def _prune_configs_for_pair_cta(configs, named_args, **kwargs):  # noqa
     M = named_args.get("M", 0)
     N = named_args.get("N", 0)
+    K = named_args.get("K", 0)
 
     pruned = []
     for c in configs:
@@ -94,12 +95,12 @@ def _prune_configs_for_pair_cta(configs, named_args, **kwargs):  # noqa
         if BLOCK_N < 64:
             continue
 
-        # PAIR_CTA requires even number of M tiles and even total tiles
+        # PAIR_CTA requires even total tiles
         num_tiles_m = math.ceil(M / BLOCK_M) if BLOCK_M > 0 else 0
         num_tiles_n = math.ceil(N / BLOCK_N) if BLOCK_N > 0 else 0
         total_tiles = num_tiles_m * num_tiles_n
 
-        pair_cta_compatible = (num_tiles_m % 2 == 0) and (total_tiles % 2 == 0)
+        pair_cta_compatible = (total_tiles % 2 == 0) and (num_tiles_n >= 2) and (N == K)
 
         c.kwargs["PAIR_CTA"] = pair_cta_compatible
         # Set ctas_per_cga for CUDA-native cluster launch semantics (TLX way)
