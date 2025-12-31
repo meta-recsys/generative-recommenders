@@ -1864,7 +1864,7 @@ def _helion_ln_mul_dropout_fwd(
     stride_x: tl.constexpr,
     stride_u: tl.constexpr,
     stride_y: tl.constexpr,
-    _RDIM_SIZE_1: tl.constexpr,
+    BLOCK_D: tl.constexpr,
     CONCAT_UX: tl.constexpr,
     SILU_U: tl.constexpr,
     TRAINING: tl.constexpr,
@@ -1873,7 +1873,7 @@ def _helion_ln_mul_dropout_fwd(
     x += row.to(tl.int64) * stride_x
     u += row.to(tl.int64) * stride_u
     y += row.to(tl.int64) * stride_y
-    cols = tl.arange(0, _RDIM_SIZE_1)
+    cols = tl.arange(0, BLOCK_D)
     mask = cols < D
 
     # Load input
@@ -1919,7 +1919,7 @@ def _helion_ln_mul_dropout_fwd(
 
         if CONCAT_UX:
             # Generate dropout masks
-            random_offsets = 3 * row * _RDIM_SIZE_1 + cols
+            random_offsets = 3 * row * BLOCK_D + cols
             random_u, random_x, random_y = rand3x(seed, random_offsets)
 
             u_keep = random_u > dropout_ratio
@@ -1932,7 +1932,7 @@ def _helion_ln_mul_dropout_fwd(
             y_output = tl.where(y_keep, y_out * dropout_scale, 0.0)
         else:
             # Generate dropout mask for y
-            random_offsets = row * _RDIM_SIZE_1 + cols
+            random_offsets = row * BLOCK_D + cols
             random_y = tl.rand(seed, random_offsets)
             y_keep = random_y > dropout_ratio
 
@@ -2008,6 +2008,387 @@ def helion_layer_norm_mul_dropout_fwd(
     )
 
     return y, mean, rstd, BLOCK_D, 1, seed  # pyre-ignore [7]
+
+
+@triton.jit
+def _helion_ln_mul_dropout_bwd_dx_du(
+    DX,
+    DU,
+    DY,
+    DW,
+    DB,
+    X,
+    U,
+    Y,
+    W,
+    B,
+    Mean,
+    Rstd,
+    stride_dx,
+    stride_du,
+    stride_dy,
+    stride_x,
+    stride_u,
+    stride_y,
+    D: tl.constexpr,
+    eps,
+    seed,
+    dropout_ratio,
+    N,
+    SILU_U: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    TRAINING: tl.constexpr,
+    CONCAT_UX: tl.constexpr,
+    COMPUTE_Y: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    tile_num = tl.num_programs(0)
+    rows_per_tile = N // tile_num
+    if pid < N % tile_num:
+        rows_per_tile += 1
+
+    if rows_per_tile == 0:
+        return
+
+    cols = tl.arange(0, BLOCK_D)
+    mask = cols < D
+
+    # precompute inverse of D
+    inv_D: tl.constexpr = 1.0 / D
+
+    row = pid
+    X += row.to(tl.int64) * stride_x
+    U += row.to(tl.int64) * stride_u
+    if COMPUTE_Y:
+        Y += row.to(tl.int64) * stride_y
+    DY += row.to(tl.int64) * stride_dy
+    DX += row.to(tl.int64) * stride_dx
+    DU += row.to(tl.int64) * stride_du
+    DW = DW + pid * D + cols
+    DB = DB + pid * D + cols
+
+    partial_dw = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    partial_db = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    w = tl.load(W + cols, mask=mask).to(tl.float32)
+    b = tl.load(B + cols, mask=mask).to(tl.float32)
+
+    for _idx in range(0, rows_per_tile):
+        x = tl.load(X + cols, mask=mask, other=0).to(tl.float32)
+        if CONCAT_UX:
+            du = tl.load(DY + cols, mask=mask, other=0).to(tl.float32)
+            dx = tl.load(DY + D + cols, mask=mask, other=0).to(tl.float32)
+            dy = tl.load(DY + 2 * D + cols, mask=mask, other=0).to(tl.float32)
+        else:
+            du = tl.zeros([BLOCK_D], dtype=tl.float32)
+            dx = tl.zeros([BLOCK_D], dtype=tl.float32)
+            dy = tl.load(DY + cols, mask=mask, other=0).to(tl.float32)
+
+        if TRAINING:
+            # pyre-fixme[16]
+            dropout_scale = fast_dividef(1.0, 1.0 - dropout_ratio)
+            if CONCAT_UX:
+                random_offsets = 3 * row * BLOCK_D + cols
+                # apply dropout on du
+                random_du, random_dx, random_dy = rand3x(seed, random_offsets)
+                du_keep = random_du > dropout_ratio
+                du = tl.where(du_keep, du * dropout_scale, 0.0)
+                # apply dropout on dx
+                dx_keep = random_dx > dropout_ratio
+                dx = tl.where(dx_keep, dx * dropout_scale, 0.0)
+                # apply dropout on dy
+                dy_keep = random_dy > dropout_ratio
+                dy = tl.where(dy_keep, dy * dropout_scale, 0.0)
+            else:
+                random_offsets = row * BLOCK_D + cols
+                random = tl.rand(seed, random_offsets)
+                dy_keep = random > dropout_ratio
+                dy = tl.where(dy_keep, dy * dropout_scale, 0.0)
+
+        mean = tl.load(Mean + row)
+        rstd = tl.load(Rstd + row)
+
+        # Compute dx
+        xhat = (x - mean) * rstd
+        u = tl.load(U + cols, mask=mask, other=0).to(tl.float32)
+        ln = xhat * w + b
+        du += dy * ln
+
+        if SILU_U:
+            sig_u = tl.sigmoid(u)
+            silu_u = u * sig_u
+            du = du * sig_u * (1 + u - silu_u)
+            u = silu_u
+
+        tl.store(DU + cols, du.to(DU.dtype.element_ty), mask=mask)
+        dy = dy * u
+        wdy = w * dy
+
+        if COMPUTE_Y:
+            y = ln * u
+            if TRAINING:
+                # pyre-fixme[16]
+                dropout_scale_y = fast_dividef(1.0, 1.0 - dropout_ratio)
+                if CONCAT_UX:
+                    u = tl.where(du_keep, u * dropout_scale_y, 0.0)  # pyre-ignore [61]
+                    x = tl.where(dx_keep, x * dropout_scale_y, 0.0)  # pyre-ignore [61]
+                    y = tl.where(dy_keep, y * dropout_scale_y, 0.0)  # pyre-ignore [61]
+                else:
+                    y = tl.where(dy_keep, y * dropout_scale_y, 0.0)  # pyre-ignore [61]
+            if CONCAT_UX:
+                tl.store(Y + cols, u.to(Y.dtype.element_ty), mask=mask)
+                tl.store(Y + D + cols, x.to(Y.dtype.element_ty), mask=mask)
+                tl.store(Y + 2 * D + cols, y.to(Y.dtype.element_ty), mask=mask)
+            else:
+                tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
+            Y += tile_num.to(tl.int64) * stride_y
+
+        xhat = tl.where(mask, xhat, 0.0)
+        wdy = tl.where(mask, wdy, 0.0)
+        # multiply by inv_D
+        c1 = tl.sum(xhat * wdy, axis=0) * inv_D
+        c2 = tl.sum(wdy, axis=0) * inv_D
+        dx += (wdy - (xhat * c1 + c2)) * rstd
+
+        # Write dx
+        tl.store(DX + cols, dx, mask=mask)
+
+        # Accumulate partial sums for dw/db
+        partial_dw += dy * xhat
+        partial_db += dy
+
+        X += tile_num.to(tl.int64) * stride_x
+        U += tile_num.to(tl.int64) * stride_u
+        DY += tile_num.to(tl.int64) * stride_dy
+        DX += tile_num.to(tl.int64) * stride_dx
+        DU += tile_num.to(tl.int64) * stride_du
+        row += tile_num
+
+    tl.store(DW, partial_dw, mask=mask)
+    tl.store(DB, partial_db, mask=mask)
+
+
+@triton_autotune(
+    configs=_get_bwd_dwdb_configs(),
+    key=["D"],
+)
+@triton.jit
+def _helion_ln_mul_dropout_bwd_dwdb(
+    DW,
+    DB,
+    FINAL_DW,
+    FINAL_DB,
+    N,
+    D,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    cols = pid * BLOCK_D + tl.arange(0, BLOCK_D)
+    dw = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
+    db = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
+
+    for i in range(0, N, BLOCK_N):
+        rows = i + tl.arange(0, BLOCK_N)
+        # pyre-fixme[16]: `int` has no attribute `__getitem__`.
+        off_mask = (rows[:, None] < N) & (cols[None, :] < D)
+        offs = rows[:, None] * D + cols[None, :]
+        dw += tl.load(DW + offs, mask=off_mask, other=0.0)
+        db += tl.load(DB + offs, mask=off_mask, other=0.0)
+
+    sum_dw = tl.sum(dw, axis=0)
+    sum_db = tl.sum(db, axis=0)
+    tl.store(FINAL_DW + cols, sum_dw.to(FINAL_DW.dtype.element_ty), mask=cols < D)
+    tl.store(FINAL_DB + cols, sum_db.to(FINAL_DB.dtype.element_ty), mask=cols < D)
+
+
+def helion_layer_norm_mul_dropout_bwd(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    u: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    BLOCK_D: int,
+    num_warps: int,
+    eps: float,
+    training: bool,
+    dropout_ratio: float,
+    seed: Optional[int] = None,
+    silu_u: bool = False,
+    concat_ux: bool = False,
+    compute_y: bool = False,
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]
+]:
+    y = None
+    N, D = x.shape
+    if compute_y:
+        if concat_ux:
+            y = torch.empty((N, 3 * D), dtype=x.dtype, device=x.device)
+        else:
+            y = torch.empty_like(x)
+    if N == 0:
+        return (
+            torch.zeros_like(x),
+            torch.zeros_like(u),
+            torch.zeros((D,), dtype=weight.dtype, device=x.device),
+            torch.zeros((D,), dtype=weight.dtype, device=x.device),
+            y,
+        )
+    dx = torch.empty_like(x)
+    du = torch.empty_like(u)
+    sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+    tile_num = max(1, min(sms * 64, N // 4))
+    _dweight = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
+    _dbias = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
+    dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
+    dbias = torch.empty((D,), dtype=weight.dtype, device=x.device)
+
+    # pyre-ignore[28]
+    _helion_ln_mul_dropout_bwd_dx_du[(tile_num,)](
+        dx,
+        du,
+        dy,
+        _dweight,
+        _dbias,
+        x,
+        u,
+        y,
+        weight,
+        bias,
+        mean,
+        rstd,
+        dx.stride(0),
+        du.stride(0),
+        dy.stride(0),
+        x.stride(0),
+        u.stride(0),
+        y.stride(0) if compute_y else 0,  # pyre-ignore [16]
+        D,
+        eps,
+        seed,
+        dropout_ratio,
+        N=N,
+        SILU_U=silu_u,
+        BLOCK_D=BLOCK_D,
+        TRAINING=training,
+        CONCAT_UX=concat_ux,
+        COMPUTE_Y=compute_y,
+        num_warps=num_warps,
+    )
+
+    blocks = triton.next_power_of_2(sms * 4)
+    BLOCK_D_DWDB = triton.next_power_of_2(triton.cdiv(D, blocks))
+    BLOCK_D_DWDB = min(max(BLOCK_D_DWDB, 4), 128)
+    _helion_ln_mul_dropout_bwd_dwdb[(triton.cdiv(D, BLOCK_D_DWDB),)](
+        _dweight,
+        _dbias,
+        dweight,
+        dbias,
+        tile_num,
+        D,
+        BLOCK_D=BLOCK_D_DWDB,
+    )
+    return dx, du, dweight, dbias, y
+
+
+class HelionLayerNormMulDropoutFunction(torch.autograd.Function):
+    @staticmethod
+    # pyre-ignore[14]
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        u: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+        eps: float,
+        dropout_ratio: float,
+        training: bool,
+        silu_u: bool = False,
+        concat_ux: bool = False,
+        seed: Optional[int] = None,
+    ) -> torch.Tensor:
+        if dropout_ratio == 0.0:
+            # skip dropout computation if dropout ratio is 0
+            training = False
+        y, mean, rstd, BLOCK_D, num_warps, seed = helion_layer_norm_mul_dropout_fwd(
+            x=x,
+            u=u,
+            weight=weight,
+            bias=bias,
+            eps=eps,
+            dropout_ratio=dropout_ratio,
+            training=training,
+            silu_u=silu_u,
+            concat_ux=concat_ux,
+            seed=seed,
+        )
+        ctx.save_for_backward(x, u, weight, bias, mean, rstd)
+        ctx.BLOCK_D = BLOCK_D
+        ctx.num_warps = num_warps
+        ctx.eps = eps
+        ctx.seed = seed
+        ctx.training = training
+        ctx.silu_u = silu_u
+        ctx.concat_ux = concat_ux
+        ctx.dropout_ratio = dropout_ratio
+        return y
+
+    @staticmethod
+    # pyre-ignore[14]
+    def backward(
+        ctx, dy: torch.Tensor
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ]:
+        x, u, weight, bias, mean, rstd = ctx.saved_tensors
+        dx, du, dweight, dbias, _ = helion_layer_norm_mul_dropout_bwd(
+            dy=dy,
+            x=x,
+            u=u,
+            weight=weight,
+            bias=bias,
+            mean=mean,
+            rstd=rstd,
+            BLOCK_D=ctx.BLOCK_D,
+            num_warps=ctx.num_warps,
+            eps=ctx.eps,
+            training=ctx.training,
+            dropout_ratio=ctx.dropout_ratio,
+            seed=ctx.seed,
+            silu_u=ctx.silu_u,
+            concat_ux=ctx.concat_ux,
+            compute_y=False,
+        )
+        return dx, du, dweight, dbias, None, None, None, None, None, None
+
+
+@torch.fx.wrap
+def helion_norm_mul_dropout(
+    x: torch.Tensor,
+    u: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+    dropout_ratio: float,
+    training: bool,
+    silu_u: bool = False,
+    concat_ux: bool = False,
+    seed: Optional[int] = None,
+) -> torch.Tensor:
+    return HelionLayerNormMulDropoutFunction.apply(
+        x, u, weight, bias, eps, dropout_ratio, training, silu_u, concat_ux, seed
+    )
 
 
 @torch.fx.wrap
