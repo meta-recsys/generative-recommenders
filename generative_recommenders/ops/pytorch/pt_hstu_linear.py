@@ -29,17 +29,20 @@ def pytorch_norm_mul_dropout(
     dropout_ratio: float,
     training: bool,
     silu_u: bool = False,
-    concat_ux: bool = False,
+    concat_u: bool = False,
+    concat_x: bool = False,
+    mul_u_activation_type: str = "none",
     group_norm: bool = False,
     num_heads: int = 1,
     linear_dim: int = -1,
 ) -> torch.Tensor:
     dtype = x.dtype
-    if silu_u:
-        u = F.silu(u)
     x = x.to(torch.float32)
     u = u.to(torch.float32)
     if group_norm:
+        if silu_u:
+            u = F.silu(u)
+            u = u.to(torch.float32)
         y = u * F.group_norm(
             x.view(-1, num_heads, linear_dim),
             num_groups=num_heads,
@@ -47,16 +50,30 @@ def pytorch_norm_mul_dropout(
             bias=bias.to(torch.float32),
             eps=eps,
         ).view(-1, num_heads * linear_dim)
+        if concat_u and concat_x:
+            y = torch.cat([u, x, y], dim=1)
     else:
-        y = u * F.layer_norm(
+        mul_u = u
+        if mul_u_activation_type == "sigmoid":
+            mul_u = torch.sigmoid(u)
+        elif mul_u_activation_type == "silu":
+            mul_u = F.silu(u)
+        y = mul_u * F.layer_norm(
             x,
             normalized_shape=(x.shape[-1],),
             weight=weight.to(torch.float32),
             bias=bias.to(torch.float32),
             eps=eps,
         )
-    if concat_ux:
-        y = torch.cat([u, x, y], dim=1)
+        if concat_u:
+            if silu_u == True:
+                u = F.silu(u)
+            if concat_x:
+                y = torch.cat([u, x, y], dim=1)
+            else:
+                y = torch.cat([u, y], dim=1)
+        elif concat_x:
+            y = torch.cat([x, y], dim=1)
     y = F.dropout(
         y,
         p=dropout_ratio,
@@ -76,7 +93,9 @@ def pytorch_hstu_compute_output(
     dropout_ratio: float,
     training: bool,
     silu_u: bool = False,
-    concat_ux: bool = False,
+    concat_u: bool = False,
+    concat_x: bool = False,
+    mul_u_activation_type: str = "none",
     group_norm: bool = False,
     num_heads: int = 1,
     linear_dim: int = -1,
@@ -91,7 +110,9 @@ def pytorch_hstu_compute_output(
         dropout_ratio=dropout_ratio,
         training=training,
         silu_u=silu_u,
-        concat_ux=concat_ux,
+        concat_u=concat_u,
+        concat_x=concat_x,
+        mul_u_activation_type=mul_u_activation_type,
         group_norm=group_norm,
         num_heads=num_heads,
         linear_dim=linear_dim,
