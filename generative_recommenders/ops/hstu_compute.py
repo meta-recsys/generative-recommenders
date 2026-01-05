@@ -101,7 +101,8 @@ def hstu_compute_output(
     linear_dim: int,
     dropout_ratio: float,
     training: bool,
-    concat_ux: bool,
+    concat_u: bool,
+    concat_x: bool,
     group_norm: bool,
     recompute_y_in_backward: bool,
     kernel: HammerKernel = HammerKernel.PYTORCH,
@@ -117,7 +118,8 @@ def hstu_compute_output(
             eps=norm_eps,
             dropout_ratio=dropout_ratio,
             training=training,
-            concat_ux=concat_ux,
+            concat_u=concat_u,
+            concat_x=concat_x,
             group_norm=group_norm,
             num_heads=num_heads,
             linear_dim=linear_dim,
@@ -134,7 +136,7 @@ def hstu_compute_output(
                 eps=norm_eps,
                 dropout_ratio=dropout_ratio,
                 training=training,
-                concat_ux=concat_ux,
+                concat_ux=concat_u and concat_x,
                 num_heads=num_heads,
                 linear_dim=linear_dim,
             )
@@ -147,7 +149,8 @@ def hstu_compute_output(
                 eps=norm_eps,
                 dropout_ratio=dropout_ratio,
                 training=training,
-                concat_ux=concat_ux,
+                concat_u=concat_u,
+                concat_x=concat_x,
             )
         return triton_cc_addmm(x, y, output_weight)
     else:
@@ -161,7 +164,8 @@ def hstu_compute_output(
             eps=norm_eps,
             dropout_ratio=dropout_ratio,
             training=training,
-            concat_ux=concat_ux,
+            concat_u=concat_u,
+            concat_x=concat_x,
             group_norm=group_norm,
             num_heads=num_heads,
             linear_dim=linear_dim,
