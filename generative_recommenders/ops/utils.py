@@ -35,3 +35,7 @@ def is_sm90() -> bool:
         return False
     props = torch.cuda.get_device_properties(0)
     return props.major == 9 and props.minor == 0
+
+
+def is_sm90_plus() -> bool:
+    return is_sm100_plus() or is_sm90()
