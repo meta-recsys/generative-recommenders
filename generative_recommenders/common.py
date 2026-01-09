@@ -267,16 +267,30 @@ def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous()
 
 
+def next_power_of_2(n: int) -> int:
+    """Return the smallest power of 2 greater than or equal to n"""
+    n -= 1
+    n |= n >> 1
+    n |= n >> 2
+    n |= n >> 4
+    n |= n >> 8
+    n |= n >> 16
+    n |= n >> 32
+    n += 1
+    return n
+
+
 @torch.fx.wrap
 def prev_power_of_2(x: int) -> int:
     if torch.compiler.is_compiling():
         # Re-write to make Dynamo happy
         x_tensor = torch.scalar_tensor(x, dtype=torch.int64)  # type: ignore[arg-type]
         x_tensor_orig = x_tensor.clone()
-        out = triton.next_power_of_2(x_tensor)  # type: ignore[arg-type]
+        out_val = next_power_of_2(int(x_tensor.item()))  # type: ignore[arg-type]
+        out = torch.scalar_tensor(out_val, dtype=torch.int64)
         return int(torch.where(torch.lt(x_tensor_orig, out), out // 2, out).item())  # type: ignore[return-value]
     else:
-        out = triton.next_power_of_2(x)
+        out = next_power_of_2(x)
         return out // 2 if out > x else out
 
 
