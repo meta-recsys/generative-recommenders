@@ -150,17 +150,23 @@ class LayerNorm(HammerModule):
         self,
         dim: int,
         eps: float = 1e-5,
+        elementwise_affine: bool = True,
         is_inference: bool = False,
     ) -> None:
         super().__init__(is_inference=is_inference)
         self._normalized_shape: List[int] = [dim]
         self._eps = eps
-        self.weight = torch.nn.Parameter(
-            torch.ones(self._normalized_shape),
-        )
-        self.bias = torch.nn.Parameter(
-            torch.zeros(self._normalized_shape),
-        )
+        self.learnable: bool = elementwise_affine
+        if self.learnable:
+            self.weight = torch.nn.Parameter(
+                torch.ones(self._normalized_shape),
+            )
+            self.bias = torch.nn.Parameter(
+                torch.zeros(self._normalized_shape),
+            )
+        else:
+            self.weight = None
+            self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return layer_norm(
