@@ -26,7 +26,6 @@ from datetime import datetime
 from typing import Any, Dict, Optional, Set
 
 import gin
-
 import torch
 from generative_recommenders.dlrm_v3.utils import MetricsLogger
 from torch.distributed.checkpoint.stateful import Stateful
@@ -76,9 +75,9 @@ def load_dense_state_dict(model: torch.nn.Module, state_dict: Dict[str, Any]) ->
     state_dict_dense_keys = {
         k for k, v in state_dict.items() if not is_sparse_key(k, v)
     }
-    assert (
-        own_state_dense_keys == state_dict_dense_keys
-    ), f"expects {own_state_dense_keys} but gets {state_dict_dense_keys}"
+    assert own_state_dense_keys == state_dict_dense_keys, (
+        f"expects {own_state_dense_keys} but gets {state_dict_dense_keys}"
+    )
     for name in state_dict_dense_keys:
         param = state_dict[name]
         if isinstance(param, torch.nn.Parameter):

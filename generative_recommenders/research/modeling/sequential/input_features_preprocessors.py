@@ -19,7 +19,6 @@ import math
 from typing import Dict, Tuple
 
 import torch
-
 from generative_recommenders.research.modeling.initialization import truncated_normal
 
 

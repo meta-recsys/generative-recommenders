@@ -24,7 +24,6 @@ Forked from bailuding/rails @ 664fdb9.
 from typing import Tuple
 
 import torch
-
 from generative_recommenders.research.rails.indexing.candidate_index import TopKModule
 from generative_recommenders.research.rails.similarities.mol.similarity_fn import (
     MoLSimilarity,

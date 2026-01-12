@@ -29,7 +29,6 @@ from generative_recommenders.modules.postprocessors import (
 from generative_recommenders.modules.preprocessors import InputPreprocessor
 from generative_recommenders.modules.stu import STU
 from generative_recommenders.ops.jagged_tensors import split_2D_jagged
-
 from torch.profiler import record_function
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -72,9 +71,9 @@ class HSTUTransducer(HammerModule):
             if output_postprocessor is not None
             else L2NormPostprocessor(is_inference=is_inference)
         )
-        assert (
-            self._is_inference == self._input_preprocessor._is_inference
-        ), f"input_preprocessor must have the same mode; self: {self._is_inference} vs input_preprocessor {self._input_preprocessor._is_inference}"
+        assert self._is_inference == self._input_preprocessor._is_inference, (
+            f"input_preprocessor must have the same mode; self: {self._is_inference} vs input_preprocessor {self._input_preprocessor._is_inference}"
+        )
         self._positional_encoder: Optional[HSTUPositionalEncoder] = positional_encoder
         self._input_dropout_ratio: float = input_dropout_ratio
         self._return_full_embeddings: bool = return_full_embeddings

@@ -17,11 +17,9 @@
 # pyre-strict
 
 import unittest
-
 from typing import Optional
 
 import torch
-
 from generative_recommenders.common import gpu_unavailable, HammerKernel
 from generative_recommenders.ops.mm import addmm
 from hypothesis import given, settings, strategies as st, Verbosity

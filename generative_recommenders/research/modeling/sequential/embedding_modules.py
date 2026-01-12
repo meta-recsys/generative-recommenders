@@ -17,7 +17,6 @@
 import abc
 
 import torch
-
 from generative_recommenders.research.modeling.initialization import truncated_normal
 
 

@@ -24,7 +24,6 @@ from typing import Callable, Dict, List, Optional
 
 import gin
 import tensorboard  # @manual=//tensorboard:lib  # noqa: F401 - required implicit dep when using torch.utils.tensorboard
-
 import torch
 from generative_recommenders.dlrm_v3.datasets.dataset import DLRMv3RandomDataset
 from generative_recommenders.dlrm_v3.datasets.kuairand import DLRMv3KuaiRandDataset
@@ -46,7 +45,6 @@ from torchrec.metrics.gauc import GAUCMetricComputation
 from torchrec.metrics.mae import MAEMetricComputation
 from torchrec.metrics.mse import MSEMetricComputation
 from torchrec.metrics.ne import NEMetricComputation
-
 from torchrec.metrics.rec_metric import RecMetricComputation
 
 logging.basicConfig(level=logging.INFO)

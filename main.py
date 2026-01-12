@@ -20,7 +20,6 @@ Main entry point for model training. Please refer to README.md for usage instruc
 
 import logging
 import os
-
 from typing import List, Optional
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "1"  # Hide excessive tensorflow debug messages
@@ -28,10 +27,8 @@ import sys
 
 import fbgemm_gpu  # noqa: F401, E402
 import gin
-
 import torch
 import torch.multiprocessing as mp
-
 from absl import app, flags
 from generative_recommenders.research.trainer.train import train_fn
 

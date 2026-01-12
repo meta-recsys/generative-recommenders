@@ -15,7 +15,6 @@
 # pyre-unsafe
 
 import torch
-
 from generative_recommenders.research.rails.indexing.candidate_index import TopKModule
 from generative_recommenders.research.rails.indexing.mips_top_k import (
     MIPSBruteForceTopK,

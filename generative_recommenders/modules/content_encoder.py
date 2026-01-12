@@ -19,7 +19,6 @@
 from typing import Dict, List, Optional
 
 import torch
-
 from generative_recommenders.common import HammerModule
 from generative_recommenders.ops.jagged_tensors import concat_2D_jagged
 

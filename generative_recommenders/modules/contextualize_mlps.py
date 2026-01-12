@@ -16,11 +16,9 @@
 
 # pyre-strict
 import abc
-
 from typing import Optional
 
 import torch
-
 from generative_recommenders.common import HammerModule, init_mlp_weights_optional_bias
 from generative_recommenders.ops.jagged_tensors import jagged_dense_bmm_broadcast_add
 from generative_recommenders.ops.layer_norm import LayerNorm, SwishLayerNorm

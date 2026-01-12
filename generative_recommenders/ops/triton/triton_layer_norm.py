@@ -24,7 +24,6 @@ import triton
 
 # @manual=//triton:triton
 import triton.language as tl
-
 from generative_recommenders.common import (
     switch_to_contiguous_if_needed,
     triton_autotune,

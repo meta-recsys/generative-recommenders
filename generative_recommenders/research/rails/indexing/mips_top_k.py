@@ -17,7 +17,6 @@
 from typing import Tuple
 
 import torch
-
 from generative_recommenders.research.rails.indexing.candidate_index import TopKModule
 
 

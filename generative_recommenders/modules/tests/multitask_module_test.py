@@ -17,20 +17,16 @@
 # pyre-strict
 
 import unittest
-
 from typing import Dict, List, Tuple
 
 import torch
 from generative_recommenders.common import gpu_unavailable, set_dev_mode
-
 from generative_recommenders.modules.multitask_module import (
     DefaultMultitaskModule,
     MultitaskTaskType,
     TaskConfig,
 )
-
 from generative_recommenders.ops.layer_norm import SwishLayerNorm
-
 from hypothesis import given, settings, strategies as st, Verbosity
 
 

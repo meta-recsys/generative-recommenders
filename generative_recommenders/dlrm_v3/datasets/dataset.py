@@ -27,7 +27,6 @@ from typing import Dict, List, Tuple
 
 import torch
 from generative_recommenders.modules.dlrm_hstu import DlrmHSTUConfig
-
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 

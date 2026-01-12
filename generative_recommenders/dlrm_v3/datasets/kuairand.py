@@ -51,9 +51,9 @@ class DLRMv3KuaiRandDataset(DLRMv3RandomDataset):
         self.seq_logs_frame: pd.DataFrame = pd.read_csv(seq_logs_file, delimiter=",")
         # apply hashing from embedding table config
         for key, table in embedding_config.items():
-            assert (
-                key in self.seq_logs_frame.columns
-            ), "Rename key in embedding table configs!"
+            assert key in self.seq_logs_frame.columns, (
+                "Rename key in embedding table configs!"
+            )
             hash_size = table.num_embeddings
             self.seq_logs_frame[key] = self.seq_logs_frame[key].apply(
                 partial(process_and_hash_x, hash_size=hash_size)
@@ -108,15 +108,15 @@ class DLRMv3KuaiRandDataset(DLRMv3RandomDataset):
             watch_time_uih = maybe_truncate_seq(watch_time_uih, self._max_uih_len)
 
             uih_seq_len = len(video_history_uih)
-            assert uih_seq_len == len(
-                timestamps_uih
-            ), "history len differs from timestamp len."
-            assert uih_seq_len == len(
-                action_weights_uih
-            ), "history len differs from weights len."
-            assert uih_seq_len == len(
-                watch_time_uih
-            ), "history len differs from watch time len."
+            assert uih_seq_len == len(timestamps_uih), (
+                "history len differs from timestamp len."
+            )
+            assert uih_seq_len == len(action_weights_uih), (
+                "history len differs from weights len."
+            )
+            assert uih_seq_len == len(watch_time_uih), (
+                "history len differs from watch time len."
+            )
 
             uih_kjt_values: List[torch.Tensor] = []
             uih_kjt_lengths: List[torch.Tensor] = []

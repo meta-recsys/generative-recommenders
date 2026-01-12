@@ -21,7 +21,6 @@ from typing import Callable, Dict, List, Optional, Set, Union
 
 import torch
 import torch.distributed as dist
-
 from generative_recommenders.research.indexing.candidate_index import (
     CandidateIndex,
     TopKModule,

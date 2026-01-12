@@ -7,7 +7,6 @@ import unittest
 import torch
 from generative_recommenders.common import gpu_unavailable
 from hammer.ops.jagged import jagged_transpose_1D
-
 from hypothesis import given, settings, strategies as st, Verbosity
 
 # buck2 test @mode/opt -c fbcode.nvcc_arch=h100 fbcode//generative_recommenders/ops/cpp/tests:jagged_transpose_1d_test

@@ -22,7 +22,6 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-
 from generative_recommenders.research.rails.similarities.mol.embeddings_fn import (
     MoLEmbeddingsFn,
 )

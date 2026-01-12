@@ -19,7 +19,6 @@
 from typing import Optional, Tuple
 
 import torch
-
 from generative_recommenders.common import HammerKernel
 from generative_recommenders.ops.pytorch.pt_jagged import pytorch_jagged_dense_bmm_add
 from generative_recommenders.ops.pytorch.pt_jagged_tensors import (
@@ -28,7 +27,6 @@ from generative_recommenders.ops.pytorch.pt_jagged_tensors import (
     pytorch_hstu_split_l2_embeddings,
     pytorch_split_2D_jagged,
 )
-
 from generative_recommenders.ops.triton.triton_jagged import triton_jagged_dense_bmm_add
 from generative_recommenders.ops.triton.triton_jagged_tensors import (
     triton_concat_2D_jagged,

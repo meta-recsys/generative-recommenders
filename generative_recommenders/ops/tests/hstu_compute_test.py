@@ -18,11 +18,9 @@
 
 import random
 import unittest
-
 from typing import Optional
 
 import torch
-
 from generative_recommenders.common import (
     generate_sparse_seq_len,
     gpu_unavailable,

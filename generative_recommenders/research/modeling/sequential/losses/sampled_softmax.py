@@ -17,12 +17,10 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-
 from generative_recommenders.research.modeling.sequential.autoregressive_losses import (
     AutoregressiveLoss,
     NegativesSampler,
 )
-
 from torch.utils.checkpoint import checkpoint
 
 

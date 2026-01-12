@@ -321,15 +321,15 @@ class DLRMv3SyntheticStreamingDataset(DLRMv3RandomDataset):
             max_num_candidates=max_num_candidates,
             size=len(ids_uih),
         )
-        assert len(ids_uih) == len(
-            timestamps_uih
-        ), "history len differs from timestamp len."
-        assert len(ids_uih) == len(
-            ratings_uih
-        ), f"history len {len(ids_uih)} differs from ratings len {len(ratings_uih)}."
-        assert (
-            len(ids_candidates) == len(ratings_candidates)
-        ), f"candidates len {len(ids_candidates)} differs from ratings len {len(ratings_candidates)}."
+        assert len(ids_uih) == len(timestamps_uih), (
+            "history len differs from timestamp len."
+        )
+        assert len(ids_uih) == len(ratings_uih), (
+            f"history len {len(ids_uih)} differs from ratings len {len(ratings_uih)}."
+        )
+        assert len(ids_candidates) == len(ratings_candidates), (
+            f"candidates len {len(ids_candidates)} differs from ratings len {len(ratings_candidates)}."
+        )
 
         ids_uih = maybe_truncate_seq(ids_uih, self._max_uih_len)
         ratings_uih = maybe_truncate_seq(ratings_uih, self._max_uih_len)

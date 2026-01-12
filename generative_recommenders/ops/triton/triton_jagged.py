@@ -24,7 +24,6 @@ import triton
 
 # @manual=//triton:triton
 import triton.language as tl
-
 from generative_recommenders.common import (
     autotune_max_seq_len,
     fine_grained_autotune_max_seq_len,

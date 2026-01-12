@@ -15,7 +15,6 @@
 from typing import Dict, Tuple
 
 import torch
-
 from generative_recommenders.research.rails.similarities.module import SimilarityModule
 
 

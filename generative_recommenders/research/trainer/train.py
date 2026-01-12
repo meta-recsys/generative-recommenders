@@ -17,24 +17,19 @@
 import logging
 import os
 import random
-
 import time
-
 from datetime import date
 from typing import Dict, Optional
 
 import gin
-
 import torch
 import torch.distributed as dist
-
 from generative_recommenders.research.data.eval import (
     _avg,
     add_to_summary_writer,
     eval_metrics_v2_from_tensors,
     get_eval_state,
 )
-
 from generative_recommenders.research.data.reco_dataset import get_reco_dataset
 from generative_recommenders.research.indexing.utils import get_top_k_module
 from generative_recommenders.research.modeling.sequential.autoregressive_losses import (
@@ -183,9 +178,9 @@ def train_fn(
         item_embedding_dim=item_embedding_dim,
     )
 
-    assert (
-        user_embedding_norm == "l2_norm" or user_embedding_norm == "layer_norm"
-    ), f"Not implemented for {user_embedding_norm}"
+    assert user_embedding_norm == "l2_norm" or user_embedding_norm == "layer_norm", (
+        f"Not implemented for {user_embedding_norm}"
+    )
     output_postproc_module = (
         L2NormEmbeddingPostprocessor(
             embedding_dim=item_embedding_dim,

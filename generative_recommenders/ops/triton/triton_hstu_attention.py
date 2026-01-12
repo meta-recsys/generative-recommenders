@@ -40,7 +40,6 @@ from generative_recommenders.common import (
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
-
 from triton.language.extra.libdevice import (  # @manual=//triton:triton
     fast_dividef,
     fast_expf,

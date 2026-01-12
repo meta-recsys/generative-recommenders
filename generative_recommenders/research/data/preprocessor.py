@@ -20,12 +20,10 @@ import os
 import sys
 import tarfile
 from typing import Dict, Optional, Union
-
 from urllib.request import urlretrieve
 from zipfile import ZipFile
 
 import numpy as np
-
 import pandas as pd
 
 
@@ -312,9 +310,9 @@ class MovielensDataProcessor(DataProcessor):
 
         # print(seq_ratings_data)
         if self.expected_num_unique_items() is not None:
-            assert (
-                self.expected_num_unique_items() == num_unique_items
-            ), f"Expected items: {self.expected_num_unique_items()}, got: {num_unique_items}"
+            assert self.expected_num_unique_items() == num_unique_items, (
+                f"Expected items: {self.expected_num_unique_items()}, got: {num_unique_items}"
+            )
 
         return num_unique_items
 
@@ -422,22 +420,18 @@ class AmazonDataProcessor(DataProcessor):
         )
 
         if self.expected_num_unique_items() is not None:
-            assert (
-                self.expected_num_unique_items() == num_unique_items
-            ), f"expected: {self.expected_num_unique_items()}, actual: {num_unique_items}"
+            assert self.expected_num_unique_items() == num_unique_items, (
+                f"expected: {self.expected_num_unique_items()}, actual: {num_unique_items}"
+            )
             logging.info(f"{self.expected_num_unique_items()} unique items.")
 
         return num_unique_items
 
 
-def get_common_preprocessors() -> (
-    Dict[
-        str,
-        Union[
-            AmazonDataProcessor, MovielensDataProcessor, MovielensSyntheticDataProcessor
-        ],
-    ]
-):
+def get_common_preprocessors() -> Dict[
+    str,
+    Union[AmazonDataProcessor, MovielensDataProcessor, MovielensSyntheticDataProcessor],
+]:
     ml_1m_dp = MovielensDataProcessor(  # pyre-ignore [45]
         "http://files.grouplens.org/datasets/movielens/ml-1m.zip",
         "tmp/movielens1m.zip",

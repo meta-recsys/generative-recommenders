@@ -261,12 +261,12 @@ class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
         N, D = seq_embeddings.shape
         assert len(pos_embeddings.shape) == 2
         assert len(ts_embeddings.shape) == 2
-        assert (
-            pos_embeddings.shape[1] == D
-        ), "shape[1] of pos_embeddings much match seq_embeddings"
-        assert (
-            ts_embeddings.shape[1] == D
-        ), "shape[1] of ts_embeddings much match seq_embeddings"
+        assert pos_embeddings.shape[1] == D, (
+            "shape[1] of pos_embeddings much match seq_embeddings"
+        )
+        assert ts_embeddings.shape[1] == D, (
+            "shape[1] of ts_embeddings much match seq_embeddings"
+        )
         out = torch.empty_like(seq_embeddings)
 
         timestamps = switch_to_contiguous_if_needed(timestamps)

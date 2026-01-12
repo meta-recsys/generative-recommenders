@@ -24,7 +24,6 @@ from typing import Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-
 from generative_recommenders.research.rails.similarities.module import SimilarityModule
 from generative_recommenders.research.rails.similarities.mol.embeddings_fn import (
     MoLEmbeddingsFn,

@@ -13,7 +13,6 @@ from pathlib import Path
 
 import torch
 from packaging.version import parse, Version
-
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDA_HOME, CUDAExtension
 
@@ -119,22 +118,22 @@ def _write_ninja_file(
 
     if IS_HIP_EXTENSION:
         post_cflags = COMMON_HIP_FLAGS + post_cflags
-    flags = [f'cflags = {" ".join(cflags)}']
-    flags.append(f'post_cflags = {" ".join(post_cflags)}')
+    flags = [f"cflags = {' '.join(cflags)}"]
+    flags.append(f"post_cflags = {' '.join(post_cflags)}")
     if with_cuda:
-        flags.append(f'cuda_cflags = {" ".join(cuda_cflags)}')
-        flags.append(f'cuda_post_cflags = {" ".join(cuda_post_cflags)}')
+        flags.append(f"cuda_cflags = {' '.join(cuda_cflags)}")
+        flags.append(f"cuda_post_cflags = {' '.join(cuda_post_cflags)}")
         cuda_post_cflags_sm80 = [
             s if s != "arch=compute_90a,code=sm_90a" else "arch=compute_80,code=sm_80"
             for s in cuda_post_cflags
         ]
-        flags.append(f'cuda_post_cflags_sm80 = {" ".join(cuda_post_cflags_sm80)}')
+        flags.append(f"cuda_post_cflags_sm80 = {' '.join(cuda_post_cflags_sm80)}")
         cuda_post_cflags_sm80_sm90 = cuda_post_cflags + [
             "-gencode",
             "arch=compute_80,code=sm_80",
         ]
         flags.append(
-            f'cuda_post_cflags_sm80_sm90 = {" ".join(cuda_post_cflags_sm80_sm90)}'
+            f"cuda_post_cflags_sm80_sm90 = {' '.join(cuda_post_cflags_sm80_sm90)}"
         )
         cuda_post_cflags_sm100 = [
             s
@@ -142,9 +141,9 @@ def _write_ninja_file(
             else "arch=compute_100a,code=sm_100a"
             for s in cuda_post_cflags
         ]
-        flags.append(f'cuda_post_cflags_sm100 = {" ".join(cuda_post_cflags_sm100)}')
-    flags.append(f'cuda_dlink_post_cflags = {" ".join(cuda_dlink_post_cflags)}')
-    flags.append(f'ldflags = {" ".join(ldflags)}')
+        flags.append(f"cuda_post_cflags_sm100 = {' '.join(cuda_post_cflags_sm100)}")
+    flags.append(f"cuda_dlink_post_cflags = {' '.join(cuda_dlink_post_cflags)}")
+    flags.append(f"ldflags = {' '.join(ldflags)}")
 
     # Turn into absolute paths so we can emit them into the ninja build
     # file wherever it is.
@@ -232,7 +231,7 @@ def _write_ninja_file(
         devlink_out = os.path.join(os.path.dirname(objects[0]), "dlink.o")
         devlink_rule = ["rule cuda_devlink"]
         devlink_rule.append("  command = $nvcc $in -o $out $cuda_dlink_post_cflags")
-        devlink = [f'build {devlink_out}: cuda_devlink {" ".join(objects)}']
+        devlink = [f"build {devlink_out}: cuda_devlink {' '.join(objects)}"]
         objects += [devlink_out]
     else:
         devlink_rule, devlink = [], []
@@ -255,7 +254,7 @@ def _write_ninja_file(
         else:
             link_rule.append("  command = $cxx $in $ldflags -o $out")
 
-        link = [f'build {library_target}: link {" ".join(objects)}']
+        link = [f"build {library_target}: link {' '.join(objects)}"]
 
         default = [f"default {library_target}"]
     else:

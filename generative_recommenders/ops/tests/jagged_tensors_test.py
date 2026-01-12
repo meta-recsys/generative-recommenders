@@ -17,11 +17,9 @@
 # pyre-strict
 
 import unittest
-
 from typing import Optional
 
 import torch
-
 from generative_recommenders.common import (
     generate_sparse_seq_len,
     gpu_unavailable,
@@ -34,7 +32,6 @@ from generative_recommenders.ops.jagged_tensors import (
     split_2D_jagged,
     split_2D_jagged_multirow,
 )
-
 from hypothesis import given, settings, strategies as st, Verbosity
 
 

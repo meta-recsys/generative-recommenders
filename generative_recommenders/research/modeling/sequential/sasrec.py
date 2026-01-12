@@ -28,7 +28,6 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-
 from generative_recommenders.research.modeling.sequential.embedding_modules import (
     EmbeddingModule,
 )
@@ -57,9 +56,9 @@ class StandardAttentionFF(torch.nn.Module):
     ) -> None:
         super().__init__()
 
-        assert (
-            activation_fn == "relu" or activation_fn == "gelu"
-        ), f"Invalid activation_fn {activation_fn}"
+        assert activation_fn == "relu" or activation_fn == "gelu", (
+            f"Invalid activation_fn {activation_fn}"
+        )
 
         self._conv1d = torch.nn.Sequential(
             torch.nn.Conv1d(

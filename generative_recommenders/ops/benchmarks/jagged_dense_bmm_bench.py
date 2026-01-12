@@ -4,7 +4,6 @@ from typing import List, Optional, Tuple
 
 import click
 import pandas as pd
-
 import torch
 
 # @manual=//triton:triton

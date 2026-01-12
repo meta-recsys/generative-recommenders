@@ -31,7 +31,6 @@ from typing import (
 )
 
 import gin
-
 import torch
 import torchrec
 from generative_recommenders.dlrm_v3.checkpoint import save_dmp_checkpoint
@@ -47,7 +46,6 @@ from torch.distributed.optim import (
     _apply_optimizer_in_backward as apply_optimizer_in_backward,
 )
 from torch.optim.optimizer import Optimizer
-
 from torch.utils.data import DataLoader, Dataset as TorchDataset
 from torch.utils.data.distributed import _T_co, DistributedSampler
 from torchrec.distributed.model_parallel import DistributedModelParallel
@@ -151,9 +149,9 @@ class ChunkDistributedSampler(DistributedSampler[_T_co]):
             indices = torch.randperm(self.num_samples, generator=g).tolist()
         else:
             indices = list(range(self.num_samples))
-        assert (
-            self.drop_last is True
-        ), "drop_last must be True for ChunkDistributedSampler"
+        assert self.drop_last is True, (
+            "drop_last must be True for ChunkDistributedSampler"
+        )
         indices = [i + self.num_samples * self.rank for i in indices]
 
         assert len(indices) == self.num_samples

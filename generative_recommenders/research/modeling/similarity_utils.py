@@ -18,7 +18,6 @@ from typing import List, Optional, Tuple
 
 import gin
 import torch
-
 from generative_recommenders.research.rails.similarities.dot_product_similarity_fn import (
     DotProductSimilarity,
 )

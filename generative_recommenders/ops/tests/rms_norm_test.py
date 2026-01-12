@@ -23,7 +23,6 @@ import torch
 from generative_recommenders.common import gpu_unavailable, HammerKernel, set_dev_mode
 from generative_recommenders.ops.layer_norm import rms_norm, RMSNorm
 from hammer.ops.triton.cc.utils import set_triton_cc_version
-
 from hypothesis import given, settings, strategies as st, Verbosity
 
 

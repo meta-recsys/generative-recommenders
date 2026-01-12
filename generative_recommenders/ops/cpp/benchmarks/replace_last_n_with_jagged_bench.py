@@ -2,7 +2,6 @@
 from typing import List
 
 import click
-
 import torch
 
 # @manual=//triton:triton

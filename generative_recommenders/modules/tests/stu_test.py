@@ -18,16 +18,12 @@
 
 import copy
 import unittest
-
 from typing import List
 
 import torch
 from generative_recommenders.common import gpu_unavailable, HammerKernel, set_dev_mode
-
 from generative_recommenders.modules.stu import STU, STULayer, STULayerConfig, STUStack
-
 from generative_recommenders.ops.jagged_tensors import split_2D_jagged
-
 from hypothesis import given, settings, strategies as st, Verbosity
 
 

@@ -19,7 +19,6 @@ from typing import List, Optional
 
 import pandas as pd
 import torch
-
 from generative_recommenders.dlrm_v3.datasets.dataset import DLRMv3RandomDataset
 from generative_recommenders.dlrm_v3.datasets.utils import (
     maybe_truncate_seq,
@@ -101,12 +100,12 @@ class DLRMv3MovieLensDataset(DLRMv3RandomDataset):
             size=len(movie_history_uih),
         )
 
-        assert len(movie_history_uih) == len(
-            movie_timestamps_uih
-        ), "history len differs from timestamp len."
-        assert len(movie_history_uih) == len(
-            movie_history_ratings_uih
-        ), "history len differs from ratings len."
+        assert len(movie_history_uih) == len(movie_timestamps_uih), (
+            "history len differs from timestamp len."
+        )
+        assert len(movie_history_uih) == len(movie_history_ratings_uih), (
+            "history len differs from ratings len."
+        )
 
         movie_history_uih = maybe_truncate_seq(movie_history_uih, self._max_uih_len)
         movie_history_ratings_uih = maybe_truncate_seq(

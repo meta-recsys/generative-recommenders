@@ -183,9 +183,9 @@ class DefaultMultitaskModule(MultitaskModule):
         is_inference: bool,
     ) -> None:
         super().__init__(is_inference)
-        assert (
-            sorted(task_configs, key=lambda x: x.task_type) == task_configs
-        ), "task_configs must be sorted by task_type."
+        assert sorted(task_configs, key=lambda x: x.task_type) == task_configs, (
+            "task_configs must be sorted by task_type."
+        )
         assert len(task_configs) > 0, "task_configs must be non-empty."
         self._task_configs: List[TaskConfig] = task_configs
         self._task_offsets: List[int] = [0] * (len(MultitaskTaskType) + 1)

@@ -19,7 +19,6 @@
 from typing import Optional
 
 import torch
-
 from generative_recommenders.common import HammerKernel, switch_to_contiguous_if_needed
 from generative_recommenders.ops.pytorch.pt_hstu_attention import (
     pytorch_cached_hstu_mha,
@@ -29,7 +28,6 @@ from generative_recommenders.ops.triton.triton_hstu_attention import (
     triton_cached_hstu_mha,
     triton_hstu_mha,
 )
-
 from hammer.v2.ops.triton.template.tlx_bw_hstu_attention import tlx_bw_hstu_mha_wrapper
 
 try:

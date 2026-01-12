@@ -26,7 +26,6 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-
 from generative_recommenders.research.modeling.sequential.embedding_modules import (
     EmbeddingModule,
 )

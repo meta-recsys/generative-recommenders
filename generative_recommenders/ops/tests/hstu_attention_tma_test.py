@@ -26,12 +26,10 @@ from generative_recommenders.common import (
     set_dev_mode,
 )
 from generative_recommenders.ops.jagged_tensors import split_2D_jagged
-
 from generative_recommenders.ops.tests.hstu_attention_test import (
     test_attn,
     test_delta_attn,
 )
-
 from hypothesis import given, settings, strategies as st, Verbosity
 
 

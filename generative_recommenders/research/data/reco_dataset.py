@@ -18,9 +18,7 @@ from dataclasses import dataclass
 from typing import List
 
 import pandas as pd
-
 import torch
-
 from generative_recommenders.research.data.dataset import DatasetV2, MultiFileDatasetV2
 from generative_recommenders.research.data.item_features import ItemFeatures
 from generative_recommenders.research.data.preprocessor import get_common_preprocessors

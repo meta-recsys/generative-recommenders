@@ -27,7 +27,6 @@ from generative_recommenders.ops.layer_norm import (
     swish_layer_norm,
     SwishLayerNorm,
 )
-
 from hypothesis import given, settings, strategies as st, Verbosity
 
 

@@ -20,9 +20,7 @@ from typing import List, Tuple
 
 import torch
 import torch.nn.functional as F
-
 from generative_recommenders.research.rails.similarities.module import SimilarityModule
-
 from torch.utils.checkpoint import checkpoint
 
 

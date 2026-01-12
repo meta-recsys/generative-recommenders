@@ -21,7 +21,6 @@ Forked from bailuding/rails @ 664fdb9.
 from typing import Callable, Dict, Tuple
 
 import torch
-
 from generative_recommenders.research.rails.similarities.mol.embeddings_fn import (
     MoLEmbeddingsFn,
 )

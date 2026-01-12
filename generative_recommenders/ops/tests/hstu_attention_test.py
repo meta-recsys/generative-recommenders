@@ -28,7 +28,6 @@ from generative_recommenders.common import (
     set_dev_mode,
 )
 from generative_recommenders.ops.jagged_tensors import split_2D_jagged
-
 from hypothesis import given, settings, strategies as st, Verbosity
 
 

@@ -16,7 +16,6 @@
 import unittest
 
 from generative_recommenders.common import gpu_unavailable
-
 from generative_recommenders.dlrm_v3.train.train_ranker import main
 
 

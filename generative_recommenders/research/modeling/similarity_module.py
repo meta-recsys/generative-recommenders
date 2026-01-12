@@ -16,7 +16,6 @@ import abc
 from typing import Optional
 
 import torch
-
 from generative_recommenders.research.rails.similarities.module import SimilarityModule
 
 

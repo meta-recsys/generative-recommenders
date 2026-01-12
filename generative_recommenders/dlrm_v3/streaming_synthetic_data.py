@@ -527,9 +527,9 @@ def write_offset(output_folder: str, num_files: int, num_users: int) -> None:
                     if not line:
                         break
                     offsets.append(offset)
-            assert (
-                len(offsets) == num_users // num_files
-            ), f"num_users {num_users // num_files} != {len(offsets)}"
+            assert len(offsets) == num_users // num_files, (
+                f"num_users {num_users // num_files} != {len(offsets)}"
+            )
             logger.warning(f"offsets for file {i} finished")
             writer.writerow([",".join([str(offset) for offset in offsets])])
 
