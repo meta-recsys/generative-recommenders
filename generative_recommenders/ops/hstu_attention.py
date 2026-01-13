@@ -30,6 +30,8 @@ from generative_recommenders.ops.triton.triton_hstu_attention import (
 )
 from hammer.v2.ops.triton.template.tlx_bw_hstu_attention import tlx_bw_hstu_mha_wrapper
 
+from hammer.v2.ops.triton.template.tlx_bw_hstu_attention import tlx_bw_hstu_mha_wrapper
+
 try:
     from hammer.ops.triton.cc.hstu_attention.triton_cc_hstu_attention import (
         triton_cc_hstu_mha,
