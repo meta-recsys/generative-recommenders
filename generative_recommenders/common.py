@@ -111,7 +111,6 @@ except ImportError:
 @unique
 class HammerKernel(Enum):
     TRITON = "TRITON"
-    TLX = "TLX"
     PYTORCH = "PYTORCH"
     CUDA = "CUDA"
     TRITON_CC = "TRITON_CC"
