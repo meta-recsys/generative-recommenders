@@ -37,7 +37,8 @@ class HSTUComputeTest(unittest.TestCase):
         N=st.integers(min_value=1000, max_value=1000),
         D=st.integers(min_value=128, max_value=128),
         L=st.integers(min_value=512, max_value=512),
-        concat_ux=st.booleans(),
+        concat_u=st.booleans(),
+        concat_x=st.booleans(),
         group_norm=st.booleans(),
         num_heads=st.sampled_from([4]),
         training=st.just(False),
@@ -69,7 +70,8 @@ class HSTUComputeTest(unittest.TestCase):
         N=st.just(1500000),
         D=st.just(512),
         L=st.just(512),
-        concat_ux=st.sampled_from([True]),
+        concat_u=st.sampled_from([True]),
+        concat_x=st.sampled_from([True]),
         group_norm=st.sampled_from([False]),
         num_heads=st.sampled_from([4]),
         training=st.just(False),
@@ -97,7 +99,8 @@ class HSTUComputeTest(unittest.TestCase):
         N: int,
         D: int,
         L: int,
-        concat_ux: bool,
+        concat_u: bool,
+        concat_x: bool,
         group_norm: bool,
         num_heads: int,
         training: bool,
@@ -145,10 +148,17 @@ class HSTUComputeTest(unittest.TestCase):
             .requires_grad_()
         )
         norm_eps = 1e-6
+        # When group_norm=True, only concat_ux = concat_u and concat_x is supported
+        if group_norm:
+            L_mult = 3 if (concat_u and concat_x) else 1
+        else:
+            L_mult = 1
+            if concat_u:
+                L_mult += 1
+            if concat_x:
+                L_mult += 1
         output_weight = (
-            torch.empty(
-                (L * 3 if concat_ux else L, D), dtype=dtype, device=torch.device("cuda")
-            )
+            torch.empty((L * L_mult, D), dtype=dtype, device=torch.device("cuda"))
             .uniform_(-0.1, 0.1)
             .requires_grad_()
         )
@@ -168,7 +178,8 @@ class HSTUComputeTest(unittest.TestCase):
             norm_eps=norm_eps,
             dropout_ratio=dropout_ratio,
             output_weight=output_weight,
-            concat_ux=concat_ux,
+            concat_u=concat_u,
+            concat_x=concat_x,
             group_norm=group_norm,
             num_heads=num_heads,
             linear_dim=L // num_heads,
@@ -204,7 +215,8 @@ class HSTUComputeTest(unittest.TestCase):
             norm_eps=norm_eps,
             dropout_ratio=dropout_ratio,
             output_weight=output_weight,
-            concat_ux=concat_ux,
+            concat_u=concat_u,
+            concat_x=concat_x,
             group_norm=group_norm,
             num_heads=num_heads,
             linear_dim=L // num_heads,
