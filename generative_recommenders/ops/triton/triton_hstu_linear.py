@@ -151,12 +151,13 @@ def _ln_mul_dropout_fwd_rng(
     stride_u,
     stride_y,
     stride_mask,
-    SILU_U: tl.constexpr,
+    CONCAT_U_SILU_U: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
     TRAINING: tl.constexpr,
     CONCAT_U: tl.constexpr,
     CONCAT_X: tl.constexpr,
+    MUL_U_ACTIVATION_TYPE: tl.constexpr,
 ):
     block_id = tl.program_id(0)
     start_row = block_id * BLOCK_N
@@ -210,10 +211,20 @@ def _ln_mul_dropout_fwd_rng(
     b = tl.load(B + cols, mask=col_mask).to(tl.float32)
     y = y * w[None, :] + b[None, :]
 
-    if SILU_U:
-        u_block = u_block * tl.sigmoid(u_block)
+    if MUL_U_ACTIVATION_TYPE == "silu":
+        # pyre-fixme[16]
+        silu_u_activation_block = u_block * tl.sigmoid(u_block)
+        y = y * silu_u_activation_block
+    elif MUL_U_ACTIVATION_TYPE == "sigmoid":
+        # pyre-fixme[16]
+        sigmoid_u_activation_block = tl.sigmoid(u_block)
+        y = y * sigmoid_u_activation_block
+    else:
+        y = y * u_block
 
-    y = y * u_block
+    if CONCAT_U and CONCAT_U_SILU_U:
+        # pyre-fixme[16]
+        u_block = u_block * tl.sigmoid(u_block)
 
     if TRAINING:
         row_offsets = start_row + tl.arange(0, BLOCK_N)
@@ -363,11 +374,12 @@ def _ln_mul_dropout_fwd(
     stride_x,
     stride_u,
     stride_y,
-    SILU_U: tl.constexpr,
+    CONCAT_U_SILU_U: tl.constexpr,
     BLOCK_D: tl.constexpr,
     TRAINING: tl.constexpr,
     CONCAT_U: tl.constexpr,
     CONCAT_X: tl.constexpr,
+    MUL_U_ACTIVATION_TYPE: tl.constexpr,
     FAST_DROPOUT: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -397,9 +409,18 @@ def _ln_mul_dropout_fwd(
     b = tl.load(B + cols, mask=mask).to(tl.float32)
     y = y * w + b
     u = tl.load(U + cols, mask=cols < D, other=0.0).to(tl.float32)
-    if SILU_U:
-        u = u * tl.sigmoid(u)
-    y = y * u
+    sigmoid_u = tl.sigmoid(u)
+    silu_u = u * sigmoid_u
+
+    if MUL_U_ACTIVATION_TYPE == "silu":
+        y = y * silu_u
+    elif MUL_U_ACTIVATION_TYPE == "sigmoid":
+        y = y * sigmoid_u
+    else:
+        y = y * u
+
+    if CONCAT_U and CONCAT_U_SILU_U:
+        u = silu_u
 
     if TRAINING:
         random_offsets = 3 * row * BLOCK_D + cols
@@ -494,11 +515,12 @@ def _ln_mul_dropout_bwd_dx_du_rng(
     eps,
     dropout_ratio,
     N,
-    SILU_U: tl.constexpr,
+    CONCAT_U_SILU_U: tl.constexpr,
     BLOCK_D: tl.constexpr,
     TRAINING: tl.constexpr,
     CONCAT_U: tl.constexpr,
     CONCAT_X: tl.constexpr,
+    MUL_U_ACTIVATION_TYPE: tl.constexpr,
     COMPUTE_Y: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -585,19 +607,34 @@ def _ln_mul_dropout_bwd_dx_du_rng(
         xhat = (x - mean) * rstd
         u = tl.load(U + cols, mask=mask, other=0).to(tl.float32)
         ln = xhat * w + b
-        du += dy * ln
-        if SILU_U:
-            # The recomputation of silu_u should be consistent with the forward pass
-            # for NE.
-            sig_u = tl.sigmoid(u)
-            silu_u = u * sig_u
-            du = du * sig_u * (1 + u - silu_u)
+        du_y = dy * ln
+        mul_u = u
+        sig_u = tl.sigmoid(u)
+        silu_u = u * sig_u
+
+        if MUL_U_ACTIVATION_TYPE == "silu":
+            mul_u = silu_u
+            du_y = dy * ln * (sig_u + silu_u * (1.0 - sig_u))
+            dy = dy * silu_u
+        elif MUL_U_ACTIVATION_TYPE == "sigmoid":
+            mul_u = sig_u
+            du_y = dy * ln * sig_u * (1.0 - sig_u)
+            dy = dy * sig_u
+        else:
+            dy = dy * u
+
+        du_u = du
+        if CONCAT_U and CONCAT_U_SILU_U:
+            du_u *= sig_u + silu_u * (1.0 - sig_u)
             u = silu_u
+
+        du = du_y + du_u
+
         tl.store(DU + cols, du.to(DU.dtype.element_ty), mask=mask)
-        dy = dy * u
+
         wdy = w * dy
         if COMPUTE_Y:
-            y = ln * u
+            y = ln * mul_u
             if TRAINING:
                 if CONCAT_U:
                     u = tl.where(
@@ -677,11 +714,12 @@ def _ln_mul_dropout_bwd_dx_du(
     seed,
     dropout_ratio,
     N,
-    SILU_U: tl.constexpr,
+    CONCAT_U_SILU_U: tl.constexpr,
     BLOCK_D: tl.constexpr,
     TRAINING: tl.constexpr,
     CONCAT_U: tl.constexpr,
     CONCAT_X: tl.constexpr,
+    MUL_U_ACTIVATION_TYPE: tl.constexpr,
     COMPUTE_Y: tl.constexpr,
     FAST_DROPOUT: tl.constexpr,
 ):
@@ -790,19 +828,32 @@ def _ln_mul_dropout_bwd_dx_du(
         xhat = (x - mean) * rstd
         u = tl.load(U + cols, mask=mask, other=0).to(tl.float32)
         ln = xhat * w + b
-        du += dy * ln
-        if SILU_U:
-            # The recomputation of silu_u should be consistent with the forward pass
-            # for NE.
-            sig_u = tl.sigmoid(u)
-            silu_u = u * sig_u
-            du = du * sig_u * (1 + u - silu_u)
-            u = silu_u
+        du_y = dy * ln
+        mul_u = u
+        sig_u = tl.sigmoid(u)
+
+        if MUL_U_ACTIVATION_TYPE == "silu":
+            mul_u = u * sig_u
+            du_y = dy * ln * (sig_u + u * sig_u * (1.0 - sig_u))
+            dy = dy * u * sig_u
+        elif MUL_U_ACTIVATION_TYPE == "sigmoid":
+            mul_u = sig_u
+            du_y = dy * ln * (sig_u * (1.0 - sig_u))
+            dy = dy * sig_u
+        else:
+            dy = dy * u
+
+        du_u = du
+        if CONCAT_U and CONCAT_U_SILU_U:
+            du_u *= sig_u + u * sig_u * (1.0 - sig_u)
+            u = u * sig_u
+
+        du = du_y + du_u
+
         tl.store(DU + cols, du.to(DU.dtype.element_ty), mask=mask)
-        dy = dy * u
         wdy = w * dy
         if COMPUTE_Y:
-            y = ln * u
+            y = ln * mul_u
             if TRAINING:
                 if CONCAT_U:
                     u = tl.where(
@@ -911,9 +962,10 @@ def triton_layer_norm_mul_dropout_fwd(
     eps: float,
     dropout_ratio: float,
     training: bool,
-    silu_u: bool = False,
+    concat_u_silu_u: bool = False,
     concat_u: bool = False,
     concat_x: bool = False,
+    mul_u_activation_type: str = "none",
     seed: Optional[int] = None,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, int, int, int
@@ -990,11 +1042,12 @@ def triton_layer_norm_mul_dropout_fwd(
             u.stride(0),
             y.stride(0),
             random_mask.stride(0),
-            SILU_U=silu_u,
+            CONCAT_U_SILU_U=concat_u_silu_u,
             BLOCK_D=BLOCK_D,
             TRAINING=training,
             CONCAT_U=concat_u,
             CONCAT_X=concat_x,
+            MUL_U_ACTIVATION_TYPE=mul_u_activation_type,
         )
 
     else:
@@ -1014,11 +1067,12 @@ def triton_layer_norm_mul_dropout_fwd(
             x.stride(0),
             u.stride(0),
             y.stride(0),
-            SILU_U=silu_u,
+            CONCAT_U_SILU_U=concat_u_silu_u,
             BLOCK_D=BLOCK_D,
             TRAINING=training,
             CONCAT_U=concat_u,
             CONCAT_X=concat_x,
+            MUL_U_ACTIVATION_TYPE=mul_u_activation_type,
             FAST_DROPOUT=COMPUTE_OUTPUT_LN_FAST_DROPOUT,
             num_warps=num_warps,
         )
@@ -1039,9 +1093,10 @@ def triton_layer_norm_mul_dropout_bwd(
     training: bool,
     dropout_ratio: float,
     seed: Optional[int] = None,
-    silu_u: bool = False,
+    concat_u_silu_u: bool = False,
     concat_u: bool = False,
     concat_x: bool = False,
+    mul_u_activation_type: str = "none",
     compute_y: bool = False,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]
@@ -1118,11 +1173,12 @@ def triton_layer_norm_mul_dropout_bwd(
             eps,
             dropout_ratio,
             N=N,
-            SILU_U=silu_u,
+            CONCAT_U_SILU_U=concat_u_silu_u,
             BLOCK_D=BLOCK_D,
             TRAINING=training,
             CONCAT_U=concat_u,
             CONCAT_X=concat_x,
+            MUL_U_ACTIVATION_TYPE=mul_u_activation_type,
             COMPUTE_Y=compute_y,
             num_warps=num_warps,
         )
@@ -1153,11 +1209,12 @@ def triton_layer_norm_mul_dropout_bwd(
             seed,
             dropout_ratio,
             N=N,
-            SILU_U=silu_u,
+            CONCAT_U_SILU_U=concat_u_silu_u,
             BLOCK_D=BLOCK_D,
             TRAINING=training,
             CONCAT_U=concat_u,
             CONCAT_X=concat_x,
+            MUL_U_ACTIVATION_TYPE=mul_u_activation_type,
             COMPUTE_Y=compute_y,
             FAST_DROPOUT=COMPUTE_OUTPUT_LN_FAST_DROPOUT,
             num_warps=num_warps,
@@ -1210,7 +1267,7 @@ class LayerNormMulDropoutFunction(torch.autograd.Function):
             eps=eps,
             dropout_ratio=dropout_ratio,
             training=training,
-            silu_u=silu_u,
+            concat_u_silu_u=silu_u,
             concat_u=concat_u,
             concat_x=concat_x,
             seed=seed,
@@ -1257,7 +1314,7 @@ class LayerNormMulDropoutFunction(torch.autograd.Function):
             training=ctx.training,
             dropout_ratio=ctx.dropout_ratio,
             seed=ctx.seed,
-            silu_u=ctx.silu_u,
+            concat_u_silu_u=ctx.silu_u,
             concat_u=ctx.concat_ux,
             concat_x=ctx.concat_ux,
             compute_y=False,
@@ -1851,9 +1908,10 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
         eps: float,
         dropout_ratio: float,
         training: bool,
-        silu_u: bool = False,
+        concat_u_silu_u: bool = False,
         concat_u: bool = False,
         concat_x: bool = False,
+        mul_u_activation_type: str = "none",
         group_norm: bool = False,
         num_heads: int = 1,
         linear_dim: int = -1,
@@ -1873,7 +1931,7 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
                     eps=eps,
                     dropout_ratio=dropout_ratio,
                     training=training,
-                    silu_u=silu_u,
+                    silu_u=concat_u_silu_u,
                     concat_ux=concat_u and concat_x,
                     num_heads=num_heads,
                     linear_dim=linear_dim,
@@ -1890,9 +1948,10 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
                 eps=eps,
                 dropout_ratio=dropout_ratio,
                 training=training,
-                silu_u=silu_u,
+                concat_u_silu_u=concat_u_silu_u,
                 concat_u=concat_u,
                 concat_x=concat_x,
+                mul_u_activation_type=mul_u_activation_type,
                 seed=seed,
             )
 
@@ -1914,7 +1973,8 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
         ctx.linear_dim = linear_dim
         ctx.group_norm = group_norm
         ctx.recompute_y_in_backward = recompute_y_in_backward
-        ctx.silu_u = silu_u
+        ctx.concat_u_silu_u = concat_u_silu_u
+        ctx.mul_u_activation_type = mul_u_activation_type
         return out
 
     @staticmethod
@@ -1928,6 +1988,7 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
         torch.Tensor,  # d_norm_weight
         torch.Tensor,  # d_norm_bias
         torch.Tensor,  # d_output_weight
+        None,
         None,
         None,
         None,
@@ -1962,7 +2023,7 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
                     training=ctx.training,
                     dropout_ratio=ctx.dropout_ratio,
                     seed=ctx.seed,
-                    silu_u=ctx.silu_u,
+                    silu_u=ctx.concat_u_silu_u,
                     concat_ux=ctx.concat_u and ctx.concat_x,
                     num_heads=ctx.num_heads,
                     linear_dim=ctx.linear_dim,
@@ -1985,9 +2046,10 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
                     training=ctx.training,
                     dropout_ratio=ctx.dropout_ratio,
                     seed=ctx.seed,
-                    silu_u=ctx.silu_u,
+                    concat_u_silu_u=ctx.concat_u_silu_u,
                     concat_u=ctx.concat_u,
                     concat_x=ctx.concat_x,
+                    mul_u_activation_type=ctx.mul_u_activation_type,
                     compute_y=ctx.recompute_y_in_backward,
                 )
             )
@@ -2001,6 +2063,7 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
             d_norm_weight,
             d_norm_bias,
             d_output_weight,
+            None,
             None,
             None,
             None,
@@ -2567,7 +2630,7 @@ def triton_norm_mul_dropout(
     eps: float,
     dropout_ratio: float,
     training: bool,
-    silu_u: bool = False,
+    concat_u_silu_u: bool = False,
     concat_u: bool = False,
     concat_x: bool = False,
     group_norm: bool = False,
@@ -2584,7 +2647,7 @@ def triton_norm_mul_dropout(
             eps,
             dropout_ratio,
             training,
-            silu_u,
+            concat_u_silu_u,
             concat_u and concat_x,
             num_heads,
             linear_dim,
@@ -2599,7 +2662,7 @@ def triton_norm_mul_dropout(
             eps,
             dropout_ratio,
             training,
-            silu_u,
+            concat_u_silu_u,
             concat_u and concat_x,
             seed,
         )
@@ -2616,9 +2679,10 @@ def triton_hstu_compute_output(
     eps: float,
     dropout_ratio: float,
     training: bool,
-    silu_u: bool = False,
+    concat_u_silu_u: bool = False,
     concat_u: bool = False,
     concat_x: bool = False,
+    mul_u_activation_type: str = "none",
     group_norm: bool = False,
     num_heads: int = 1,
     linear_dim: int = -1,
@@ -2635,9 +2699,10 @@ def triton_hstu_compute_output(
         eps,
         dropout_ratio,
         training,
-        silu_u,
+        concat_u_silu_u,
         concat_u,
         concat_x,
+        mul_u_activation_type,
         group_norm,
         num_heads,
         linear_dim,
