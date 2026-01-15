@@ -461,7 +461,7 @@ def train_fn(
 
             if eval_dict_all is None:
                 eval_dict_all = {}
-                for k, v in eval_dict.items():
+                for k in eval_dict.keys():
                     eval_dict_all[k] = []
 
             for k, v in eval_dict.items():
