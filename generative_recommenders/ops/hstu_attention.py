@@ -28,6 +28,7 @@ from generative_recommenders.ops.triton.triton_hstu_attention import (
     triton_cached_hstu_mha,
     triton_hstu_mha,
 )
+from hammer.v2.ops.triton.template.tlx_bw_hstu_attention import tlx_bw_hstu_mha_wrapper
 
 try:
     from hammer.ops.triton.cc.hstu_attention.triton_cc_hstu_attention import (
@@ -69,7 +70,7 @@ def hstu_mha(
         torch._assert(v.shape[1] == H, "wrong v shape[1]")
         torch._assert(causal, "only support causal attention")
 
-    if kernel in [HammerKernel.TRITON, HammerKernel.TRITON_CC]:
+    if kernel in [HammerKernel.TRITON, HammerKernel.TLX, HammerKernel.TRITON_CC]:
         if not is_fx_tracing() and kernel == HammerKernel.TRITON:
             torch._assert(q.is_cuda, "q must be CUDA tensor")
             torch._assert(k.is_cuda, "k must be CUDA tensor")
@@ -98,6 +99,20 @@ def hstu_mha(
             contextual_seq_len=contextual_seq_len,
             sort_by_length=sort_by_length,
             enable_tma=enable_tma,
+        )
+    elif kernel == HammerKernel.TLX:
+        return tlx_bw_hstu_mha_wrapper(
+            max_seq_len=max_seq_len,
+            alpha=alpha,
+            q=q,
+            k=k,
+            v=v,
+            seq_offsets=seq_offsets,
+            attn_scale=torch.tensor(1.0 / max_seq_len).to(q.device),
+            num_targets=num_targets,
+            max_attn_len=max_attn_len,
+            contextual_seq_len=contextual_seq_len,
+            sort_by_length=sort_by_length,
         )
     elif kernel == HammerKernel.TRITON_CC:
         return triton_cc_hstu_mha(

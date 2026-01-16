@@ -10,6 +10,7 @@ import torch
 import triton
 from generative_recommenders.common import (
     apply_sampling,
+    blackwell_tlx_unavailable,
     generate_sparse_seq_len,
     HammerKernel,
 )
@@ -26,6 +27,8 @@ except ImportError:
 def _get_kernel(provider: str) -> HammerKernel:
     if provider == "triton":
         return HammerKernel.TRITON
+    elif provider == "tlx":
+        return HammerKernel.TLX
     elif provider == "pytorch":
         return HammerKernel.PYTORCH
     else:
@@ -76,6 +79,7 @@ def _flops(
 @click.option("--target-size", type=int, default=20)
 @click.option("--bench-backward", type=bool, default=True)
 @click.option("--bench-forward", type=bool, default=True)
+@click.option("--bench-tlx", type=bool, default=False)
 @click.option("--bench-pytorch", type=bool, default=False)
 @click.option("--report-flops", type=bool, default=False)
 @click.option("--return-result", type=bool, default=False)
@@ -98,6 +102,7 @@ def main(  # noqa: C901
     target_size: int,
     bench_backward: bool,
     bench_forward: bool,
+    bench_tlx: bool,
     bench_pytorch: bool,
     report_flops: bool,
     return_result: bool,
@@ -126,6 +131,10 @@ def main(  # noqa: C901
         line_vals.append("pytorch")
         line_names.append("PyTorch")
         styles.append(("green", "-"))
+    if bench_tlx and not blackwell_tlx_unavailable[0]:
+        line_vals.append("tlx")
+        line_names.append("tlx")
+        styles.append(("cyan", "-"))
 
     bench_backward = False if has_delta_q else bench_backward
     modes = []
@@ -255,7 +264,13 @@ def main(  # noqa: C901
             q = q.requires_grad_(True)
             k = k.requires_grad_(True)
             v = v.requires_grad_(True)
-        assert provider in ["triton", "pytorch", "flash_cuda_jagged", "flash_cuda"]
+        assert provider in [
+            "triton",
+            "pytorch",
+            "flash_cuda_jagged",
+            "flash_cuda",
+            "tlx",
+        ]
         if has_delta_q:
             fn = lambda: delta_hstu_mha(  # noqa E731
                 max_seq_len=seq_len,
