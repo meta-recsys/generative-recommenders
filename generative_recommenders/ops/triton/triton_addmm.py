@@ -686,11 +686,16 @@ def _addmm_fwd_tma_ws_persistent(
     tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
     tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
     # Barriers for producer <-> Epilogue
+    # y_load_bar: producer signals when y data is ready
+    # y_empty_bar: epilogue signals when done using y buffer
     if EPILOGUE_SUBTILE:
         y_load_bar_first = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
         y_load_bar_second = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+        y_empty_bar_first = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+        y_empty_bar_second = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
     else:
         y_load_bar = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+        y_empty_bar = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
 
     with tlx.async_tasks():
         # Epilogue consumer: waits for Y from producer, adds bias, stores Z
@@ -727,9 +732,12 @@ def _addmm_fwd_tma_ws_persistent(
                     y_bar_first = tlx.local_view(y_load_bar_first, 0)
                     # pyre-ignore[61]
                     y_bar_second = tlx.local_view(y_load_bar_second, 0)
+                    # pyre-ignore[61]
+                    y_empty_first = tlx.local_view(y_empty_bar_first, 0)
+                    # pyre-ignore[61]
+                    y_empty_second = tlx.local_view(y_empty_bar_second, 0)
                     tlx.barrier_wait(y_bar_first, y_load_phase)
                     tlx.barrier_wait(y_bar_second, y_load_phase)
-                    y_load_phase = y_load_phase ^ 1
 
                     # Process first half of the tile
                     acc_tmem_subslice1 = tlx.subslice(acc_tmem, 0, BLOCK_N // 2)
@@ -750,12 +758,17 @@ def _addmm_fwd_tma_ws_persistent(
                     y = tlx.local_load(y_buf_second_view)
                     z = (result + y.to(tl.float32)).to(z_desc.dtype)
                     z_desc.store([offs_xm, offs_wn + BLOCK_N // 2], z)
+
+                    tlx.barrier_arrive(y_empty_first, 1)
+                    tlx.barrier_arrive(y_empty_second, 1)
+                    y_load_phase = y_load_phase ^ 1
                 else:
                     # Wait for y load from producer
                     # pyre-ignore[61]
                     y_bar = tlx.local_view(y_load_bar, 0)
+                    # pyre-ignore[61]
+                    y_empty = tlx.local_view(y_empty_bar, 0)
                     tlx.barrier_wait(y_bar, y_load_phase)
-                    y_load_phase = y_load_phase ^ 1
 
                     # Load y from SMEM
                     # pyre-ignore[61]
@@ -764,6 +777,9 @@ def _addmm_fwd_tma_ws_persistent(
                     result = tlx.local_load(acc_tmem)
                     z = (result + y.to(tl.float32)).to(z_desc.dtype)
                     z_desc.store([offs_xm, offs_wn], z)
+
+                    tlx.barrier_arrive(y_empty, 1)
+                    y_load_phase = y_load_phase ^ 1
 
                 # Signal MMA that this TMEM buffer is now free
                 tlx.barrier_arrive(tmem_empty_bars[cur_tmem_buf], 1)
@@ -801,12 +817,12 @@ def _addmm_fwd_tma_ws_persistent(
                     tlx.barrier_wait(smem_full_bars[buf], dot_phase)
 
                     # CTA0 waits for both CTA0 and CTA1 to finish loading before issuing dot op
+                    # "Arrive Remote, Wait Local" pattern: all CTAs signal CTA 0's barrier, only CTA 0 waits
                     if PAIR_CTA:
                         # pyre-ignore[61]
-                        cta_bar = tlx.remote_view(cta_bars[buf], 0)
-                        tlx.barrier_arrive(cta_bar, 1)
+                        tlx.barrier_arrive(cta_bars[buf], 1, remote_cta_rank=0)
                         # pyre-ignore[61]
-                        tlx.barrier_wait(cta_bar, phase=dot_phase, pred=pred_cta0)
+                        tlx.barrier_wait(cta_bars[buf], phase=dot_phase, pred=pred_cta0)
 
                     tlx.async_dot(
                         x_buffers[buf],
@@ -894,11 +910,15 @@ def _addmm_fwd_tma_ws_persistent(
                     y_bar_first = tlx.local_view(y_load_bar_first, 0)
                     # pyre-ignore[61]
                     y_bar_second = tlx.local_view(y_load_bar_second, 0)
+                    # pyre-ignore[61]
+                    y_empty_first = tlx.local_view(y_empty_bar_first, 0)
+                    # pyre-ignore[61]
+                    y_empty_second = tlx.local_view(y_empty_bar_second, 0)
 
                     # Wait for epilogue to finish using previous y data
                     if tile_id > start_pid:
-                        tlx.barrier_wait(y_bar_first, y_load_phase ^ 1)
-                        tlx.barrier_wait(y_bar_second, y_load_phase ^ 1)
+                        tlx.barrier_wait(y_empty_first, y_load_phase ^ 1)
+                        tlx.barrier_wait(y_empty_second, y_load_phase ^ 1)
 
                     if BROADCAST_Y:
                         tlx.barrier_expect_bytes(y_bar_first, 1 * (BLOCK_N // 2) * 2)
@@ -939,10 +959,12 @@ def _addmm_fwd_tma_ws_persistent(
                     y_buf_view = tlx.local_view(y_buffer, 0)
                     # pyre-ignore[61]
                     y_bar = tlx.local_view(y_load_bar, 0)
+                    # pyre-ignore[61]
+                    y_empty = tlx.local_view(y_empty_bar, 0)
 
                     # Wait for epilogue to finish using previous y data
                     if tile_id > start_pid:
-                        tlx.barrier_wait(y_bar, y_load_phase ^ 1)
+                        tlx.barrier_wait(y_empty, y_load_phase ^ 1)
 
                     if BROADCAST_Y:
                         tlx.barrier_expect_bytes(y_bar, 1 * BLOCK_N * 2)
