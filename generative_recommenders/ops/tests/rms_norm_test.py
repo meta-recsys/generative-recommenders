@@ -26,6 +26,9 @@ from hammer.ops.triton.cc.utils import set_triton_cc_version
 from hypothesis import given, settings, strategies as st, Verbosity
 
 
+# buck2 test @mode/opt //generative_recommenders/ops/tests:rms_norm_test -- --print-passing-details
+
+
 class LayerNormTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore[56]
@@ -65,6 +68,7 @@ class LayerNormTest(unittest.TestCase):
             else [torch.float32]
         ),
         silu=st.booleans(),
+        is_contiguous=st.sampled_from([True, False]),
     )
     @settings(
         deadline=None,
@@ -115,15 +119,29 @@ class LayerNormTest(unittest.TestCase):
         real_kernel: HammerKernel,
         skip_comparisons: bool = False,
         test_backward: bool = True,
+        is_contiguous: bool = True,
     ) -> None:
         N = N // 4 * 4
         # enable auto-tuning to verify correctness of multi-row kernel
         set_dev_mode(False)
-        x = (
-            torch.empty((N, D), dtype=dtype, device=torch.device("cuda"))
-            .normal_(0.0, 1.0)
-            .requires_grad_()
-        )
+
+        if is_contiguous:
+            x = (
+                torch.empty((N, D), dtype=dtype, device=torch.device("cuda"))
+                .normal_(0.0, 1.0)
+                .requires_grad_()
+            )
+        else:
+            # Create a non-contiguous tensor by transposing a (D, N) tensor
+            x = (
+                torch.empty((D, N), dtype=dtype, device=torch.device("cuda"))
+                .normal_(0.0, 1.0)
+                .T.requires_grad_()
+            )
+            # Empty tensors (N=0) are always contiguous, so only assert for non-empty
+            if N > 0:
+                assert not x.is_contiguous(), "x should be non-contiguous for this test"
+
         weight = (
             torch.empty((D,), device=torch.device("cuda"))
             .uniform_(-1.0, 1.0)
