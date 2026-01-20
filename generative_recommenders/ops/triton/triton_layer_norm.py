@@ -74,7 +74,6 @@ def _get_norm_bwd_configs() -> List[triton.Config]:
                 triton.Config(
                     {"BLOCK_N": BLOCK_N},
                     num_warps=num_warps,
-                    pre_hook=_bwd_pre_hook,
                 )
             )
     return configs
@@ -714,7 +713,7 @@ def _weighted_rms_norm_fwd(
     W,
     Rstd,
     N,
-    D,
+    D: tl.constexpr,
     eps,
     stride_x,
     stride_y,
@@ -787,7 +786,7 @@ def _weighted_rms_norm_bwd_dx(
     stride_dx,
     stride_dy,
     stride_x,
-    D,
+    D: tl.constexpr,
     eps,
     GROUP_N,
     BLOCK_D: tl.constexpr,
@@ -839,6 +838,7 @@ def _weighted_rms_norm_bwd_dx(
 @triton_autotune(
     configs=_get_norm_bwd_configs(),
     key=["BLOCK_D", "SILU"],
+    reset_to_zero=["DW"],
 )
 @triton.jit
 def _weighted_rms_norm_bwd(
