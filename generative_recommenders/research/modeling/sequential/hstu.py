@@ -20,6 +20,8 @@ Actions Speak Louder than Words: Trillion-Parameter Sequential Transducers for G
 (https://arxiv.org/abs/2402.17152, ICML'24).
 """
 
+import gin
+
 import abc
 import math
 from typing import Callable, Dict, List, Optional, Tuple, Union
@@ -238,6 +240,7 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         concat_ua: bool = False,
         epsilon: float = 1e-6,
         max_length: Optional[int] = None,
+        attn_impl: Optional[str] = None,
     ) -> None:
         super().__init__()
         self._embedding_dim: int = embedding_dim
@@ -271,6 +274,7 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         )
         torch.nn.init.xavier_uniform_(self._o.weight)
         self._eps: float = epsilon
+        self._attn_impl: Optional[str] = attn_impl
 
     def _norm_input(self, x: torch.Tensor) -> torch.Tensor:
         return F.layer_norm(x, normalized_shape=[self._embedding_dim], eps=self._eps)
@@ -341,21 +345,54 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         B: int = x_offsets.size(0) - 1
         if self._normalization == "rel_bias" or self._normalization == "hstu_rel_bias":
             assert self._rel_attn_bias is not None
-            attn_output, padded_q, padded_k = _hstu_attention_maybe_from_cache(
-                num_heads=self._num_heads,
-                attention_dim=self._attention_dim,
-                linear_dim=self._linear_dim,
-                q=q,
-                k=k,
-                v=v,
-                cached_q=cached_q,
-                cached_k=cached_k,
-                delta_x_offsets=delta_x_offsets,
-                x_offsets=x_offsets,
-                all_timestamps=all_timestamps,
-                invalid_attn_mask=invalid_attn_mask,
-                rel_attn_bias=self._rel_attn_bias,
-            )
+            if self._attn_impl is None:
+                attn_output, padded_q, padded_k = _hstu_attention_maybe_from_cache(
+                    num_heads=self._num_heads,
+                    attention_dim=self._attention_dim,
+                    linear_dim=self._linear_dim,
+                    q=q, k=k, v=v,
+                    cached_q=cached_q, cached_k=cached_k,
+                    delta_x_offsets=delta_x_offsets,
+                    x_offsets=x_offsets,
+                    all_timestamps=all_timestamps,
+                    invalid_attn_mask=invalid_attn_mask,
+                    rel_attn_bias=self._rel_attn_bias,
+                )
+            else:
+                try:
+                    from generative_recommenders.ops.hstu_attention_dispatch import (
+                        hstu_attention_from_cache,
+                    )
+                    attn_output, padded_q, padded_k = hstu_attention_from_cache(
+                        impl=self._attn_impl,
+                        num_heads=self._num_heads,
+                        attention_dim=self._attention_dim,
+                        linear_dim=self._linear_dim,
+                        q=q, k=k, v=v,
+                        cached_q=cached_q, cached_k=cached_k,
+                        delta_x_offsets=delta_x_offsets,
+                        x_offsets=x_offsets,
+                        all_timestamps=all_timestamps,
+                        invalid_attn_mask=invalid_attn_mask,
+                        rel_attn_bias=self._rel_attn_bias,
+                    )
+                except Exception as _e:
+                    if not hasattr(self, "_fallback_notified"):
+                        print(f"[HSTU] backend failed ({type(_e).__name__}); fallback to default")
+                        self._fallback_notified = True
+                    attn_output, padded_q, padded_k = _hstu_attention_maybe_from_cache(
+                        num_heads=self._num_heads,
+                        attention_dim=self._attention_dim,
+                        linear_dim=self._linear_dim,
+                        q=q, k=k, v=v,
+                        cached_q=cached_q, cached_k=cached_k,
+                        delta_x_offsets=delta_x_offsets,
+                        x_offsets=x_offsets,
+                        all_timestamps=all_timestamps,
+                        invalid_attn_mask=invalid_attn_mask,
+                        rel_attn_bias=self._rel_attn_bias,
+                    )
+
         elif self._normalization == "softmax_rel_bias":
             if delta_x_offsets is not None:
                 B = x_offsets.size(0) - 1
@@ -539,6 +576,8 @@ class HSTUJagged(torch.nn.Module):
         return y, cache_states
 
 
+
+@gin.configurable
 class HSTU(SequentialEncoderWithLearnedSimilarityModule):
     """
     Implements HSTU (Hierarchical Sequential Transduction Unit) in
@@ -571,6 +610,7 @@ class HSTU(SequentialEncoderWithLearnedSimilarityModule):
         enable_relative_attention_bias: bool = True,
         concat_ua: bool = False,
         verbose: bool = True,
+        attn_impl: Optional[str] = None,
     ) -> None:
         super().__init__(ndp_module=similarity_module)
 
@@ -616,6 +656,8 @@ class HSTU(SequentialEncoderWithLearnedSimilarityModule):
                     dropout_ratio=linear_dropout_rate,
                     attn_dropout_ratio=attn_dropout_rate,
                     concat_ua=concat_ua,
+                    attn_impl=attn_impl,
+
                 )
                 for _ in range(num_blocks)
             ],
