@@ -997,7 +997,7 @@ def triton_layer_norm_mul_dropout_fwd(
     if D > BLOCK_D:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
 
-    if seed is None:
+    if seed is None and training:
         seed = torch.randint(low=0, high=2**62, size=(1,), dtype=torch.int64).item()
     num_warps: int = min(max(BLOCK_D // 256, 1), 8)
     sms = torch.cuda.get_device_properties("cuda").multi_processor_count
