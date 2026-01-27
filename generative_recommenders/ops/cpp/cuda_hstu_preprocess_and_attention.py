@@ -95,28 +95,93 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 quantize_output=fp8_in_addmm_fwd,
             )
         )
-        if fp8_in_addmm_fwd:
-            assert x_scale is not None and normed_x_fp8 is not None
-            uvqk = fp8_rowwise_quantize_addmm(
-                x=normed_x,
-                x_fp8=normed_x_fp8,
-                w=uvqk_weight,
-                y=uvqk_bias,
-                x_scale=x_scale,
-                custom_kernel=False,
-                is_inference=False,
-            ).contiguous()
+        # When silu_u is False and we want to recompute in backward, we split the weight
+        # for u and vqk separately during training to compute them independently.
+        # This avoids needing to clone u (which would otherwise keep the whole uvqk alive).
+        if not silu_u and recompute_uvqk_in_backward:
+            # Split the weights/biases to compute u and vqk separately
+            u_weight, vqk_weight = uvqk_weight.split(
+                [
+                    hidden_dim * num_heads,
+                    hidden_dim * num_heads
+                    + attn_dim * num_heads
+                    + attn_dim * num_heads,
+                ],
+                dim=1,
+            )
+            u_bias, vqk_bias = uvqk_bias.split(
+                [
+                    hidden_dim * num_heads,
+                    hidden_dim * num_heads
+                    + attn_dim * num_heads
+                    + attn_dim * num_heads,
+                ],
+                dim=0,
+            )
+            if fp8_in_addmm_fwd:
+                assert x_scale is not None and normed_x_fp8 is not None
+                u = fp8_rowwise_quantize_addmm(
+                    x=normed_x,
+                    x_fp8=normed_x_fp8,
+                    w=u_weight,
+                    y=u_bias,
+                    x_scale=x_scale,
+                    custom_kernel=False,
+                    is_inference=False,
+                ).contiguous()
+                vqk = fp8_rowwise_quantize_addmm(
+                    x=normed_x,
+                    x_fp8=normed_x_fp8,
+                    w=vqk_weight,
+                    y=vqk_bias,
+                    x_scale=x_scale,
+                    custom_kernel=False,
+                    is_inference=False,
+                ).contiguous()
+            else:
+                u = maybe_triton_addmm_fwd(normed_x, u_weight, u_bias).contiguous()
+                vqk = maybe_triton_addmm_fwd(
+                    normed_x, vqk_weight, vqk_bias
+                ).contiguous()
+            v, q, k = vqk.split(
+                [
+                    hidden_dim * num_heads,
+                    attn_dim * num_heads,
+                    attn_dim * num_heads,
+                ],
+                dim=1,
+            )
+            # uvqk is not used since we split the computation, but we need it
+            # for saving in case recompute_uvqk_in_backward is False in a
+            # different code path. Set to None to satisfy type checker.
+            uvqk = None
         else:
-            uvqk = maybe_triton_addmm_fwd(normed_x, uvqk_weight, uvqk_bias).contiguous()
-        u, v, q, k = uvqk.split(
-            [
-                hidden_dim * num_heads,
-                hidden_dim * num_heads,
-                attn_dim * num_heads,
-                attn_dim * num_heads,
-            ],
-            dim=1,
-        )
+            if fp8_in_addmm_fwd:
+                assert x_scale is not None and normed_x_fp8 is not None
+                uvqk = fp8_rowwise_quantize_addmm(
+                    x=normed_x,
+                    x_fp8=normed_x_fp8,
+                    w=uvqk_weight,
+                    y=uvqk_bias,
+                    x_scale=x_scale,
+                    custom_kernel=False,
+                    is_inference=False,
+                ).contiguous()
+            else:
+                uvqk = maybe_triton_addmm_fwd(
+                    normed_x, uvqk_weight, uvqk_bias
+                ).contiguous()
+            u, v, q, k = uvqk.split(
+                [
+                    hidden_dim * num_heads,
+                    hidden_dim * num_heads,
+                    attn_dim * num_heads,
+                    attn_dim * num_heads,
+                ],
+                dim=1,
+            )
+            if silu_u:
+                u = F.silu(u)
         if rotary_weights is not None:
             q_cos_weights = rotary_weights[0]
             q_sin_weights = rotary_weights[1]
@@ -143,10 +208,6 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         q = q.view(-1, num_heads, attn_dim)
         k = k.view(-1, num_heads, attn_dim)
         v = v.view(-1, num_heads, hidden_dim)
-        if silu_u:
-            u = F.silu(u)
-        elif recompute_uvqk_in_backward:
-            u = u.clone()  # otherwise the whole uvqk will be saved
         if is_sm100_plus():
             out = torch.ops.bw_hstu.bw_hstu_mha_fwd(
                 max_seq_len,
@@ -306,25 +367,94 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         if ctx.recompute_uvqk_in_backward:
             uvqk_bias = ctx.saved_tensors[idx]
             idx += 1
-            if ctx.fp8_in_addmm_fwd:
-                x_scale, normed_x_fp8 = ctx.saved_tensors[idx : idx + 2]
-                uvqk = fp8_rowwise_quantize_addmm(
-                    x=normed_x,
-                    x_fp8=normed_x_fp8,
-                    w=uvqk_weight,
-                    y=uvqk_bias,
-                    x_scale=x_scale,
-                    custom_kernel=False,
-                    is_inference=False,
+            if not ctx.silu_u:
+                # When silu_u is False, we only recompute vqk (not u)
+                # Split the weights/biases to extract vqk portion
+                _, vqk_weight = uvqk_weight.split(
+                    [
+                        ctx.hidden_dim * ctx.num_heads,
+                        ctx.hidden_dim * ctx.num_heads
+                        + ctx.attn_dim * ctx.num_heads
+                        + ctx.attn_dim * ctx.num_heads,
+                    ],
+                    dim=1,
                 )
-                idx += 2
+                _, vqk_bias = uvqk_bias.split(
+                    [
+                        ctx.hidden_dim * ctx.num_heads,
+                        ctx.hidden_dim * ctx.num_heads
+                        + ctx.attn_dim * ctx.num_heads
+                        + ctx.attn_dim * ctx.num_heads,
+                    ],
+                    dim=0,
+                )
+                if ctx.fp8_in_addmm_fwd:
+                    x_scale, normed_x_fp8 = ctx.saved_tensors[idx : idx + 2]
+                    vqk = fp8_rowwise_quantize_addmm(
+                        x=normed_x,
+                        x_fp8=normed_x_fp8,
+                        w=vqk_weight,
+                        y=vqk_bias,
+                        x_scale=x_scale,
+                        custom_kernel=False,
+                        is_inference=False,
+                    )
+                    idx += 2
+                else:
+                    vqk = maybe_triton_addmm_fwd(
+                        normed_x, vqk_weight, vqk_bias
+                    ).contiguous()
+                # Split vqk into v, q, k components
+                v, q, k = vqk.split(
+                    [
+                        ctx.hidden_dim * ctx.num_heads,
+                        ctx.attn_dim * ctx.num_heads,
+                        ctx.attn_dim * ctx.num_heads,
+                    ],
+                    dim=1,
+                )
+                u = None
             else:
-                uvqk = maybe_triton_addmm_fwd(
-                    normed_x, uvqk_weight, uvqk_bias
-                ).contiguous()
+                # When silu_u is True, we recompute uvqk (all components)
+                if ctx.fp8_in_addmm_fwd:
+                    x_scale, normed_x_fp8 = ctx.saved_tensors[idx : idx + 2]
+                    uvqk = fp8_rowwise_quantize_addmm(
+                        x=normed_x,
+                        x_fp8=normed_x_fp8,
+                        w=uvqk_weight,
+                        y=uvqk_bias,
+                        x_scale=x_scale,
+                        custom_kernel=False,
+                        is_inference=False,
+                    )
+                    idx += 2
+                else:
+                    uvqk = maybe_triton_addmm_fwd(
+                        normed_x, uvqk_weight, uvqk_bias
+                    ).contiguous()
+                # Split uvqk into u, v, q, k components
+                u, v, q, k = uvqk.split(
+                    [
+                        ctx.hidden_dim * ctx.num_heads,
+                        ctx.hidden_dim * ctx.num_heads,
+                        ctx.attn_dim * ctx.num_heads,
+                        ctx.attn_dim * ctx.num_heads,
+                    ],
+                    dim=1,
+                )
         else:
             uvqk = ctx.saved_tensors[idx]
             idx += 1
+            # Split saved uvqk into u, v, q, k components
+            u, v, q, k = uvqk.split(
+                [
+                    ctx.hidden_dim * ctx.num_heads,
+                    ctx.hidden_dim * ctx.num_heads,
+                    ctx.attn_dim * ctx.num_heads,
+                    ctx.attn_dim * ctx.num_heads,
+                ],
+                dim=1,
+            )
         if ctx.has_rotary_weights:
             q_cos_weights, q_sin_weights, k_cos_weights, k_sin_weights = (
                 ctx.saved_tensors[idx : idx + 4]
@@ -338,17 +468,15 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 None,
             )
 
-        duvqk = torch.empty_like(uvqk)
-        du, dv, dq, dk = duvqk.split(
+        duvqk = torch.empty(
             [
-                ctx.hidden_dim * ctx.num_heads,
-                ctx.hidden_dim * ctx.num_heads,
-                ctx.attn_dim * ctx.num_heads,
-                ctx.attn_dim * ctx.num_heads,
+                x.size(0),
+                ctx.hidden_dim * ctx.num_heads * 2 + ctx.attn_dim * ctx.num_heads * 2,
             ],
-            dim=1,
+            device=x.device,
+            dtype=x.dtype,
         )
-        u, v, q, k = uvqk.split(
+        du, dv, dq, dk = duvqk.split(
             [
                 ctx.hidden_dim * ctx.num_heads,
                 ctx.hidden_dim * ctx.num_heads,
@@ -360,6 +488,9 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         q = q.view(-1, ctx.num_heads, ctx.attn_dim)
         k = k.view(-1, ctx.num_heads, ctx.attn_dim)
         v = v.view(-1, ctx.num_heads, ctx.hidden_dim)
+        dq = dq.view(-1, ctx.num_heads, ctx.attn_dim)
+        dk = dk.view(-1, ctx.num_heads, ctx.attn_dim)
+        dv = dv.view(-1, ctx.num_heads, ctx.hidden_dim)
         if (
             ctx.recompute_uvqk_in_backward and ctx.has_rotary_weights
         ):  # recompute ROPE on qk
