@@ -40,12 +40,26 @@ try:
 except OSError:
     pass
 
+CUDA_JAGGED_DENSE_BMM_FWD = False
 CUDA_JAGGED_DENSE_BMM_BWD = False
+
+
+def set_cuda_jagged_dense_bmm_fwd(value: bool) -> None:
+    global CUDA_JAGGED_DENSE_BMM_FWD
+    CUDA_JAGGED_DENSE_BMM_FWD = value
+
+
+def get_cuda_jagged_dense_bmm_fwd() -> bool:
+    return CUDA_JAGGED_DENSE_BMM_FWD
 
 
 def set_cuda_jagged_dense_bmm_bwd(value: bool) -> None:
     global CUDA_JAGGED_DENSE_BMM_BWD
     CUDA_JAGGED_DENSE_BMM_BWD = value
+
+
+def get_cuda_jagged_dense_bmm_bwd() -> bool:
+    return CUDA_JAGGED_DENSE_BMM_BWD
 
 
 def _triton_concat_2D_jagged_internal(
@@ -840,9 +854,22 @@ class _JaggedDenseBmmAddFunction(torch.autograd.Function):
         bias: torch.Tensor,
         elementwise: bool = False,
     ):
-        out, B, K, N = triton_jagged_dense_bmm_add_fwd(
-            max_seq_len, seq_offsets, jagged, dense, bias, elementwise
-        )
+        if get_cuda_jagged_dense_bmm_fwd():
+            jagged = switch_to_contiguous_if_needed(jagged)
+            bias = switch_to_contiguous_if_needed(bias)
+            # Ensure bias has same dtype as jagged (required by CUDA kernel)
+            bias = bias.to(jagged.dtype)
+            # Ensure seq_offsets is int64 (required by CUDA kernel)
+            seq_offsets = seq_offsets.to(torch.int64)
+            _, K = jagged.shape
+            B, _, N = dense.shape
+            out = torch.ops.jagged_dense_bmm_broadcast_add.jagged_dense_bmm_broadcast_add_fwd(
+                max_seq_len, seq_offsets, jagged, dense, bias, elementwise
+            )
+        else:
+            out, B, K, N = triton_jagged_dense_bmm_add_fwd(
+                max_seq_len, seq_offsets, jagged, dense, bias, elementwise
+            )
 
         ctx.save_for_backward(seq_offsets, jagged, dense)
         ctx.B = B
@@ -858,7 +885,7 @@ class _JaggedDenseBmmAddFunction(torch.autograd.Function):
         ctx, d_out: torch.Tensor
     ) -> Tuple[None, None, torch.Tensor, torch.Tensor, torch.Tensor, None]:
         seq_offsets, jagged, dense = ctx.saved_tensors
-        if CUDA_JAGGED_DENSE_BMM_BWD:
+        if get_cuda_jagged_dense_bmm_bwd():
             d_jagged, d_dense, d_bias = (
                 torch.ops.jagged_dense_bmm_broadcast_add.jagged_dense_bmm_broadcast_add_bwd(
                     ctx.max_seq_len,
