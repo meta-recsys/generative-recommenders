@@ -30,7 +30,7 @@ from generative_recommenders.common import (
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
-from generative_recommenders.ops.utils import is_sm100_plus
+from generative_recommenders.ops.utils import is_sm100_plus, is_sm90
 from torch._inductor.runtime import triton_helpers
 
 try:
@@ -40,12 +40,28 @@ try:
 except OSError:
     pass
 
+CUDA_JAGGED_DENSE_BMM_FWD = False
 CUDA_JAGGED_DENSE_BMM_BWD = False
+
+
+def set_cuda_jagged_dense_bmm_fwd(value: bool) -> None:
+    global CUDA_JAGGED_DENSE_BMM_FWD
+    CUDA_JAGGED_DENSE_BMM_FWD = value
+
+
+def get_cuda_jagged_dense_bmm_fwd() -> bool:
+    # currently only supports H100
+    return CUDA_JAGGED_DENSE_BMM_FWD and is_sm90()
 
 
 def set_cuda_jagged_dense_bmm_bwd(value: bool) -> None:
     global CUDA_JAGGED_DENSE_BMM_BWD
     CUDA_JAGGED_DENSE_BMM_BWD = value
+
+
+def get_cuda_jagged_dense_bmm_bwd() -> bool:
+    # currently only supports H100
+    return CUDA_JAGGED_DENSE_BMM_BWD and is_sm90()
 
 
 def _triton_concat_2D_jagged_internal(
@@ -840,9 +856,24 @@ class _JaggedDenseBmmAddFunction(torch.autograd.Function):
         bias: torch.Tensor,
         elementwise: bool = False,
     ):
-        out, B, K, N = triton_jagged_dense_bmm_add_fwd(
-            max_seq_len, seq_offsets, jagged, dense, bias, elementwise
-        )
+        if get_cuda_jagged_dense_bmm_fwd():
+            jagged = switch_to_contiguous_if_needed(jagged)
+            bias = switch_to_contiguous_if_needed(bias)
+            # Ensure bias has same dtype as jagged (required by CUDA kernel)
+            if bias.dtype != jagged.dtype:
+                bias = bias.to(jagged.dtype)
+            # Ensure seq_offsets is int64 (required by CUDA kernel)
+            if seq_offsets.dtype != torch.int64:
+                seq_offsets = seq_offsets.to(torch.int64)
+            _, K = jagged.shape
+            B, _, N = dense.shape
+            out = torch.ops.jagged_dense_bmm_broadcast_add.jagged_dense_bmm_broadcast_add_fwd(
+                max_seq_len, seq_offsets, jagged, dense, bias, elementwise
+            )
+        else:
+            out, B, K, N = triton_jagged_dense_bmm_add_fwd(
+                max_seq_len, seq_offsets, jagged, dense, bias, elementwise
+            )
 
         ctx.save_for_backward(seq_offsets, jagged, dense)
         ctx.B = B
@@ -858,7 +889,7 @@ class _JaggedDenseBmmAddFunction(torch.autograd.Function):
         ctx, d_out: torch.Tensor
     ) -> Tuple[None, None, torch.Tensor, torch.Tensor, torch.Tensor, None]:
         seq_offsets, jagged, dense = ctx.saved_tensors
-        if CUDA_JAGGED_DENSE_BMM_BWD:
+        if get_cuda_jagged_dense_bmm_bwd():
             d_jagged, d_dense, d_bias = (
                 torch.ops.jagged_dense_bmm_broadcast_add.jagged_dense_bmm_broadcast_add_bwd(
                     ctx.max_seq_len,
