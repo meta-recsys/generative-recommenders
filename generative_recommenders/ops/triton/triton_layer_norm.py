@@ -28,7 +28,7 @@ from generative_recommenders.common import (
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
-from generative_recommenders.ops.utils import is_sm100_plus
+from generative_recommenders.ops.utils import get_sm_count, is_sm100_plus
 
 try:
     # @manual=//triton:triton
@@ -567,7 +567,7 @@ def triton_weighted_layer_norm_bwd(
         assert weight is not None and bias is not None
         N, D = x.shape
         dx = torch.empty_like(x)
-        sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+        sms = get_sm_count()
         tile_num = max(1, min(sms * 8, N // 4))
         _dweight = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
         _dbias = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
@@ -1053,7 +1053,7 @@ class RMSNormFunction(torch.autograd.Function):
             dweight.zero_()
             return dx, dweight, None, None
 
-        sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+        sms = get_sm_count()
         tile_num = max(1, min(sms * 8, N // 4))
 
         _weighted_rms_norm_bwd[(tile_num,)](
@@ -1142,7 +1142,7 @@ class SwishLayerNormFunction(torch.autograd.Function):
         x, weight, bias, mean, rstd = ctx.saved_tensors
         N, D = x.shape
         dx = torch.empty_like(x)
-        sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+        sms = get_sm_count()
         tile_num = max(1, min(sms * 8, N // 4))
         _dweight = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
         _dbias = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
