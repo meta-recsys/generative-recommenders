@@ -83,6 +83,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         full_attn_size: Optional[int] = None,
         silu_u: bool = True,
         fp8_in_addmm_fwd: bool = False,
+        num_softmax_heads: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         max_attn_len = max_attn_len or 0
         full_attn_size = full_attn_size or 0
@@ -234,8 +235,9 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 None,  # min_full_attn_seq_len_tensor,
                 1,  # num_groups
             )
+            softmax_lse = None
         else:
-            out, _ = torch.ops.hstu.hstu_mha_fwd(
+            out, softmax_lse = torch.ops.hstu.hstu_mha_fwd(
                 max_seq_len,
                 alpha,
                 q,
@@ -252,6 +254,9 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 None,  # k_descale
                 None,  # v_descale
                 0,  # sm_margin
+                0,  # max_q_len,
+                None,  # seq_offsets_q,
+                num_softmax_heads,  # num_softmax_heads,
             )
         # update ctx
         saved_tensors = [
@@ -264,6 +269,8 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             seq_offsets,
             out,
         ]
+        if num_softmax_heads > 0:
+            saved_tensors.append(softmax_lse)
         if num_targets is not None:
             saved_tensors.append(num_targets)
         if attn_scale is not None:
@@ -303,6 +310,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         ctx.sort_by_length = sort_by_length
         ctx.silu_u = silu_u
         ctx.fp8_in_addmm_fwd = fp8_in_addmm_fwd
+        ctx.num_softmax_heads = num_softmax_heads
         return u, out
 
     @staticmethod
@@ -336,11 +344,17 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         None,
         None,
         None,
+        None,
     ]:
         x, norm_weight, norm_bias, x_mean, x_rstd, uvqk_weight, seq_offsets, out = (
             ctx.saved_tensors[:8]
         )
         idx = 8
+        if ctx.num_softmax_heads > 0:
+            softmax_lse = ctx.saved_tensors[idx]
+            idx += 1
+        else:
+            softmax_lse = None
         if ctx.has_multiple_targets:
             num_targets = ctx.saved_tensors[idx]
             idx += 1
@@ -563,6 +577,10 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 ctx.sort_by_length,
                 False,  # deterministic
                 0,  # sm_margin
+                0,  # max_q_len,
+                None,  # seq_offsets_q,
+                ctx.num_softmax_heads,  # num_softmax_heads,
+                softmax_lse,
             )
         if ctx.has_rotary_weights:
             _dq = triton_apply_rope_bwd(
@@ -618,6 +636,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             None,
             d_uvqk_weight,
             d_uvqk_bias,
+            None,
             None,
             None,
             None,
