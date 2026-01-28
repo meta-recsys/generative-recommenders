@@ -30,7 +30,7 @@ from generative_recommenders.common import (
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
-from generative_recommenders.ops.utils import is_sm100_plus
+from generative_recommenders.ops.utils import is_sm100_plus, is_sm90
 from torch._inductor.runtime import triton_helpers
 
 try:
@@ -50,7 +50,8 @@ def set_cuda_jagged_dense_bmm_fwd(value: bool) -> None:
 
 
 def get_cuda_jagged_dense_bmm_fwd() -> bool:
-    return CUDA_JAGGED_DENSE_BMM_FWD
+    # currently only supports H100
+    return CUDA_JAGGED_DENSE_BMM_FWD and is_sm90()
 
 
 def set_cuda_jagged_dense_bmm_bwd(value: bool) -> None:
@@ -59,7 +60,8 @@ def set_cuda_jagged_dense_bmm_bwd(value: bool) -> None:
 
 
 def get_cuda_jagged_dense_bmm_bwd() -> bool:
-    return CUDA_JAGGED_DENSE_BMM_BWD
+    # currently only supports H100
+    return CUDA_JAGGED_DENSE_BMM_BWD and is_sm90()
 
 
 def _triton_concat_2D_jagged_internal(
