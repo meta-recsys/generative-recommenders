@@ -28,7 +28,7 @@ def pytorch_norm_mul_dropout(
     eps: float,
     dropout_ratio: float,
     training: bool,
-    concat_u_silu_u: bool = False,
+    silu_u: bool = False,
     concat_u: bool = False,
     concat_x: bool = False,
     mul_u_activation_type: str = "none",
@@ -40,7 +40,7 @@ def pytorch_norm_mul_dropout(
     x = x.to(torch.float32)
     u = u.to(torch.float32)
     if group_norm:
-        if concat_u_silu_u:
+        if silu_u:
             u = F.silu(u)
             u = u.to(torch.float32)
         y = u * F.group_norm(
@@ -66,7 +66,7 @@ def pytorch_norm_mul_dropout(
             eps=eps,
         )
         if concat_u:
-            if concat_u_silu_u:
+            if silu_u:
                 u = F.silu(u)
             if concat_x:
                 y = torch.cat([u, x, y], dim=1)
@@ -92,7 +92,7 @@ def pytorch_hstu_compute_output(
     eps: float,
     dropout_ratio: float,
     training: bool,
-    concat_u_silu_u: bool = False,
+    silu_u: bool = False,
     concat_u: bool = False,
     concat_x: bool = False,
     mul_u_activation_type: str = "none",
@@ -109,7 +109,7 @@ def pytorch_hstu_compute_output(
         eps=eps,
         dropout_ratio=dropout_ratio,
         training=training,
-        concat_u_silu_u=concat_u_silu_u,
+        silu_u=silu_u,
         concat_u=concat_u,
         concat_x=concat_x,
         mul_u_activation_type=mul_u_activation_type,
