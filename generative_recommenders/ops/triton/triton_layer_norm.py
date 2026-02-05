@@ -1039,15 +1039,6 @@ class RMSNormFunction(torch.autograd.Function):
         x, weight, rstd = ctx.saved_tensors
         N, D = x.shape
         dx = torch.empty_like(x)
-        if D <= 1024:
-            GROUP_N = 256 * 8
-        elif D <= 4096:
-            GROUP_N = 128 * 8
-        elif D <= 8192:
-            GROUP_N = 96 * 8
-        else:
-            GROUP_N = 64 * 8
-        GROUP_N = N if GROUP_N > N else GROUP_N
         dweight = torch.zeros((D,), dtype=weight.dtype, device=x.device)
         if N == 0:
             dweight.zero_()
