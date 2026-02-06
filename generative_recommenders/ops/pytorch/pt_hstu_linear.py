@@ -118,3 +118,13 @@ def pytorch_hstu_compute_output(
         linear_dim=linear_dim,
     )
     return torch.addmm(x, y, output_weight.to(x.dtype)).to(dtype)
+
+
+def pytorch_swiglu(
+    x: torch.Tensor,
+    w_gate: torch.Tensor,
+    w_up: torch.Tensor,
+) -> torch.Tensor:
+    gate = F.silu(F.linear(x, w_gate))
+    up = F.linear(x, w_up)
+    return gate * up
