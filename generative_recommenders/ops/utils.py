@@ -39,3 +39,13 @@ def is_sm90() -> bool:
 
 def is_sm90_plus() -> bool:
     return is_sm100_plus() or is_sm90()
+
+
+def copy_if_different_ptr(dst: torch.Tensor, src: torch.Tensor) -> None:
+    if torch.compiler.is_compiling():
+        # During compilation, always copy (no-op if same tensor) since .data_ptr() will break PT2
+        dst.copy_(src)
+    else:
+        # In actual execution, check if copy is needed
+        if dst.data_ptr() != src.data_ptr():
+            dst.copy_(src)
