@@ -29,6 +29,11 @@ from generative_recommenders.common import (
     triton_autotune,
 )
 from generative_recommenders.ops.triton.triton_addmm import maybe_triton_addmm_fwd
+from generative_recommenders.ops.utils import (
+    generate_dropout_seed,
+    get_sm_count,
+    is_sm100_plus,
+)
 
 
 def _get_layer_norm_mul_dropout_fwd_multirow_configs() -> List[triton.Config]:
@@ -44,8 +49,6 @@ def _get_layer_norm_mul_dropout_fwd_multirow_configs() -> List[triton.Config]:
             )
     return configs
 
-
-from generative_recommenders.ops.utils import is_sm100_plus
 
 # @manual=//triton:triton
 from triton.language.extra import libdevice
@@ -998,9 +1001,8 @@ def triton_layer_norm_mul_dropout_fwd(
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
 
     if seed is None and training:
-        seed = torch.randint(low=0, high=2**62, size=(1,), dtype=torch.int64).item()
+        seed = generate_dropout_seed()
     num_warps: int = min(max(BLOCK_D // 256, 1), 8)
-    sms = torch.cuda.get_device_properties("cuda").multi_processor_count
     # Benchmark shows separating RNG from ln_mul_dropout kernel only benefits on
     # blackwell when CONCAT_UX is enabled. (fused RNG kernel can benefit from rand3x fast
     # dropout)
@@ -1123,7 +1125,7 @@ def triton_layer_norm_mul_dropout_bwd(
         )
     dx = torch.empty_like(x)
     du = torch.empty_like(u)
-    sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+    sms = get_sm_count()
     tile_num = max(1, min(sms * 64, N // 4))
     _dweight = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
     _dbias = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
@@ -1619,7 +1621,7 @@ def triton_group_norm_mul_dropout_fwd(
         )
 
     if seed is None:
-        seed = torch.randint(low=0, high=2**62, size=(1,), dtype=torch.int64).item()
+        seed = generate_dropout_seed()
     num_warps: int = min(max(BLOCK_D * BLOCK_H // 256, 1), 8)
     # pyre-ignore[28]
     _group_norm_mul_dropout_fwd[(N,)](
@@ -2205,7 +2207,7 @@ def helion_layer_norm_mul_dropout_fwd(
     N, D = x.shape
 
     if seed is None:
-        seed = torch.randint(low=0, high=2**62, size=(1,), dtype=torch.int64).item()
+        seed = generate_dropout_seed()
 
     if concat_ux:
         y = torch.empty([N, 3 * D], dtype=x.dtype, device=x.device)
@@ -2469,7 +2471,7 @@ def helion_layer_norm_mul_dropout_bwd(
         )
     dx = torch.empty_like(x)
     du = torch.empty_like(u)
-    sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+    sms = get_sm_count()
     tile_num = max(1, min(sms * 64, N // 4))
     _dweight = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
     _dbias = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)

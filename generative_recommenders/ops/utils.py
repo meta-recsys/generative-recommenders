@@ -16,9 +16,14 @@
 
 # pyre-strict
 
+import functools
+import random
+
 import torch
 
 
+@torch.compiler.assume_constant_result
+@functools.lru_cache(maxsize=1)
 def is_sm100_plus() -> bool:
     """
     Check if this is a Blackwell Datacenter GPU.
@@ -30,12 +35,36 @@ def is_sm100_plus() -> bool:
     return props.major == 10 and (props.minor >= 0 and props.minor <= 3)
 
 
+@torch.compiler.assume_constant_result
+@functools.lru_cache(maxsize=1)
 def is_sm90() -> bool:
+    """
+    Check if this is an H100 GPU (SM 9.0).
+    """
     if not torch.cuda.is_available():
         return False
     props = torch.cuda.get_device_properties(0)
     return props.major == 9 and props.minor == 0
 
 
+@torch.compiler.assume_constant_result
+@functools.lru_cache(maxsize=1)
 def is_sm90_plus() -> bool:
+    """
+    Check if this is an H100 GPU (SM 9.0) or newer (Blackwell).
+    """
     return is_sm100_plus() or is_sm90()
+
+
+@torch.compiler.assume_constant_result
+@functools.lru_cache(maxsize=1)
+def get_sm_count() -> int:
+    """
+    Get the number of streaming multiprocessors (SMs) on the current GPU.
+    """
+    return torch.cuda.get_device_properties(0).multi_processor_count
+
+
+def generate_dropout_seed() -> int:
+    """Generate a random seed for dropout operations."""
+    return random.randrange(0, 2**62)
