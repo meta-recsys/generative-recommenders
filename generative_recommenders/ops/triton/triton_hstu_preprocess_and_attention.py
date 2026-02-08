@@ -59,7 +59,9 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         recompute_normed_x_in_backward: bool,
         sort_by_length: bool,
         enable_tma: bool,
+        num_softmax_heads: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert num_softmax_heads == 0, "Softmax attention is not supported"
         normed_x, x_mean, x_rstd, BLOCK_D = triton_weighted_layer_norm_fwd(
             x=x,
             weight=norm_weight,
@@ -100,6 +102,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             contextual_seq_len=contextual_seq_len,
             sort_by_length_indices=sort_by_length_indices,
             enable_tma=enable_tma,
+            num_softmax_heads=num_softmax_heads,
         )
         # update ctx
         saved_tensors = [
@@ -137,6 +140,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         ctx.contextual_seq_len = contextual_seq_len
         ctx.sort_by_length = sort_by_length
         ctx.enable_tma = enable_tma
+        ctx.num_softmax_heads = num_softmax_heads
         return silu_u, out
 
     @staticmethod
@@ -245,6 +249,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             contextual_seq_len=ctx.contextual_seq_len,
             sort_by_length_indices=sort_by_length_indices,
             enable_tma=ctx.enable_tma,
+            num_softmax_heads=ctx.num_softmax_heads,
         )
         if dq.data_ptr() != _dq.data_ptr():
             dq.copy_(_dq)

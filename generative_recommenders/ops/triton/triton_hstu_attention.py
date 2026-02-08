@@ -2569,6 +2569,7 @@ def triton_hstu_attention_fwd(
     contextual_seq_len: int,
     sort_by_length_indices: Optional[torch.Tensor],
     enable_tma: bool,
+    num_softmax_heads: int,
 ) -> torch.Tensor:
     Z = seq_offsets.numel() - 1
     AUTOTUNE_Z = prev_power_of_2(Z)
@@ -2678,6 +2679,7 @@ def triton_hstu_attention_bwd(
     contextual_seq_len: int,
     sort_by_length_indices: Optional[torch.Tensor],
     enable_tma: bool,
+    num_softmax_heads: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     dout = switch_to_contiguous_if_needed(dout)
     dq = switch_to_contiguous_if_needed(dq)
@@ -2813,6 +2815,7 @@ class _AttentionFunction(torch.autograd.Function):
             contextual_seq_len=contextual_seq_len,
             sort_by_length_indices=sort_by_length_indices,
             enable_tma=enable_tma,
+            num_softmax_heads=0,
         )
 
     @staticmethod
@@ -2864,6 +2867,7 @@ class _AttentionFunction(torch.autograd.Function):
                 contextual_seq_len=ctx.contextual_seq_len,
                 sort_by_length_indices=sort_by_length_indices,
                 enable_tma=ctx.enable_tma,
+                num_softmax_heads=0,
             )
             return (
                 None,
