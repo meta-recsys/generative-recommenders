@@ -99,13 +99,28 @@ def _generate_random_mask(
     STRIDE: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    # NOTE: This function appears to be incomplete/unused - kept for compatibility
+    """Generate random dropout masks for (N_MASK, D) shaped tensors.
+
+    This kernel processes 4 rows at a time using rand4x for efficiency.
+    Each program instance handles rows [pid*4, pid*4+3].
+
+    Args:
+        MASK_BUFFER: Output buffer for boolean dropout masks
+        N_MASK: Number of rows to generate masks for
+        dropout_ratio: Probability of dropping (0 = keep all, 1 = drop all)
+        seed: Random seed for reproducibility
+        D: Feature size
+        STRIDE: Row stride of the output buffer
+        BLOCK_D: Block size for column processing (power of 2 >= D)
+    """
+    # Use int32 for RNG offset calculation (overflow only causes duplicate randoms, not crashes)
     pid = tl.program_id(0)
     cols = tl.arange(0, BLOCK_D)
     col_mask = cols < D
     random_offsets = pid * BLOCK_D + cols
     rand1, rand2, rand3, rand4 = tl.rand4x(seed, random_offsets)
-    start_row = pid * 4
+    # Convert to int64 only for address arithmetic to prevent IMA
+    start_row = pid.to(tl.int64) * 4
     MASK_BUFFER += start_row * STRIDE
     row_mask = start_row < N_MASK
     mask1 = rand1 > dropout_ratio
@@ -194,14 +209,17 @@ def _ln_mul_dropout_fwd_rng(
     rows = start_row + tl.arange(0, BLOCK_N)
     row_mask = rows < N
 
-    mean = tl.sum(x_block, axis=1) / D
+    # Pre-compute inv_D to replace divisions with multiplications (optimization)
+    inv_D = 1.0 / D
+
+    mean = tl.sum(x_block, axis=1) * inv_D
     tl.store(Mean + rows, mean, mask=row_mask)
     mean = tl.expand_dims(mean, 1)
 
     x_mean = x_block - mean
     x_mean = tl.where(row_mask[:, None] & col_mask[None, :], x_mean, 0.0)
     _var = x_mean * x_mean
-    var = tl.sum(_var, axis=1) / D
+    var = tl.sum(_var, axis=1) * inv_D
     rstd = 1 / tl.sqrt(var + eps)
     tl.store(Rstd + rows, rstd, mask=row_mask)
     rstd = tl.expand_dims(rstd, 1)
@@ -211,70 +229,87 @@ def _ln_mul_dropout_fwd_rng(
     b = tl.load(B + cols, mask=col_mask).to(tl.float32)
     y = y * w[None, :] + b[None, :]
 
+    # Pre-compute sigmoid once to avoid redundant computation
+    sigmoid_u_block = tl.sigmoid(u_block)
+    silu_u_block = u_block * sigmoid_u_block
+
     if MUL_U_ACTIVATION_TYPE == "silu":
-        # pyre-fixme[16]
-        silu_u_activation_block = u_block * tl.sigmoid(u_block)
-        y = y * silu_u_activation_block
+        y = y * silu_u_block
     elif MUL_U_ACTIVATION_TYPE == "sigmoid":
-        # pyre-fixme[16]
-        sigmoid_u_activation_block = tl.sigmoid(u_block)
-        y = y * sigmoid_u_activation_block
+        y = y * sigmoid_u_block
     else:
         y = y * u_block
 
     if CONCAT_U and SILU_U:
         # pyre-fixme[16]
-        u_block = u_block * tl.sigmoid(u_block)
+        u_block = silu_u_block
 
     if TRAINING:
-        row_offsets = start_row + tl.arange(0, BLOCK_N)
+        row_offsets = (start_row + tl.arange(0, BLOCK_N)).to(tl.int64)
         col_offsets = tl.arange(0, BLOCK_D)
+        # Pre-compute dropout scale once to avoid repeated divisions
+        dropout_scale = 1.0 / (1.0 - dropout_ratio)
         if CONCAT_U and CONCAT_X:
-            # Load precomputed random masks for u, x, y
-            u_offsets = row_offsets[:, None] * stride_mask + col_offsets[None, :]
-            x_offsets = (row_offsets[:, None] + N) * stride_mask + col_offsets[None, :]
-            y_offsets = (row_offsets[:, None] + 2 * N) * stride_mask + col_offsets[
+            # Load precomputed random masks for u, x, y from (3*N, D) format
+            # Layout: interleaved mask rows:
+            # - rows 3n: u_mask for data row n
+            # - rows 3n+1: x_mask for data row n
+            # - rows 3n+2: y_mask for data row n
+            mask = (row_offsets[:, None] < N) & (col_offsets[None, :] < D)
+
+            # Calculate offsets for each mask using interleaved layout
+            # Each row n in the block accesses mask rows 3n, 3n+1, 3n+2
+
+            u_offsets = (3 * row_offsets[:, None]) * stride_mask + col_offsets[None, :]
+            x_offsets = (3 * row_offsets[:, None] + 1) * stride_mask + col_offsets[
+                None, :
+            ]
+            y_offsets = (3 * row_offsets[:, None] + 2) * stride_mask + col_offsets[
                 None, :
             ]
 
-            mask = (row_offsets[:, None] < N) & (col_offsets[None, :] < D)
-
             u_keep = tl.load(RANDOM_MASK + u_offsets, mask=mask, other=True)
             x_keep = tl.load(RANDOM_MASK + x_offsets, mask=mask, other=True)
             y_keep = tl.load(RANDOM_MASK + y_offsets, mask=mask, other=True)
 
-            u_block = tl.where(u_keep, u_block / (1.0 - dropout_ratio), 0.0)
-            x_block = tl.where(x_keep, x_block / (1.0 - dropout_ratio), 0.0)
-            y = tl.where(y_keep, y / (1.0 - dropout_ratio), 0.0)
+            u_block = tl.where(u_keep, u_block * dropout_scale, 0.0)
+            x_block = tl.where(x_keep, x_block * dropout_scale, 0.0)
+            y = tl.where(y_keep, y * dropout_scale, 0.0)
         elif CONCAT_U:
             # Load precomputed random mask for u, y
-            u_offsets = row_offsets[:, None] * stride_mask + col_offsets[None, :]
-            y_offsets = (row_offsets[:, None] + N) * stride_mask + col_offsets[None, :]
+            # Interleaved 2x layout: rows 2n for u, rows 2n+1 for y
+            u_offsets = (2 * row_offsets[:, None]) * stride_mask + col_offsets[None, :]
+            y_offsets = (2 * row_offsets[:, None] + 1) * stride_mask + col_offsets[
+                None, :
+            ]
             mask = (row_offsets[:, None] < N) & (col_offsets[None, :] < D)
 
             u_keep = tl.load(RANDOM_MASK + u_offsets, mask=mask, other=True)
             y_keep = tl.load(RANDOM_MASK + y_offsets, mask=mask, other=True)
 
-            u_block = tl.where(u_keep, u_block / (1.0 - dropout_ratio), 0.0)
-            y = tl.where(y_keep, y / (1.0 - dropout_ratio), 0.0)
+            u_block = tl.where(u_keep, u_block * dropout_scale, 0.0)
+            y = tl.where(y_keep, y * dropout_scale, 0.0)
         elif CONCAT_X:
             # Load precomputed random mask for x, y
-            x_offsets = row_offsets[:, None] * stride_mask + col_offsets[None, :]
-            y_offsets = (row_offsets[:, None] + N) * stride_mask + col_offsets[None, :]
+            # Interleaved 2x layout: rows 2n for x, rows 2n+1 for y
+            x_offsets = (2 * row_offsets[:, None]) * stride_mask + col_offsets[None, :]
+            y_offsets = (2 * row_offsets[:, None] + 1) * stride_mask + col_offsets[
+                None, :
+            ]
             mask = (row_offsets[:, None] < N) & (col_offsets[None, :] < D)
 
             x_keep = tl.load(RANDOM_MASK + x_offsets, mask=mask, other=True)
             y_keep = tl.load(RANDOM_MASK + y_offsets, mask=mask, other=True)
 
-            x_block = tl.where(x_keep, x_block / (1.0 - dropout_ratio), 0.0)
-            y = tl.where(y_keep, y / (1.0 - dropout_ratio), 0.0)
+            x_block = tl.where(x_keep, x_block * dropout_scale, 0.0)
+            y = tl.where(y_keep, y * dropout_scale, 0.0)
         else:
             # Load precomputed random mask for y
             y_offsets = row_offsets[:, None] * stride_mask + col_offsets[None, :]
             mask = (row_offsets[:, None] < N) & (col_offsets[None, :] < D)
 
             y_keep = tl.load(RANDOM_MASK + y_offsets, mask=mask, other=True)
-            y = tl.where(y_keep, y / (1.0 - dropout_ratio), 0.0)
+            y = tl.where(y_keep, y * dropout_scale, 0.0)
 
     if CONCAT_U and CONCAT_X:
         Y_block_ptr_u = tl.make_block_ptr(
@@ -536,27 +571,43 @@ def _ln_mul_dropout_bwd_dx_du_rng(
     mask = cols < D
 
     row = pid
-    X += row.to(tl.int64) * stride_x
-    U += row.to(tl.int64) * stride_u
+    # Pre-compute row and pid as int64 once for initial pointer setup
+    row_i64 = row.to(tl.int64)
+    pid_i64 = pid.to(tl.int64)
+    X += row_i64 * stride_x
+    U += row_i64 * stride_u
     if COMPUTE_Y:
-        Y += row.to(tl.int64) * stride_y
-    DY += row.to(tl.int64) * stride_dy
-    DX += row.to(tl.int64) * stride_dx
-    DU += row.to(tl.int64) * stride_du
-    DW = DW + pid * D + cols
-    DB = DB + pid * D + cols
+        Y += row_i64 * stride_y
+    DY += row_i64 * stride_dy
+    DX += row_i64 * stride_dx
+    DU += row_i64 * stride_du
+    DW = DW + pid_i64 * D + cols
+    DB = DB + pid_i64 * D + cols
 
     num_random = 1
     if CONCAT_U:
         num_random += 1
     if CONCAT_X:
         num_random += 1
-    RANDOM_MASK += row.to(tl.int64) * stride_mask * num_random
+
+    # Pre-compute stride_mask * num_random for loop increment (loop-invariant)
+    mask_stride_per_row = stride_mask * num_random
+    RANDOM_MASK += row_i64 * mask_stride_per_row
 
     partial_dw = tl.zeros((BLOCK_D,), dtype=tl.float32)
     partial_db = tl.zeros((BLOCK_D,), dtype=tl.float32)
     w = tl.load(W + cols, mask=mask).to(tl.float32)
     b = tl.load(B + cols, mask=mask).to(tl.float32)
+
+    dropout_scale = 0.0
+    if TRAINING:
+        dropout_scale = 1.0 / (1.0 - dropout_ratio)
+
+    # Pre-compute inv_D to replace divisions with multiplications (optimization)
+    inv_D = 1.0 / D
+
+    # Pre-compute tile_num as int64 to avoid repeated conversion in the loop
+    tile_num_i64 = tile_num.to(tl.int64)
     for _ in range(0, rows_per_tile):
         # Load data to SRAM
         x = tl.load(X + cols, mask=mask, other=0).to(tl.float32)
@@ -564,6 +615,14 @@ def _ln_mul_dropout_bwd_dx_du_rng(
             du = tl.load(DY + cols, mask=mask, other=0).to(tl.float32)
             dx = tl.load(DY + D + cols, mask=mask, other=0).to(tl.float32)
             dy = tl.load(DY + 2 * D + cols, mask=mask, other=0).to(tl.float32)
+        elif CONCAT_U:
+            du = tl.load(DY + cols, mask=mask, other=0).to(tl.float32)
+            dx = tl.zeros([BLOCK_D], dtype=tl.float32)
+            dy = tl.load(DY + D + cols, mask=mask, other=0).to(tl.float32)
+        elif CONCAT_X:
+            du = tl.zeros([BLOCK_D], dtype=tl.float32)
+            dx = tl.load(DY + cols, mask=mask, other=0).to(tl.float32)
+            dy = tl.load(DY + D + cols, mask=mask, other=0).to(tl.float32)
         else:
             du = tl.zeros([BLOCK_D], dtype=tl.float32)
             dx = tl.zeros([BLOCK_D], dtype=tl.float32)
@@ -571,6 +630,7 @@ def _ln_mul_dropout_bwd_dx_du_rng(
         if TRAINING:
             if CONCAT_U and CONCAT_X:
                 # Load dropout masks for u, x, y from pre-generated mask tensor
+                # Interleaved 3x layout: rows 3n for u, rows 3n+1 for x, rows 3n+2 for y
                 du_keep = tl.load(RANDOM_MASK + cols, mask=mask, other=True)
                 dx_keep = tl.load(
                     RANDOM_MASK + stride_mask + cols, mask=mask, other=True
@@ -578,27 +638,29 @@ def _ln_mul_dropout_bwd_dx_du_rng(
                 dy_keep = tl.load(
                     RANDOM_MASK + 2 * stride_mask + cols, mask=mask, other=True
                 )
-                du = tl.where(du_keep, du / (1.0 - dropout_ratio), 0.0)
-                dx = tl.where(dx_keep, dx / (1.0 - dropout_ratio), 0.0)
-                dy = tl.where(dy_keep, dy / (1.0 - dropout_ratio), 0.0)
+                du = tl.where(du_keep, du * dropout_scale, 0.0)
+                dx = tl.where(dx_keep, dx * dropout_scale, 0.0)
+                dy = tl.where(dy_keep, dy * dropout_scale, 0.0)
             elif CONCAT_U:
+                # Interleaved 2x layout: rows 2n for u, rows 2n+1 for y
                 du_keep = tl.load(RANDOM_MASK + cols, mask=mask, other=True)
                 dy_keep = tl.load(
                     RANDOM_MASK + stride_mask + cols, mask=mask, other=True
                 )
-                du = tl.where(du_keep, du / (1.0 - dropout_ratio), 0.0)
-                dy = tl.where(dy_keep, dy / (1.0 - dropout_ratio), 0.0)
+                du = tl.where(du_keep, du * dropout_scale, 0.0)
+                dy = tl.where(dy_keep, dy * dropout_scale, 0.0)
             elif CONCAT_X:
+                # Interleaved 2x layout: rows 2n for x, rows 2n+1 for y
                 dx_keep = tl.load(RANDOM_MASK + cols, mask=mask, other=True)
                 dy_keep = tl.load(
                     RANDOM_MASK + stride_mask + cols, mask=mask, other=True
                 )
-                dx = tl.where(dx_keep, dx / (1.0 - dropout_ratio), 0.0)
-                dy = tl.where(dy_keep, dy / (1.0 - dropout_ratio), 0.0)
+                dx = tl.where(dx_keep, dx * dropout_scale, 0.0)
+                dy = tl.where(dy_keep, dy * dropout_scale, 0.0)
             else:
                 # Load dropout mask directly instead of generating random numbers
                 dy_keep = tl.load(RANDOM_MASK + cols, mask=mask, other=True)
-                dy = tl.where(dy_keep, dy / (1.0 - dropout_ratio), 0.0)
+                dy = tl.where(dy_keep, dy * dropout_scale, 0.0)
 
         mean = tl.load(Mean + row)
         rstd = tl.load(Rstd + row)
@@ -610,22 +672,28 @@ def _ln_mul_dropout_bwd_dx_du_rng(
         du_y = dy * ln
         mul_u = u
         sig_u = tl.sigmoid(u)
-        silu_u = u * sig_u
+
+        # Pre-compute commonly used expressions to avoid redundant computation
+        silu_u = u * sig_u  # silu(u) - used multiple times
+        dsig_u = sig_u * (1.0 - sig_u)  # sigmoid derivative - used multiple times
+        dsilu_u = sig_u + silu_u * (
+            1.0 - sig_u
+        )  # silu derivative - used multiple times
 
         if MUL_U_ACTIVATION_TYPE == "silu":
             mul_u = silu_u
-            du_y = dy * ln * (sig_u + silu_u * (1.0 - sig_u))
+            du_y = dy * ln * dsilu_u
             dy = dy * silu_u
         elif MUL_U_ACTIVATION_TYPE == "sigmoid":
             mul_u = sig_u
-            du_y = dy * ln * sig_u * (1.0 - sig_u)
+            du_y = dy * ln * dsig_u
             dy = dy * sig_u
         else:
             dy = dy * u
 
         du_u = du
         if CONCAT_U and SILU_U:
-            du_u *= sig_u + silu_u * (1.0 - sig_u)
+            du_u *= dsilu_u
             u = silu_u
 
         du = du_y + du_u
@@ -639,18 +707,18 @@ def _ln_mul_dropout_bwd_dx_du_rng(
                 if CONCAT_U:
                     u = tl.where(
                         du_keep,  # pyre-ignore [61]
-                        u / (1.0 - dropout_ratio),
+                        u * dropout_scale,
                         0.0,
                     )
                 if CONCAT_X:
                     x = tl.where(
                         dx_keep,  # pyre-ignore [61]
-                        x / (1.0 - dropout_ratio),
+                        x * dropout_scale,
                         0.0,
                     )
                 y = tl.where(
                     dy_keep,  # pyre-ignore [61]
-                    y / (1.0 - dropout_ratio),
+                    y * dropout_scale,
                     0.0,
                 )
             if CONCAT_U and CONCAT_X:
@@ -665,12 +733,12 @@ def _ln_mul_dropout_bwd_dx_du_rng(
                 tl.store(Y + D + cols, y.to(Y.dtype.element_ty), mask=mask)
             else:
                 tl.store(Y + cols, y.to(Y.dtype.element_ty), mask=mask)
-            Y += tile_num.to(tl.int64) * stride_y
+            Y += tile_num_i64 * stride_y
 
-        xhat = tl.where(mask, xhat, 0.0)
-        wdy = tl.where(mask, wdy, 0.0)
-        c1 = tl.sum(xhat * wdy, axis=0) / D
-        c2 = tl.sum(wdy, axis=0) / D
+        # Note: xhat and wdy are already 0 outside valid range due to masked loads,
+        # so no additional tl.where masking is needed before reduction
+        c1 = tl.sum(xhat * wdy, axis=0) * inv_D
+        c2 = tl.sum(wdy, axis=0) * inv_D
         dx += (wdy - (xhat * c1 + c2)) * rstd
         # Write dx
         tl.store(DX + cols, dx, mask=mask)
@@ -678,12 +746,13 @@ def _ln_mul_dropout_bwd_dx_du_rng(
         # Accumulate partial sums for dw/db
         partial_dw += dy * xhat
         partial_db += dy
-        X += tile_num.to(tl.int64) * stride_x
-        U += tile_num.to(tl.int64) * stride_u
-        DY += tile_num.to(tl.int64) * stride_dy
-        DX += tile_num.to(tl.int64) * stride_dx
-        DU += tile_num.to(tl.int64) * stride_du
-        RANDOM_MASK += tile_num.to(tl.int64) * stride_mask * num_random
+        X += tile_num_i64 * stride_x
+        U += tile_num_i64 * stride_u
+        DY += tile_num_i64 * stride_dy
+        DX += tile_num_i64 * stride_dx
+        DU += tile_num_i64 * stride_du
+        # Increment mask pointer using pre-computed stride
+        RANDOM_MASK += tile_num_i64 * mask_stride_per_row
         row += tile_num
     tl.store(DW, partial_dw, mask=mask)
     tl.store(DB, partial_db, mask=mask)
@@ -936,7 +1005,7 @@ def _ln_mul_dropout_bwd_dwdb(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    pid = tl.program_id(0).to(tl.int64)
     cols = pid * BLOCK_D + tl.arange(0, BLOCK_D)
     dw = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
     db = tl.zeros((BLOCK_N, BLOCK_D), dtype=tl.float32)
@@ -955,6 +1024,50 @@ def _ln_mul_dropout_bwd_dwdb(
     tl.store(FINAL_DB + cols, sum_db.to(FINAL_DB.dtype.element_ty), mask=cols < D)
 
 
+def _create_dropout_mask(
+    N: int,
+    D: int,
+    BLOCK_D: int,
+    concat_u: bool,
+    concat_x: bool,
+    dropout_ratio: float,
+    seed: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Create dropout mask tensor for layer norm mul dropout.
+
+    Args:
+        N: Number of rows
+        D: Feature dimension
+        BLOCK_D: Block size for D dimension
+        concat_u: Whether to concatenate u
+        concat_x: Whether to concatenate x
+        dropout_ratio: Dropout ratio
+        seed: Random seed
+        device: Device to create tensor on
+
+    Returns:
+        random_mask: Boolean tensor with shape depending on concat flags:
+            - (3*N, D) if concat_u and concat_x (interleaved u, x, y masks)
+            - (2*N, D) if concat_u or concat_x (interleaved masks)
+            - (N, D) otherwise (y mask only)
+    """
+    # Determine mask multiplier based on concat flags
+    num_masks = 1 + int(concat_u) + int(concat_x)
+    N_MASK = num_masks * N
+    random_mask = torch.empty([N_MASK, D], dtype=torch.bool, device=device)
+    _generate_random_mask[(triton.cdiv(N_MASK, 4),)](
+        random_mask,
+        N_MASK,
+        dropout_ratio,
+        seed,
+        D,  # pyre-ignore[6]
+        random_mask.stride(0),  # pyre-ignore[6]
+        BLOCK_D,  # pyre-fixme[6]: Triton constexpr param
+    )
+    return random_mask
+
+
 def triton_layer_norm_mul_dropout_fwd(
     x: torch.Tensor,
     u: torch.Tensor,
@@ -969,8 +1082,30 @@ def triton_layer_norm_mul_dropout_fwd(
     mul_u_activation_type: str = "none",
     seed: Optional[int] = None,
 ) -> Tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, int, int, int
-]:  # y, mean, rstd, BLOCK_D, num_warps, seed
+    torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, Optional[torch.Tensor]
+]:  # y, mean, rstd, BLOCK_D, num_warps, seed, random_mask
+    """Forward pass for layer norm + mul + dropout.
+
+    Args:
+        x: Input tensor of shape (N, D)
+        u: Second input tensor of shape (N, D)
+        weight: Layer norm weight of shape (D,)
+        bias: Layer norm bias of shape (D,)
+        eps: Layer norm epsilon
+        dropout_ratio: Dropout probability
+        training: Whether in training mode
+        silu_u: Whether to apply SiLU to u before concatenation
+        concat_u: Whether to concatenate u to output
+        concat_x: Whether to concatenate x to output
+        mul_u_activation_type: Activation type for u multiplication
+        seed: Random seed for dropout
+
+    Returns:
+        Tuple of (y, mean, rstd, BLOCK_D, num_warps, seed, random_mask)
+        - random_mask is None when using fused RNG path (non-SM100+)
+        - random_mask is always returned when using separate RNG path (SM100+)
+          for reuse in backward pass (avoids redundant mask generation)
+    """
     assert x.dim() == 2
     x = switch_to_contiguous_if_needed(x)
     N, D = x.shape
@@ -990,7 +1125,7 @@ def triton_layer_norm_mul_dropout_fwd(
     mean = torch.empty((N,), dtype=torch.float32, device=x.device)
     rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
     if N == 0:
-        return y, mean, rstd, 0, 0, 0
+        return y, mean, rstd, 0, 0, 0, None
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()
     BLOCK_D: int = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
@@ -998,28 +1133,25 @@ def triton_layer_norm_mul_dropout_fwd(
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
 
     if seed is None and training:
+        # pyre-ignore[9]: torch.randint with dtype=int64 always returns int
         seed = torch.randint(low=0, high=2**62, size=(1,), dtype=torch.int64).item()
     num_warps: int = min(max(BLOCK_D // 256, 1), 8)
-    sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+    random_mask: Optional[torch.Tensor] = None
     # Benchmark shows separating RNG from ln_mul_dropout kernel only benefits on
     # blackwell when CONCAT_UX is enabled. (fused RNG kernel can benefit from rand3x fast
     # dropout)
-    if (
-        not FUSE_OUTPUT_LN_RNG_BLACKWELL
-        and is_sm100_plus()
-        and (not concat_u and not concat_x)
-        and training
-    ):
-        random_mask = torch.empty([N, D], dtype=torch.bool, device=x.device)
-
-        _generate_random_mask[(triton.cdiv(N, 4),)](
-            random_mask,
-            N,
-            dropout_ratio,
-            seed,
-            D,  # pyre-ignore [6]
-            random_mask.stride(0),  # pyre-ignore [6]
-            BLOCK_D,  # pyre-ignore [6]
+    # Extended to support concat_u + concat_x for mask reuse optimization
+    if not FUSE_OUTPUT_LN_RNG_BLACKWELL and is_sm100_plus() and training:
+        random_mask = _create_dropout_mask(
+            N=N,
+            D=D,
+            BLOCK_D=BLOCK_D,
+            concat_u=concat_u,
+            concat_x=concat_x,
+            dropout_ratio=dropout_ratio,
+            # pyre-ignore[6]: seed is int from torch.randint with dtype=int64
+            seed=seed,
+            device=x.device,
         )
 
         def grid(META):
@@ -1051,7 +1183,13 @@ def triton_layer_norm_mul_dropout_fwd(
             MUL_U_ACTIVATION_TYPE=mul_u_activation_type,
         )
 
+        # Note: We ALWAYS keep random_mask on SM100+ path for internal backward reuse.
+        # The mask is already generated; keeping it avoids redundant _generate_random_mask
+        # in backward pass.
+
     else:
+        # Default path: fused RNG generation
+        # Mask cannot be saved with fused RNG - it's generated inline in the kernel
         # pyre-ignore[28]
         _ln_mul_dropout_fwd[(N,)](
             x,
@@ -1077,7 +1215,7 @@ def triton_layer_norm_mul_dropout_fwd(
             FAST_DROPOUT=COMPUTE_OUTPUT_LN_FAST_DROPOUT,
             num_warps=num_warps,
         )
-    return y, mean, rstd, BLOCK_D, num_warps, seed  # pyre-ignore [7]
+    return y, mean, rstd, BLOCK_D, num_warps, seed, random_mask  # pyre-ignore[7]
 
 
 def triton_layer_norm_mul_dropout_bwd(
@@ -1099,6 +1237,7 @@ def triton_layer_norm_mul_dropout_bwd(
     concat_x: bool = False,
     mul_u_activation_type: str = "none",
     compute_y: bool = False,
+    random_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]
 ]:
@@ -1130,24 +1269,9 @@ def triton_layer_norm_mul_dropout_bwd(
     dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
     dbias = torch.empty((D,), dtype=weight.dtype, device=x.device)
 
-    if (
-        not FUSE_OUTPUT_LN_RNG_BLACKWELL
-        and is_sm100_plus()
-        and (not concat_u and not concat_x)
-        and training
-    ):
-        random_mask = torch.empty([N, D], dtype=torch.bool, device=x.device)
-
-        _generate_random_mask[(triton.cdiv(N, 4),)](
-            random_mask,
-            N,
-            dropout_ratio,
-            seed,
-            D,  # pyre-ignore [6]
-            random_mask.stride(0),  # pyre-ignore [6]
-            BLOCK_D,  # pyre-ignore [6]
-        )
-
+    # Use separated RNG when random_mask is provided (from forward pass on SM100+ path)
+    # Note: On SM100+ path, forward should ALWAYS pass the mask, avoiding regeneration here.
+    if random_mask is not None:
         # pyre-ignore[28]
         _ln_mul_dropout_bwd_dx_du_rng[(tile_num,)](
             dx,
@@ -1260,24 +1384,40 @@ class LayerNormMulDropoutFunction(torch.autograd.Function):
             training = False
         # skipping supporting concat_u and concat_x separately here because seems like this code path is only used in v1 of hstu_linear
         concat_u, concat_x = concat_ux, concat_ux
-        y, mean, rstd, BLOCK_D, num_warps, seed = triton_layer_norm_mul_dropout_fwd(
-            x=x,
-            u=u,
-            weight=weight,
-            bias=bias,
-            eps=eps,
-            dropout_ratio=dropout_ratio,
-            training=training,
-            silu_u=silu_u,
-            concat_u=concat_u,
-            concat_x=concat_x,
-            seed=seed,
+
+        # Call forward function which generates and returns random_mask
+        # On SM100+ path, random_mask is always returned for backward reuse
+        # On fused RNG path, random_mask is None (mask generated inline in kernel)
+        y, mean, rstd, BLOCK_D, num_warps, returned_seed, random_mask = (
+            triton_layer_norm_mul_dropout_fwd(
+                x=x,
+                u=u,
+                weight=weight,
+                bias=bias,
+                eps=eps,
+                dropout_ratio=dropout_ratio,
+                training=training,
+                silu_u=silu_u,
+                concat_u=concat_u,
+                concat_x=concat_x,
+                seed=seed,
+            )
         )
-        ctx.save_for_backward(x, u, weight, bias, mean, rstd)
+
+        # Save tensors for backward pass
+        # When random_mask is generated (SM100+ path), always save it for reuse
+        # in backward pass. This avoids redundant _generate_random_mask execution.
+        if random_mask is not None:
+            ctx.save_for_backward(x, u, weight, bias, mean, rstd, random_mask)
+            ctx.has_random_mask = True
+        else:
+            ctx.save_for_backward(x, u, weight, bias, mean, rstd)
+            ctx.has_random_mask = False
+
         ctx.BLOCK_D = BLOCK_D
         ctx.num_warps = num_warps
         ctx.eps = eps
-        ctx.seed = seed
+        ctx.seed = returned_seed
         ctx.training = training
         ctx.concat_ux = concat_ux
         ctx.silu_u = silu_u
@@ -1300,7 +1440,13 @@ class LayerNormMulDropoutFunction(torch.autograd.Function):
         None,
         None,
     ]:
-        x, u, weight, bias, mean, rstd = ctx.saved_tensors
+        # Extract saved tensors including optional random mask
+        if ctx.has_random_mask:
+            x, u, weight, bias, mean, rstd, random_mask = ctx.saved_tensors
+        else:
+            x, u, weight, bias, mean, rstd = ctx.saved_tensors
+            random_mask = None
+
         dx, du, dweight, dbias, _ = triton_layer_norm_mul_dropout_bwd(
             dy=dy,
             x=x,
@@ -1319,6 +1465,7 @@ class LayerNormMulDropoutFunction(torch.autograd.Function):
             concat_u=ctx.concat_ux,
             concat_x=ctx.concat_ux,
             compute_y=False,
+            random_mask=random_mask,  # Pass saved mask to backward
         )
         return dx, du, dweight, dbias, None, None, None, None, None, None
 
@@ -1940,20 +2087,22 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
                 )
             )
             ctx.BLOCK_H = BLOCK_H
+            random_mask = None
         else:
-            y, mean, rstd, BLOCK_D, num_warps, seed = triton_layer_norm_mul_dropout_fwd(
-                x=attn,
-                u=u,
-                weight=norm_weight,
-                bias=norm_bias,
-                eps=eps,
-                dropout_ratio=dropout_ratio,
-                training=training,
-                silu_u=silu_u,
-                concat_u=concat_u,
-                concat_x=concat_x,
-                mul_u_activation_type=mul_u_activation_type,
-                seed=seed,
+            y, mean, rstd, BLOCK_D, num_warps, seed, random_mask = (
+                triton_layer_norm_mul_dropout_fwd(
+                    x=attn,
+                    u=u,
+                    weight=norm_weight,
+                    bias=norm_bias,
+                    eps=eps,
+                    dropout_ratio=dropout_ratio,
+                    training=training,
+                    silu_u=silu_u,
+                    concat_u=concat_u,
+                    concat_x=concat_x,
+                    seed=seed,
+                )
             )
 
         out = maybe_triton_addmm_fwd(x=y, w=output_weight, y=x)
@@ -1961,6 +2110,13 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
         saved_tensors = [attn, u, norm_weight, norm_bias, mean, rstd, output_weight]
         if not recompute_y_in_backward:
             saved_tensors.append(y)
+        # Save random_mask for reuse in backward pass (avoids regenerating mask)
+        # When random_mask is available (SM100+ path), always save it.
+        if random_mask is not None:
+            saved_tensors.append(random_mask)
+            ctx.has_random_mask = True
+        else:
+            ctx.has_random_mask = False
         ctx.save_for_backward(*saved_tensors)
         ctx.BLOCK_D = BLOCK_D
         ctx.num_warps = num_warps
@@ -1989,22 +2145,33 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
         torch.Tensor,  # d_norm_weight
         torch.Tensor,  # d_norm_bias
         torch.Tensor,  # d_output_weight
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+        None,  # eps
+        None,  # dropout_ratio
+        None,  # training
+        None,  # silu_u
+        None,  # concat_u
+        None,  # concat_x
+        None,  # mul_u_activation_type
+        None,  # group_norm
+        None,  # num_heads
+        None,  # linear_dim
+        None,  # seed
+        None,  # recompute_y_in_backward
     ]:
         attn, u, norm_weight, norm_bias, mean, rstd, output_weight = ctx.saved_tensors[
             :7
         ]
+        # Extract optional saved tensors based on flags
+        next_idx = 7
+        if not ctx.recompute_y_in_backward:
+            saved_y = ctx.saved_tensors[next_idx]
+            next_idx += 1
+        else:
+            saved_y = None
+        if ctx.has_random_mask:
+            random_mask = ctx.saved_tensors[next_idx]
+        else:
+            random_mask = None
         dy = torch.mm(dout, output_weight.t())
 
         if ctx.group_norm:
@@ -2052,10 +2219,11 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
                     concat_x=ctx.concat_x,
                     mul_u_activation_type=ctx.mul_u_activation_type,
                     compute_y=ctx.recompute_y_in_backward,
+                    random_mask=random_mask,
                 )
             )
         if not ctx.recompute_y_in_backward:
-            y = ctx.saved_tensors[7]
+            y = saved_y
         d_output_weight = torch.mm(y.t(), dout)
         return (
             dattn,
@@ -2064,18 +2232,18 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
             d_norm_weight,
             d_norm_bias,
             d_output_weight,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None,  # eps
+            None,  # dropout_ratio
+            None,  # training
+            None,  # silu_u
+            None,  # concat_u
+            None,  # concat_x
+            None,  # mul_u_activation_type
+            None,  # group_norm
+            None,  # num_heads
+            None,  # linear_dim
+            None,  # seed
+            None,  # recompute_y_in_backward
         )
 
 
