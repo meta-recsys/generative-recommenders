@@ -141,17 +141,20 @@ class TimestampLayerNormPostprocessor(OutputPostprocessor):
 
         timestamps = timestamps.unsqueeze(-1)
         period_units = _unsqueeze_if_needed(period_units, combined_embeddings)
-        units_per_period = _unsqueeze_if_needed(units_per_period, combined_embeddings)
+        units_per_period = _unsqueeze_if_needed(
+            units_per_period, combined_embeddings
+        ).float()
+        # Compute time features in float32 to avoid bf16 precision loss through
+        # discontinuous floor/remainder ops, matching Inductor fusion behavior.
+        _units_elapsed_type: torch.dtype = combined_embeddings.dtype
         _units_since_epoch = torch.div(
-            timestamps, period_units, rounding_mode="floor"
+            timestamps.float(), period_units.float(), rounding_mode="floor"
         )  # [sum(N_i), num_time_features] or [B, N, num_time_features]
         _units_elapsed = (
             (torch.remainder(_units_since_epoch, units_per_period) / units_per_period)
             * 2
             * 3.14
         )
-        # Note: `torch.polar` does not support bfloat16 datatype
-        _units_elapsed_type: torch.dtype = _units_elapsed.dtype
         _units_elapsed = torch.view_as_real(
             torch.polar(
                 _cast_dtype(torch.ones_like(_units_elapsed), torch.float32),
@@ -171,6 +174,9 @@ class TimestampLayerNormPostprocessor(OutputPostprocessor):
         seq_payloads: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
         user_embeddings = self._time_feature_combiner(
-            self._concat_time_features(seq_embeddings, timestamps=seq_timestamps)
+            self._concat_time_features(seq_embeddings, timestamps=seq_timestamps).to(
+                self._time_feature_combiner.weight.dtype  # pyre-fixme[6]: For 1st argument expected `dtype` but got `Union[dtype,
+                #  Tensor, Module]`.
+            )
         )
         return self._layer_norm(user_embeddings)
