@@ -26,7 +26,7 @@ from generative_recommenders.ops.triton.triton_addmm import (
 from generative_recommenders.ops.triton.triton_layer_norm import (
     triton_weighted_layer_norm_bwd,
 )
-from generative_recommenders.ops.utils import is_sm100_plus
+from generative_recommenders.ops.utils import copy_if_different_ptr, is_sm100_plus
 from torch.nn import functional as F
 
 try:
@@ -202,10 +202,8 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 cos_rope=k_cos_weights,
                 sin_rope=k_sin_weights,
             ).view(-1, num_heads * attn_dim)
-            if q.data_ptr() != _q.data_ptr():
-                q.copy_(_q)
-            if k.data_ptr() != _k.data_ptr():
-                k.copy_(_k)
+            copy_if_different_ptr(q, _q)
+            copy_if_different_ptr(k, _k)
         q = q.view(-1, num_heads, attn_dim)
         k = k.view(-1, num_heads, attn_dim)
         v = v.view(-1, num_heads, hidden_dim)
@@ -597,17 +595,13 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 cos_rope=k_cos_weights,
                 sin_rope=k_sin_weights,
             )
-        if dq.data_ptr() != _dq.data_ptr():
-            dq.copy_(_dq)
-        if dk.data_ptr() != _dk.data_ptr():
-            dk.copy_(_dk)
-        if dv.data_ptr() != _dv.data_ptr():
-            dv.copy_(_dv)
+        copy_if_different_ptr(dq, _dq)
+        copy_if_different_ptr(dk, _dk)
+        copy_if_different_ptr(dv, _dv)
         if ctx.silu_u:
             torch.ops.aten.silu_backward(_du, u, grad_input=du)
         else:
-            if du.data_ptr() != _du.data_ptr():
-                du.copy_(_du)
+            copy_if_different_ptr(du, _du)
         d_normed_x, d_uvqk_weight, d_uvqk_bias = triton_addmm_bwd(
             x=normed_x,
             w=uvqk_weight,
