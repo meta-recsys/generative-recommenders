@@ -92,56 +92,50 @@ def rand3x(seed, offsets, n_rounds: tl.constexpr = 10):  # pyre-ignore [9]
 @triton.jit
 def _generate_random_mask(
     MASK_BUFFER,
-    N_MASK,
+    N,
     dropout_ratio,
     seed,
     D: tl.constexpr,
     STRIDE: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    NUM_MASKS: tl.constexpr,
 ):
-    """Generate random dropout masks for (N_MASK, D) shaped tensors.
+    """Generate bit-packed dropout masks for (N, D) tensors. Outputs int8.
 
-    This kernel processes 4 rows at a time using rand4x for efficiency.
-    Each program instance handles rows [pid*4, pid*4+3].
-
-    Args:
-        MASK_BUFFER: Output buffer for boolean dropout masks
-        N_MASK: Number of rows to generate masks for
-        dropout_ratio: Probability of dropping (0 = keep all, 1 = drop all)
-        seed: Random seed for reproducibility
-        D: Feature size
-        STRIDE: Row stride of the output buffer
-        BLOCK_D: Block size for column processing (power of 2 >= D)
+    Processes 4 rows per program using rand4x. Mask j occupies bit j.
+    Extraction: y = val & 1, x = val & 2, u = val & 4.
     """
-    # Use int32 for RNG offset calculation (overflow only causes duplicate randoms, not crashes)
     pid = tl.program_id(0)
     cols = tl.arange(0, BLOCK_D)
     col_mask = cols < D
-    random_offsets = pid * BLOCK_D + cols
-    rand1, rand2, rand3, rand4 = tl.rand4x(seed, random_offsets)
-    # Convert to int64 only for address arithmetic to prevent IMA
     start_row = pid.to(tl.int64) * 4
-    MASK_BUFFER += start_row * STRIDE
-    row_mask = start_row < N_MASK
-    mask1 = rand1 > dropout_ratio
-    tl.store(MASK_BUFFER + cols, mask1, mask=row_mask & col_mask)
-    row_mask = (start_row + 1) < N_MASK
-    mask2 = rand2 > dropout_ratio
-    tl.store(MASK_BUFFER + STRIDE + cols, mask2, mask=row_mask & col_mask)
-    row_mask = (start_row + 2) < N_MASK
-    mask3 = rand3 > dropout_ratio
-    tl.store(
-        MASK_BUFFER + 2 * STRIDE + cols,
-        mask3,
-        mask=row_mask & col_mask,
-    )
-    row_mask = (start_row + 3) < N_MASK
-    mask4 = rand4 > dropout_ratio
-    tl.store(
-        MASK_BUFFER + 3 * STRIDE + cols,
-        mask4,
-        mask=row_mask & col_mask,
-    )
+
+    base_ptr = MASK_BUFFER + start_row * STRIDE + cols
+    row0_mask = (start_row < N) & col_mask
+    row1_mask = ((start_row + 1) < N) & col_mask
+    row2_mask = ((start_row + 2) < N) & col_mask
+    row3_mask = ((start_row + 3) < N) & col_mask
+
+    # Each pid uses NUM_MASKS consecutive BLOCK_D chunks for Philox offsets
+    rand_offset = pid * (NUM_MASKS * BLOCK_D) + cols
+
+    packed0 = tl.zeros([BLOCK_D], dtype=tl.int8)
+    packed1 = tl.zeros([BLOCK_D], dtype=tl.int8)
+    packed2 = tl.zeros([BLOCK_D], dtype=tl.int8)
+    packed3 = tl.zeros([BLOCK_D], dtype=tl.int8)
+
+    for j in tl.static_range(NUM_MASKS):
+        r0, r1, r2, r3 = tl.rand4x(seed, rand_offset)
+        packed0 |= (r0 > dropout_ratio).to(tl.int8) << j
+        packed1 |= (r1 > dropout_ratio).to(tl.int8) << j
+        packed2 |= (r2 > dropout_ratio).to(tl.int8) << j
+        packed3 |= (r3 > dropout_ratio).to(tl.int8) << j
+        rand_offset += BLOCK_D
+
+    tl.store(base_ptr, packed0, mask=row0_mask)
+    tl.store(base_ptr + STRIDE, packed1, mask=row1_mask)
+    tl.store(base_ptr + 2 * STRIDE, packed2, mask=row2_mask)
+    tl.store(base_ptr + 3 * STRIDE, packed3, mask=row3_mask)
 
 
 @triton_autotune(
@@ -208,6 +202,8 @@ def _ln_mul_dropout_fwd_rng(
     col_mask = cols < D
     rows = start_row + tl.arange(0, BLOCK_N)
     row_mask = rows < N
+    # Pre-compute 2D mask for reuse in dropout and masked operations
+    mask_2d = row_mask[:, None] & col_mask[None, :]
 
     # Pre-compute inv_D to replace divisions with multiplications (optimization)
     inv_D = 1.0 / D
@@ -217,7 +213,7 @@ def _ln_mul_dropout_fwd_rng(
     mean = tl.expand_dims(mean, 1)
 
     x_mean = x_block - mean
-    x_mean = tl.where(row_mask[:, None] & col_mask[None, :], x_mean, 0.0)
+    x_mean = tl.where(mask_2d, x_mean, 0.0)
     _var = x_mean * x_mean
     var = tl.sum(_var, axis=1) * inv_D
     rstd = 1 / tl.sqrt(var + eps)
@@ -245,70 +241,39 @@ def _ln_mul_dropout_fwd_rng(
         u_block = silu_u_block
 
     if TRAINING:
-        row_offsets = (start_row + tl.arange(0, BLOCK_N)).to(tl.int64)
-        col_offsets = tl.arange(0, BLOCK_D)
-        # Pre-compute dropout scale once to avoid repeated divisions
+        # Reuse rows (as int64 for pointer arithmetic) and pre-computed mask_2d
+        row_offsets_i64 = rows.to(tl.int64)
+        # Pre-compute loop-invariant values
         dropout_scale = 1.0 / (1.0 - dropout_ratio)
-        if CONCAT_U and CONCAT_X:
-            # Load precomputed random masks for u, x, y from (3*N, D) format
-            # Layout: interleaved mask rows:
-            # - rows 3n: u_mask for data row n
-            # - rows 3n+1: x_mask for data row n
-            # - rows 3n+2: y_mask for data row n
-            mask = (row_offsets[:, None] < N) & (col_offsets[None, :] < D)
+        offsets = row_offsets_i64[:, None] * stride_mask + cols[None, :]
 
-            # Calculate offsets for each mask using interleaved layout
-            # Each row n in the block accesses mask rows 3n, 3n+1, 3n+2
+        if CONCAT_U or CONCAT_X:
+            # All 2+ mask cases use compressed int8 format - load once
+            compressed = tl.load(RANDOM_MASK + offsets, mask=mask_2d, other=0).to(
+                tl.int32
+            )
+            # Bit 0 is always y_mask
+            y_keep = (compressed & 1) != 0
 
-            u_offsets = (3 * row_offsets[:, None]) * stride_mask + col_offsets[None, :]
-            x_offsets = (3 * row_offsets[:, None] + 1) * stride_mask + col_offsets[
-                None, :
-            ]
-            y_offsets = (3 * row_offsets[:, None] + 2) * stride_mask + col_offsets[
-                None, :
-            ]
+            if CONCAT_U and CONCAT_X:
+                # 3-mask: (u_mask << 2) | (x_mask << 1) | y_mask
+                x_keep = (compressed & 2) != 0
+                u_keep = (compressed & 4) != 0
+                u_block = tl.where(u_keep, u_block * dropout_scale, 0.0)
+                x_block = tl.where(x_keep, x_block * dropout_scale, 0.0)
+            elif CONCAT_U:
+                # 2-mask: (u_mask << 1) | y_mask
+                u_keep = (compressed & 2) != 0
+                u_block = tl.where(u_keep, u_block * dropout_scale, 0.0)
+            else:  # CONCAT_X
+                # 2-mask: (x_mask << 1) | y_mask
+                x_keep = (compressed & 2) != 0
+                x_block = tl.where(x_keep, x_block * dropout_scale, 0.0)
 
-            u_keep = tl.load(RANDOM_MASK + u_offsets, mask=mask, other=True)
-            x_keep = tl.load(RANDOM_MASK + x_offsets, mask=mask, other=True)
-            y_keep = tl.load(RANDOM_MASK + y_offsets, mask=mask, other=True)
-
-            u_block = tl.where(u_keep, u_block * dropout_scale, 0.0)
-            x_block = tl.where(x_keep, x_block * dropout_scale, 0.0)
-            y = tl.where(y_keep, y * dropout_scale, 0.0)
-        elif CONCAT_U:
-            # Load precomputed random mask for u, y
-            # Interleaved 2x layout: rows 2n for u, rows 2n+1 for y
-            u_offsets = (2 * row_offsets[:, None]) * stride_mask + col_offsets[None, :]
-            y_offsets = (2 * row_offsets[:, None] + 1) * stride_mask + col_offsets[
-                None, :
-            ]
-            mask = (row_offsets[:, None] < N) & (col_offsets[None, :] < D)
-
-            u_keep = tl.load(RANDOM_MASK + u_offsets, mask=mask, other=True)
-            y_keep = tl.load(RANDOM_MASK + y_offsets, mask=mask, other=True)
-
-            u_block = tl.where(u_keep, u_block * dropout_scale, 0.0)
-            y = tl.where(y_keep, y * dropout_scale, 0.0)
-        elif CONCAT_X:
-            # Load precomputed random mask for x, y
-            # Interleaved 2x layout: rows 2n for x, rows 2n+1 for y
-            x_offsets = (2 * row_offsets[:, None]) * stride_mask + col_offsets[None, :]
-            y_offsets = (2 * row_offsets[:, None] + 1) * stride_mask + col_offsets[
-                None, :
-            ]
-            mask = (row_offsets[:, None] < N) & (col_offsets[None, :] < D)
-
-            x_keep = tl.load(RANDOM_MASK + x_offsets, mask=mask, other=True)
-            y_keep = tl.load(RANDOM_MASK + y_offsets, mask=mask, other=True)
-
-            x_block = tl.where(x_keep, x_block * dropout_scale, 0.0)
             y = tl.where(y_keep, y * dropout_scale, 0.0)
         else:
-            # Load precomputed random mask for y
-            y_offsets = row_offsets[:, None] * stride_mask + col_offsets[None, :]
-            mask = (row_offsets[:, None] < N) & (col_offsets[None, :] < D)
-
-            y_keep = tl.load(RANDOM_MASK + y_offsets, mask=mask, other=True)
+            # 1-mask: y_mask at bit 0
+            y_keep = tl.load(RANDOM_MASK + offsets, mask=mask_2d, other=True)
             y = tl.where(y_keep, y * dropout_scale, 0.0)
 
     if CONCAT_U and CONCAT_X:
@@ -584,15 +549,8 @@ def _ln_mul_dropout_bwd_dx_du_rng(
     DW = DW + pid_i64 * D + cols
     DB = DB + pid_i64 * D + cols
 
-    num_random = 1
-    if CONCAT_U:
-        num_random += 1
-    if CONCAT_X:
-        num_random += 1
-
-    # Pre-compute stride_mask * num_random for loop increment (loop-invariant)
-    mask_stride_per_row = stride_mask * num_random
-    RANDOM_MASK += row_i64 * mask_stride_per_row
+    # Pre-compute mask pointer offset (all cases use stride_mask for (N, D) shape)
+    RANDOM_MASK += row_i64 * stride_mask
 
     partial_dw = tl.zeros((BLOCK_D,), dtype=tl.float32)
     partial_db = tl.zeros((BLOCK_D,), dtype=tl.float32)
@@ -628,37 +586,30 @@ def _ln_mul_dropout_bwd_dx_du_rng(
             dx = tl.zeros([BLOCK_D], dtype=tl.float32)
             dy = tl.load(DY + cols, mask=mask, other=0).to(tl.float32)
         if TRAINING:
-            if CONCAT_U and CONCAT_X:
-                # Load dropout masks for u, x, y from pre-generated mask tensor
-                # Interleaved 3x layout: rows 3n for u, rows 3n+1 for x, rows 3n+2 for y
-                du_keep = tl.load(RANDOM_MASK + cols, mask=mask, other=True)
-                dx_keep = tl.load(
-                    RANDOM_MASK + stride_mask + cols, mask=mask, other=True
+            if CONCAT_U or CONCAT_X:
+                # All 2+ mask cases use compressed int8 format - load once
+                compressed = tl.load(RANDOM_MASK + cols, mask=mask, other=0).to(
+                    tl.int32
                 )
-                dy_keep = tl.load(
-                    RANDOM_MASK + 2 * stride_mask + cols, mask=mask, other=True
-                )
-                du = tl.where(du_keep, du * dropout_scale, 0.0)
-                dx = tl.where(dx_keep, dx * dropout_scale, 0.0)
-                dy = tl.where(dy_keep, dy * dropout_scale, 0.0)
-            elif CONCAT_U:
-                # Interleaved 2x layout: rows 2n for u, rows 2n+1 for y
-                du_keep = tl.load(RANDOM_MASK + cols, mask=mask, other=True)
-                dy_keep = tl.load(
-                    RANDOM_MASK + stride_mask + cols, mask=mask, other=True
-                )
-                du = tl.where(du_keep, du * dropout_scale, 0.0)
-                dy = tl.where(dy_keep, dy * dropout_scale, 0.0)
-            elif CONCAT_X:
-                # Interleaved 2x layout: rows 2n for x, rows 2n+1 for y
-                dx_keep = tl.load(RANDOM_MASK + cols, mask=mask, other=True)
-                dy_keep = tl.load(
-                    RANDOM_MASK + stride_mask + cols, mask=mask, other=True
-                )
-                dx = tl.where(dx_keep, dx * dropout_scale, 0.0)
+                dy_keep = (compressed & 1) != 0  # Bit 0 always y_mask
+
+                if CONCAT_U and CONCAT_X:
+                    # Format: (u_mask << 2) | (x_mask << 1) | y_mask
+                    dx_keep = (compressed & 2) != 0
+                    du_keep = (compressed & 4) != 0
+                    du = tl.where(du_keep, du * dropout_scale, 0.0)
+                    dx = tl.where(dx_keep, dx * dropout_scale, 0.0)
+                elif CONCAT_U:
+                    # Format: (u_mask << 1) | y_mask
+                    du_keep = (compressed & 2) != 0
+                    du = tl.where(du_keep, du * dropout_scale, 0.0)
+                else:  # CONCAT_X
+                    # Format: (x_mask << 1) | y_mask
+                    dx_keep = (compressed & 2) != 0
+                    dx = tl.where(dx_keep, dx * dropout_scale, 0.0)
                 dy = tl.where(dy_keep, dy * dropout_scale, 0.0)
             else:
-                # Load dropout mask directly instead of generating random numbers
+                # 1-mask: y_mask at bit 0
                 dy_keep = tl.load(RANDOM_MASK + cols, mask=mask, other=True)
                 dy = tl.where(dy_keep, dy * dropout_scale, 0.0)
 
@@ -751,8 +702,8 @@ def _ln_mul_dropout_bwd_dx_du_rng(
         DY += tile_num_i64 * stride_dy
         DX += tile_num_i64 * stride_dx
         DU += tile_num_i64 * stride_du
-        # Increment mask pointer using pre-computed stride
-        RANDOM_MASK += tile_num_i64 * mask_stride_per_row
+        # Increment mask pointer
+        RANDOM_MASK += tile_num_i64 * stride_mask
         row += tile_num
     tl.store(DW, partial_dw, mask=mask)
     tl.store(DB, partial_db, mask=mask)
@@ -1047,23 +998,22 @@ def _create_dropout_mask(
         device: Device to create tensor on
 
     Returns:
-        random_mask: Boolean tensor with shape depending on concat flags:
-            - (3*N, D) if concat_u and concat_x (interleaved u, x, y masks)
-            - (2*N, D) if concat_u or concat_x (interleaved masks)
-            - (N, D) otherwise (y mask only)
+        random_mask: (N, D) int8 tensor. Mask j at bit j.
+
+    Bit layout: y = val & 1, x = val & 2, u = val & 4.
     """
-    # Determine mask multiplier based on concat flags
     num_masks = 1 + int(concat_u) + int(concat_x)
-    N_MASK = num_masks * N
-    random_mask = torch.empty([N_MASK, D], dtype=torch.bool, device=device)
-    _generate_random_mask[(triton.cdiv(N_MASK, 4),)](
+    # Torch uses 1 byte for bool internally, same as int8, so always use int8.
+    random_mask = torch.empty([N, D], dtype=torch.int8, device=device)
+    _generate_random_mask[(triton.cdiv(N, 4),)](
         random_mask,
-        N_MASK,
+        N,
         dropout_ratio,
         seed,
         D,  # pyre-ignore[6]
         random_mask.stride(0),  # pyre-ignore[6]
         BLOCK_D,  # pyre-fixme[6]: Triton constexpr param
+        num_masks,  # pyre-ignore[6]: NUM_MASKS constexpr
     )
     return random_mask
 
