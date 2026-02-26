@@ -42,14 +42,16 @@ try:
     )
 
     if is_sm100_plus():
+        print("is sm100_plus architecture, loading hstu flash attention for blackwell")
         torch.ops.load_library(
             "//generative_recommenders/fb/ultra/ops/blackwell/hstu_attention:hstu_flash_attention"
         )
+    print("loading hstu flash attention for general architecture")
     torch.ops.load_library(
         "//generative_recommenders/ops/cpp/hstu_attention:hstu_flash_attention"
     )
-except ImportError:
-    pass
+except ImportError as ex:
+    print(f"Library importing error when importing library: {ex}")
 
 
 class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
