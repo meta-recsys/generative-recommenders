@@ -43,6 +43,8 @@ except OSError:
 CUDA_JAGGED_DENSE_BMM_FWD = False
 CUDA_JAGGED_DENSE_BMM_BWD = False
 
+SPLIT_2D_JAGGED_KERNEL = None
+
 
 def set_cuda_jagged_dense_bmm_fwd(value: bool) -> None:
     global CUDA_JAGGED_DENSE_BMM_FWD
@@ -62,6 +64,18 @@ def set_cuda_jagged_dense_bmm_bwd(value: bool) -> None:
 def get_cuda_jagged_dense_bmm_bwd() -> bool:
     # currently only supports H100
     return CUDA_JAGGED_DENSE_BMM_BWD and is_sm90()
+
+
+def set_split_2d_jagged_kernel(value: Optional[str]) -> None:
+    global SPLIT_2D_JAGGED_KERNEL
+    SPLIT_2D_JAGGED_KERNEL = value
+
+
+def get_split_2d_jagged_kernel() -> Optional[str]:
+    # only override during training
+    if torch.is_grad_enabled():
+        return SPLIT_2D_JAGGED_KERNEL
+    return None
 
 
 def _triton_concat_2D_jagged_internal(
@@ -1679,6 +1693,23 @@ def triton_split_2D_jagged(
     )
 
 
+@torch.jit.unused
+def helion_split_2D_jagged(
+    values: torch.Tensor,
+    max_seq_len: int,
+    offsets_a: Optional[torch.Tensor] = None,
+    offsets_b: Optional[torch.Tensor] = None,
+    dense_size: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return _HelionSplit2DJaggedFunction.apply(
+        values,
+        max_seq_len,
+        offsets_a,
+        offsets_b,
+        dense_size,
+    )
+
+
 @triton.jit
 def concat_2D_jagged_w_prefix_multirow(
     OffsetsA,
@@ -2187,7 +2218,74 @@ def _helion_split_2d_jagged_kernel(
             tl.store(out_b_flat + out_b_idx * 1, slice_b, mask_b)
 
 
-def helion_split_2D_jagged(
+class _HelionSplit2DJaggedFunction(torch.autograd.Function):
+    @staticmethod
+    # pyre-ignore[14]
+    def forward(
+        ctx,
+        values: torch.Tensor,
+        max_seq_len: int,
+        offsets_a: torch.Tensor,
+        offsets_b: torch.Tensor,
+        dense_size: int = 0,  # noqa: F841
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        values = switch_to_contiguous_if_needed(values)
+        B = offsets_a.shape[0] - 1
+        D = values.size(1)
+
+        # TODO: maybe check if torch.compiler.is_compiling() and use index_select instead
+        seq_len_a = int(offsets_a[-1].item())
+        seq_len_b = int(offsets_b[-1].item())
+
+        values_a, values_b = _helion_split_2D_jagged_impl(
+            values=values,
+            max_seq_len=max_seq_len,
+            offsets_a=offsets_a,
+            offsets_b=offsets_b,
+            dense_size=dense_size,
+        )
+
+        ctx.save_for_backward(offsets_a, offsets_b)
+        ctx.max_seq_len = max_seq_len
+        ctx.seq_len_a = seq_len_a
+        ctx.seq_len_b = seq_len_b
+        ctx.dense_size = dense_size
+        ctx.B = B
+        ctx.D = D
+        return values_a, values_b
+
+    @staticmethod
+    def backward(ctx, *d_values) -> Tuple[torch.Tensor, None, None, None, None]:
+        offsets_a, offsets_b = ctx.saved_tensors
+        values_a, values_b = d_values
+        BLOCK_D = triton.next_power_of_2(ctx.D)
+
+        dvalues = torch.empty(
+            (ctx.seq_len_a + ctx.seq_len_b, ctx.D),
+            device=values_a.device,
+            dtype=values_a.dtype,
+        )
+        _triton_concat_2D_jagged_internal(
+            values_a=values_a,
+            values_b=values_b,
+            values_out=dvalues,
+            max_seq_len=ctx.max_seq_len,
+            B=ctx.B,
+            offsets_a=offsets_a,
+            offsets_b=offsets_b,
+            D=ctx.D,
+            dense_size=0,
+            stride_dense_batch=0,
+            n_prefix=0,
+            is_dense_a=False,
+            is_dense_b=False,
+            is_replace=False,
+            BLOCK_D=BLOCK_D,
+        )
+        return dvalues, None, None, None, None
+
+
+def _helion_split_2D_jagged_impl(
     values: torch.Tensor,
     max_seq_len: int,
     offsets_a: torch.Tensor,
