@@ -1993,7 +1993,6 @@ struct CollectiveMainloopFwdSm90 {
           softmax.template max_get_scale</*Is_first=*/false, Check_inf>(tSrS),
           scores_scale);
       softmax.template online_softmax</*Is_first=*/false, Check_inf>(tSrS);
-      softmax.rescale_o(tOrO, scores_scale);
       warpgroup_wait<0>();
       pipeline_v.consumer_release(smem_pipe_read_v); // release V
       if constexpr (Is_FP8 && !V_colmajor) {
@@ -2003,6 +2002,7 @@ struct CollectiveMainloopFwdSm90 {
       if constexpr (Is_FP8 && V_colmajor) {
         hstu::permute_Aregs_fp8(tOrP);
       }
+      softmax.rescale_o(tOrO, scores_scale);
       if constexpr (!Mma1_is_RS) {
         cute::copy(smem_tiled_copy_P, smem_thr_copy_P.retile_S(tOrP), tPsP);
       }
@@ -2164,10 +2164,10 @@ struct CollectiveMainloopFwdSm90 {
         tOrV(_, _, _, smem_pipe_read.index()),
         tOrO);
     cute::copy(softmax.finalize(1.0f), scores_scale);
-    softmax.rescale_o(tOrO, scores_scale);
     warpgroup_wait<0>();
     pipeline_v.consumer_release(
         smem_pipe_read); // release V, otherwise producers will hang
+    softmax.rescale_o(tOrO, scores_scale);
     if constexpr (Is_FP8 && !V_colmajor) {
       hstu::permute_output_fp8(tOrO);
     }
