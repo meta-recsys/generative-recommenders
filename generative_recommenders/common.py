@@ -115,6 +115,7 @@ class HammerKernel(Enum):
     PYTORCH = "PYTORCH"
     CUDA = "CUDA"
     TRITON_CC = "TRITON_CC"
+    CUTEDSL = "CUTEDSL"
 
 
 class HammerModule(torch.nn.Module, abc.ABC):
