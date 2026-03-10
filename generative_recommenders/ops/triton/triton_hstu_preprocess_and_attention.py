@@ -29,6 +29,7 @@ from generative_recommenders.ops.triton.triton_hstu_attention import (
     triton_hstu_attention_fwd,
 )
 from generative_recommenders.ops.triton.triton_layer_norm import (
+    compute_BLOCK_D,
     triton_weighted_layer_norm_bwd,
     triton_weighted_layer_norm_fwd,
 )
@@ -62,12 +63,13 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         num_softmax_heads: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert num_softmax_heads == 0, "Softmax attention is not supported"
-        normed_x, x_mean, x_rstd, BLOCK_D = triton_weighted_layer_norm_fwd(
+        normed_x, x_mean, x_rstd = triton_weighted_layer_norm_fwd(
             x=x,
             weight=norm_weight,
             bias=norm_bias,
             eps=norm_eps,
         )
+        BLOCK_D = compute_BLOCK_D(x)
         uvqk = maybe_triton_addmm_fwd(
             x=normed_x, w=uvqk_weight, y=uvqk_bias
         ).contiguous()
@@ -180,7 +182,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         else:
             num_targets = None
         if ctx.recompute_normed_x_in_backward:
-            normed_x, _, _, _ = triton_weighted_layer_norm_fwd(
+            normed_x, _, _ = triton_weighted_layer_norm_fwd(
                 x=x,
                 weight=norm_weight,
                 bias=norm_bias,
@@ -228,12 +230,8 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         dq = dq.view(-1, ctx.num_heads, ctx.attn_dim)
         dk = dk.view(-1, ctx.num_heads, ctx.attn_dim)
         dv = dv.view(-1, ctx.num_heads, ctx.hidden_dim)
-        # Note: the two operations below update duvqk in place
-        (
-            _dq,
-            _dk,
-            _dv,
-        ) = triton_hstu_attention_bwd(
+        # Note: the operation below updates duvqk in place
+        triton_hstu_attention_bwd(
             dout=dout,
             q=q,
             k=k,
@@ -251,12 +249,6 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             enable_tma=ctx.enable_tma,
             num_softmax_heads=ctx.num_softmax_heads,
         )
-        if dq.data_ptr() != _dq.data_ptr():
-            dq.copy_(_dq)
-        if dk.data_ptr() != _dk.data_ptr():
-            dk.copy_(_dk)
-        if dv.data_ptr() != _dv.data_ptr():
-            dv.copy_(_dv)
         torch.ops.aten.silu_backward(dsilu_u, u, grad_input=du)
         d_normed_x, d_uvqk_weight, d_uvqk_bias = triton_addmm_bwd(
             x=normed_x,

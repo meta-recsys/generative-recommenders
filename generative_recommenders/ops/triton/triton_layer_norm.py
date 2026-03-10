@@ -28,7 +28,7 @@ from generative_recommenders.common import (
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
-from generative_recommenders.ops.utils import is_sm100_plus
+from generative_recommenders.ops.utils import is_sm100_plus, maybe_register_custom_op
 
 try:
     # @manual=//triton:triton
@@ -475,6 +475,16 @@ def _layer_norm_bwd_dwdb(
     tl.store(FINAL_DB + cols, sum_db.to(FINAL_DB.dtype.element_ty), mask=cols < D)
 
 
+def compute_BLOCK_D(x: torch.Tensor) -> int:
+    """Compute the BLOCK_D parameter for layer norm kernels."""
+    D = x.shape[-1]
+    MAX_FUSED_SIZE = 65536 // x.element_size()
+    return min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
+
+
+@maybe_register_custom_op(
+    "generative_recommenders::triton_weighted_layer_norm_fwd", mutates_args=()
+)
 def triton_weighted_layer_norm_fwd(
     x: torch.Tensor,
     weight: Optional[torch.Tensor],
@@ -482,7 +492,7 @@ def triton_weighted_layer_norm_fwd(
     eps: float,
     mean: Optional[torch.Tensor] = None,
     rstd: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert x.dim() == 2, f"x.dim() == {x.dim()}, expected 2"
     x = switch_to_contiguous_if_needed(x)
     N, D = x.shape
@@ -496,10 +506,13 @@ def triton_weighted_layer_norm_fwd(
 
     y = torch.empty_like(x)
     compute_mean_and_rstd = mean is None or rstd is None
-    if mean is None:
-        mean = torch.empty((N,), dtype=torch.float32, device=x.device)
-    if rstd is None:
-        rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
+    # Always allocate new tensors to avoid aliasing inputs with outputs
+    out_mean = torch.empty((N,), dtype=torch.float32, device=x.device)
+    out_rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
+    if not compute_mean_and_rstd:
+        assert mean is not None and rstd is not None
+        out_mean.copy_(mean)
+        out_rstd.copy_(rstd)
 
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()
@@ -508,7 +521,7 @@ def triton_weighted_layer_norm_fwd(
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
 
     if N == 0:
-        return y, mean, rstd, BLOCK_D
+        return y, out_mean, out_rstd
 
     # pyre-ignore[28]
     grid = lambda meta: (  # noqa E731
@@ -520,8 +533,8 @@ def triton_weighted_layer_norm_fwd(
             y,
             weight,
             bias,
-            mean,
-            rstd,
+            out_mean,
+            out_rstd,
             N,
             D,
             eps,
@@ -536,8 +549,8 @@ def triton_weighted_layer_norm_fwd(
         _layer_norm_fwd[grid](
             x,
             y,
-            mean,
-            rstd,
+            out_mean,
+            out_rstd,
             N,
             D,
             eps,
@@ -548,23 +561,42 @@ def triton_weighted_layer_norm_fwd(
             COMPUTE_MEAN_AND_RSTD=compute_mean_and_rstd,
         )
 
-    return y, mean, rstd, BLOCK_D
+    return y, out_mean, out_rstd
 
 
-def triton_weighted_layer_norm_bwd(
-    dy: torch.Tensor,
+@triton_weighted_layer_norm_fwd.register_fake
+def _(
     x: torch.Tensor,
     weight: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
+    eps: float,
+    mean: Optional[torch.Tensor] = None,
+    rstd: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    N = x.shape[0]
+    y = torch.empty_like(x)
+    # Always allocate new tensors to avoid aliasing inputs with outputs
+    out_mean = torch.empty((N,), dtype=torch.float32, device=x.device)
+    out_rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
+    return y, out_mean, out_rstd
+
+
+@maybe_register_custom_op(
+    "generative_recommenders::triton_weighted_layer_norm_bwd", mutates_args=()
+)
+def _triton_weighted_layer_norm_bwd_impl(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
     mean: torch.Tensor,
     rstd: torch.Tensor,
     learnable: bool,
     eps: float,
     BLOCK_D: int,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_warps: int = min(max(BLOCK_D // 256, 1), 8)
     if learnable:
-        assert weight is not None and bias is not None
         N, D = x.shape
         dx = torch.empty_like(x)
         sms = torch.cuda.get_device_properties(x.device).multi_processor_count
@@ -618,8 +650,11 @@ def triton_weighted_layer_norm_bwd(
     else:
         N, D = x.shape
         dx = torch.empty_like(x)
+        # Return empty tensors as sentinels for None
+        dweight = torch.empty(0, dtype=x.dtype, device=x.device)
+        dbias = torch.empty(0, dtype=x.dtype, device=x.device)
         if N == 0:
-            return dx, None, None
+            return dx, dweight, dbias
         # pyre-ignore[28]
         _layer_norm_bwd_dx[(N,)](
             dx,
@@ -635,7 +670,62 @@ def triton_weighted_layer_norm_bwd(
             BLOCK_D=BLOCK_D,
             num_warps=num_warps,
         )
+        return dx, dweight, dbias
+
+
+@_triton_weighted_layer_norm_bwd_impl.register_fake
+def _(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    learnable: bool,
+    eps: float,
+    BLOCK_D: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dx = torch.empty_like(x)
+    if learnable:
+        D = x.shape[-1]
+        dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
+        dbias = torch.empty((D,), dtype=weight.dtype, device=x.device)
+    else:
+        dweight = torch.empty(0, dtype=x.dtype, device=x.device)
+        dbias = torch.empty(0, dtype=x.dtype, device=x.device)
+    return dx, dweight, dbias
+
+
+def triton_weighted_layer_norm_bwd(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    learnable: bool,
+    eps: float,
+    BLOCK_D: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    # Use sentinel tensors for custom_op compatibility (can't return Optional[Tensor])
+    _weight = (
+        weight if weight is not None else torch.empty(0, dtype=x.dtype, device=x.device)
+    )
+    _bias = bias if bias is not None else torch.empty(0, dtype=x.dtype, device=x.device)
+    dx, dweight, dbias = _triton_weighted_layer_norm_bwd_impl(
+        dy=dy,
+        x=x,
+        weight=_weight,
+        bias=_bias,
+        mean=mean,
+        rstd=rstd,
+        learnable=learnable,
+        eps=eps,
+        BLOCK_D=BLOCK_D,
+    )
+    if not learnable:
         return dx, None, None
+    return dx, dweight, dbias
 
 
 class LayerNormFunction(torch.autograd.Function):
@@ -648,12 +738,13 @@ class LayerNormFunction(torch.autograd.Function):
         bias: Optional[torch.Tensor],
         eps: float,
     ) -> torch.Tensor:
-        y, mean, rstd, BLOCK_D = triton_weighted_layer_norm_fwd(
+        y, mean, rstd = triton_weighted_layer_norm_fwd(
             x=x,
             weight=weight,
             bias=bias,
             eps=eps,
         )
+        BLOCK_D = compute_BLOCK_D(x)
         learnable = weight is not None
         if learnable:
             ctx.save_for_backward(x, weight, bias, mean, rstd)

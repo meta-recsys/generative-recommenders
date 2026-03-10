@@ -22,6 +22,10 @@ import triton
 
 # @manual=//triton:triton
 import triton.language as tl
+from generative_recommenders.ops.utils import (
+    copy_if_different_ptr,
+    maybe_register_custom_op,
+)
 
 try:
     # @manual=//triton:triton
@@ -2557,6 +2561,9 @@ def _hstu_attn_bwd(  # noqa C901
             )
 
 
+@maybe_register_custom_op(
+    "generative_recommenders::triton_hstu_attention_fwd", mutates_args=()
+)
 def triton_hstu_attention_fwd(
     N: int,
     alpha: float,
@@ -2663,6 +2670,10 @@ def triton_hstu_attention_fwd(
     return out
 
 
+@maybe_register_custom_op(
+    "generative_recommenders::triton_hstu_attention_bwd",
+    mutates_args=("dq", "dk", "dv"),
+)
 def triton_hstu_attention_bwd(
     dout: torch.Tensor,
     q: torch.Tensor,
@@ -2680,13 +2691,17 @@ def triton_hstu_attention_bwd(
     sort_by_length_indices: Optional[torch.Tensor],
     enable_tma: bool,
     num_softmax_heads: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> None:
+    orig_dq, orig_dk, orig_dv = dq, dk, dv
     dout = switch_to_contiguous_if_needed(dout)
     dq = switch_to_contiguous_if_needed(dq)
     dk = switch_to_contiguous_if_needed(dk)
     dv = switch_to_contiguous_if_needed(dv)
     if dout.shape[0] == 0:
-        return torch.zeros_like(q), torch.zeros_like(k), torch.zeros_like(v)
+        orig_dq.zero_()
+        orig_dk.zero_()
+        orig_dv.zero_()
+        return
     Z = seq_offsets.numel() - 1
     _, H, DimQ = q.shape
     _, _, DimV = v.shape
@@ -2764,7 +2779,52 @@ def triton_hstu_attention_bwd(
         ENABLE_BUFFER_OPS_ASSUMES=ENABLE_BUFFER_OPS_ASSUMES,
     )
 
-    return dq, dk, dv
+    copy_if_different_ptr(orig_dq, dq)
+    copy_if_different_ptr(orig_dk, dk)
+    copy_if_different_ptr(orig_dv, dv)
+
+
+@triton_hstu_attention_fwd.register_fake
+def _triton_hstu_attention_fwd_fake(
+    N: int,
+    alpha: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    num_targets: Optional[torch.Tensor],
+    max_attn_len: int,
+    contextual_seq_len: int,
+    sort_by_length_indices: Optional[torch.Tensor],
+    enable_tma: bool,
+    num_softmax_heads: int,
+) -> torch.Tensor:
+    L, H, _ = q.shape
+    _, _, DimV = v.shape
+    out = torch.empty((L, H, DimV), dtype=v.dtype, device=v.device)
+    return out
+
+
+@triton_hstu_attention_bwd.register_fake
+def _triton_hstu_attention_bwd_fake(
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    dq: torch.Tensor,
+    dk: torch.Tensor,
+    dv: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    num_targets: Optional[torch.Tensor],
+    N: int,
+    alpha: float,
+    max_attn_len: int,
+    contextual_seq_len: int,
+    sort_by_length_indices: Optional[torch.Tensor],
+    enable_tma: bool,
+    num_softmax_heads: int,
+) -> None:
+    return None
 
 
 class _AttentionFunction(torch.autograd.Function):
@@ -2851,7 +2911,7 @@ class _AttentionFunction(torch.autograd.Function):
             dq = torch.empty_like(q)
             dk = torch.empty_like(k)
             dv = torch.empty_like(v)
-            dq, dk, dv = triton_hstu_attention_bwd(
+            triton_hstu_attention_bwd(
                 dout=dout,
                 q=q,
                 k=k,

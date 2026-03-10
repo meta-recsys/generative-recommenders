@@ -14,9 +14,52 @@
 
 #!/usr/bin/env python3
 
-# pyre-strict
+# pyre-ignore-all-errors
+
+import functools
+import os
 
 import torch
+
+
+class _PlainFuncWrapper:
+    """Thin wrapper around a plain function that provides no-op register_fake
+    and register_kernel methods, mirroring the CustomOpDef API so that
+    downstream @func.register_fake / func.register_kernel("cpu") calls
+    don't break when the function is not wrapped as a custom op."""
+
+    def __init__(self, func):
+        self._func = func
+        functools.update_wrapper(self, func)
+
+    def __call__(self, *args, **kwargs):
+        return self._func(*args, **kwargs)
+
+    def register_fake(self, fake_func):
+        return fake_func
+
+    def register_kernel(self, device):
+        def inner(func):
+            return func
+
+        return inner
+
+
+def maybe_register_custom_op(op_name, mutates_args):
+    """
+    Conditionally registers a function as a torch custom op.
+
+    When AOTI_LOWER is set in the environment, the function is returned
+    unwrapped so that torch.export / Dynamo can trace through the plain
+    Python implementation instead of treating the custom op as opaque.
+    """
+
+    def decorator(func):
+        if os.environ.get("AOTI_LOWER"):
+            return _PlainFuncWrapper(func)
+        return torch.library.custom_op(op_name, func, mutates_args=mutates_args)
+
+    return decorator
 
 
 def is_sm100_plus() -> bool:

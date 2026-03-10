@@ -29,6 +29,7 @@ from generative_recommenders.common import (
     triton_autotune,
 )
 from generative_recommenders.ops.triton.triton_addmm import maybe_triton_addmm_fwd
+from generative_recommenders.ops.utils import maybe_register_custom_op
 
 
 def _get_layer_norm_mul_dropout_fwd_multirow_configs() -> List[triton.Config]:
@@ -1018,6 +1019,156 @@ def _create_dropout_mask(
     return random_mask
 
 
+@maybe_register_custom_op(
+    "generative_recommenders::_triton_layer_norm_mul_dropout_fwd_impl", mutates_args=()
+)
+def _triton_layer_norm_mul_dropout_fwd_impl(
+    x: torch.Tensor,
+    u: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+    dropout_ratio: float,
+    training: bool,
+    silu_u: bool,
+    concat_u: bool,
+    concat_x: bool,
+    mul_u_activation_type: str,
+    seed: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Internal implementation that returns only tensors for custom_op compatibility.
+
+    Returns (y, mean, rstd, random_mask) where random_mask is empty when not used.
+    """
+    N, D = x.shape
+
+    if concat_u and concat_x:
+        y = torch.empty((N, 3 * D), dtype=x.dtype, device=x.device)
+    elif concat_u:
+        y = torch.empty((N, 2 * D), dtype=x.dtype, device=x.device)
+    elif concat_x:
+        y = torch.empty((N, 2 * D), dtype=x.dtype, device=x.device)
+    else:
+        y = torch.empty_like(x)
+    mean = torch.empty((N,), dtype=torch.float32, device=x.device)
+    rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
+    if N == 0:
+        return y, mean, rstd, torch.empty(0, dtype=x.dtype, device=x.device)
+    # Less than 64KB per feature: enqueue fused kernel
+    MAX_FUSED_SIZE = 65536 // x.element_size()
+    BLOCK_D: int = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
+    if D > BLOCK_D:
+        raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+
+    num_warps: int = min(max(BLOCK_D // 256, 1), 8)
+    random_mask: torch.Tensor = torch.empty(0, dtype=x.dtype, device=x.device)
+    # Benchmark shows separating RNG from ln_mul_dropout kernel only benefits on
+    # blackwell when CONCAT_UX is enabled. (fused RNG kernel can benefit from rand3x fast
+    # dropout)
+    # Extended to support concat_u + concat_x for mask reuse optimization
+    if not FUSE_OUTPUT_LN_RNG_BLACKWELL and is_sm100_plus() and training:
+        random_mask = _create_dropout_mask(
+            N=N,
+            D=D,
+            BLOCK_D=BLOCK_D,
+            concat_u=concat_u,
+            concat_x=concat_x,
+            dropout_ratio=dropout_ratio,
+            seed=seed,
+            device=x.device,
+        )
+
+        def grid(META):
+            return (triton.cdiv(N, META["BLOCK_N"]),)
+
+        # pyre-ignore[28]
+        _ln_mul_dropout_fwd_rng[grid](
+            x,
+            u,
+            y,
+            weight,
+            bias,
+            mean,
+            rstd,
+            random_mask,
+            N,
+            D,
+            eps,
+            dropout_ratio,
+            x.stride(0),
+            u.stride(0),
+            y.stride(0),
+            random_mask.stride(0),
+            SILU_U=silu_u,
+            BLOCK_D=BLOCK_D,
+            TRAINING=training,
+            CONCAT_U=concat_u,
+            CONCAT_X=concat_x,
+            MUL_U_ACTIVATION_TYPE=mul_u_activation_type,
+        )
+
+    else:
+        # Default path: fused RNG generation
+        # Mask cannot be saved with fused RNG - it's generated inline in the kernel
+        # pyre-ignore[28]
+        _ln_mul_dropout_fwd[(N,)](
+            x,
+            u,
+            y,
+            weight,
+            bias,
+            mean,
+            rstd,
+            D,
+            eps,
+            seed,
+            dropout_ratio,
+            x.stride(0),
+            u.stride(0),
+            y.stride(0),
+            SILU_U=silu_u,
+            BLOCK_D=BLOCK_D,
+            TRAINING=training,
+            CONCAT_U=concat_u,
+            CONCAT_X=concat_x,
+            MUL_U_ACTIVATION_TYPE=mul_u_activation_type,
+            FAST_DROPOUT=COMPUTE_OUTPUT_LN_FAST_DROPOUT,
+            num_warps=num_warps,
+        )
+    return y, mean, rstd, random_mask
+
+
+@_triton_layer_norm_mul_dropout_fwd_impl.register_fake
+def _triton_layer_norm_mul_dropout_fwd_impl_fake(
+    x: torch.Tensor,
+    u: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+    dropout_ratio: float,
+    training: bool,
+    silu_u: bool,
+    concat_u: bool,
+    concat_x: bool,
+    mul_u_activation_type: str,
+    seed: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fake implementation for FakeTensor tracing."""
+    N, D = x.shape
+    if concat_u and concat_x:
+        y = torch.empty((N, 3 * D), dtype=x.dtype, device=x.device)
+    elif concat_u:
+        y = torch.empty((N, 2 * D), dtype=x.dtype, device=x.device)
+    elif concat_x:
+        y = torch.empty((N, 2 * D), dtype=x.dtype, device=x.device)
+    else:
+        y = torch.empty_like(x)
+    mean = torch.empty((N,), dtype=torch.float32, device=x.device)
+    rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
+    random_mask = torch.empty(0, dtype=x.dtype, device=x.device)
+    return y, mean, rstd, random_mask
+
+
 def triton_layer_norm_mul_dropout_fwd(
     x: torch.Tensor,
     u: torch.Tensor,
@@ -1064,18 +1215,24 @@ def triton_layer_norm_mul_dropout_fwd(
     assert weight.numel() == D
     assert bias.numel() == D
 
-    if concat_u and concat_x:
-        y = torch.empty((N, 3 * D), dtype=x.dtype, device=x.device)
-    elif concat_u:
-        y = torch.empty((N, 2 * D), dtype=x.dtype, device=x.device)
-    elif concat_x:
-        y = torch.empty((N, 2 * D), dtype=x.dtype, device=x.device)
-    else:
-        y = torch.empty_like(x)
-    mean = torch.empty((N,), dtype=torch.float32, device=x.device)
-    rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
     if N == 0:
-        return y, mean, rstd, 0, 0, 0, None
+        D = x.shape[1]
+        if concat_u and concat_x:
+            y = torch.empty((0, 3 * D), dtype=x.dtype, device=x.device)
+        elif concat_u or concat_x:
+            y = torch.empty((0, 2 * D), dtype=x.dtype, device=x.device)
+        else:
+            y = torch.empty_like(x)
+        return (
+            y,
+            torch.empty((N,), dtype=torch.float32, device=x.device),
+            torch.empty((N,), dtype=torch.float32, device=x.device),
+            0,
+            0,
+            0,
+            None,
+        )
+
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()
     BLOCK_D: int = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
@@ -1086,89 +1243,35 @@ def triton_layer_norm_mul_dropout_fwd(
         # pyre-ignore[9]: torch.randint with dtype=int64 always returns int
         seed = torch.randint(low=0, high=2**62, size=(1,), dtype=torch.int64).item()
     num_warps: int = min(max(BLOCK_D // 256, 1), 8)
-    random_mask: Optional[torch.Tensor] = None
-    # Benchmark shows separating RNG from ln_mul_dropout kernel only benefits on
-    # blackwell when CONCAT_UX is enabled. (fused RNG kernel can benefit from rand3x fast
-    # dropout)
-    # Extended to support concat_u + concat_x for mask reuse optimization
-    if not FUSE_OUTPUT_LN_RNG_BLACKWELL and is_sm100_plus() and training:
-        random_mask = _create_dropout_mask(
-            N=N,
-            D=D,
-            BLOCK_D=BLOCK_D,
-            concat_u=concat_u,
-            concat_x=concat_x,
-            dropout_ratio=dropout_ratio,
-            # pyre-ignore[6]: seed is int from torch.randint with dtype=int64
-            seed=seed,
-            device=x.device,
-        )
 
-        def grid(META):
-            return (triton.cdiv(N, META["BLOCK_N"]),)
+    # Call internal implementation
+    y, mean, rstd, random_mask_tensor = _triton_layer_norm_mul_dropout_fwd_impl(
+        x,
+        u,
+        weight,
+        bias,
+        eps,
+        dropout_ratio,
+        training,
+        silu_u,
+        concat_u,
+        concat_x,
+        mul_u_activation_type,
+        seed if seed is not None else 0,
+    )
 
-        # pyre-ignore[28]
-        _ln_mul_dropout_fwd_rng[grid](
-            x,
-            u,
-            y,
-            weight,
-            bias,
-            mean,
-            rstd,
-            random_mask,
-            N,
-            D,
-            eps,
-            dropout_ratio,
-            x.stride(0),
-            u.stride(0),
-            y.stride(0),
-            random_mask.stride(0),
-            SILU_U=silu_u,
-            BLOCK_D=BLOCK_D,
-            TRAINING=training,
-            CONCAT_U=concat_u,
-            CONCAT_X=concat_x,
-            MUL_U_ACTIVATION_TYPE=mul_u_activation_type,
-        )
+    # Convert empty tensor back to None
+    random_mask: Optional[torch.Tensor] = (
+        random_mask_tensor if random_mask_tensor.numel() > 0 else None
+    )
 
-        # Note: We ALWAYS keep random_mask on SM100+ path for internal backward reuse.
-        # The mask is already generated; keeping it avoids redundant _generate_random_mask
-        # in backward pass.
-
-    else:
-        # Default path: fused RNG generation
-        # Mask cannot be saved with fused RNG - it's generated inline in the kernel
-        # pyre-ignore[28]
-        _ln_mul_dropout_fwd[(N,)](
-            x,
-            u,
-            y,
-            weight,
-            bias,
-            mean,
-            rstd,
-            D,
-            eps,
-            seed,
-            dropout_ratio,
-            x.stride(0),
-            u.stride(0),
-            y.stride(0),
-            SILU_U=silu_u,
-            BLOCK_D=BLOCK_D,
-            TRAINING=training,
-            CONCAT_U=concat_u,
-            CONCAT_X=concat_x,
-            MUL_U_ACTIVATION_TYPE=mul_u_activation_type,
-            FAST_DROPOUT=COMPUTE_OUTPUT_LN_FAST_DROPOUT,
-            num_warps=num_warps,
-        )
     return y, mean, rstd, BLOCK_D, num_warps, seed, random_mask  # pyre-ignore[7]
 
 
-def triton_layer_norm_mul_dropout_bwd(
+@maybe_register_custom_op(
+    "generative_recommenders::_triton_layer_norm_mul_dropout_bwd_impl", mutates_args=()
+)
+def _triton_layer_norm_mul_dropout_bwd_impl(
     dy: torch.Tensor,
     x: torch.Tensor,
     u: torch.Tensor,
@@ -1181,17 +1284,19 @@ def triton_layer_norm_mul_dropout_bwd(
     eps: float,
     training: bool,
     dropout_ratio: float,
-    seed: Optional[int] = None,
-    silu_u: bool = False,
-    concat_u: bool = False,
-    concat_x: bool = False,
-    mul_u_activation_type: str = "none",
-    compute_y: bool = False,
-    random_mask: Optional[torch.Tensor] = None,
-) -> Tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]
-]:
-    y = None
+    seed: int,
+    silu_u: bool,
+    concat_u: bool,
+    concat_x: bool,
+    mul_u_activation_type: str,
+    compute_y: bool,
+    random_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Internal implementation that returns only tensors for custom_op compatibility.
+
+    When compute_y is False, y is returned as an empty tensor.
+    random_mask with numel() == 0 means no mask (fused RNG path).
+    """
     N, D = x.shape
     if compute_y:
         if concat_u and concat_x:
@@ -1202,6 +1307,9 @@ def triton_layer_norm_mul_dropout_bwd(
             y = torch.empty((N, 2 * D), dtype=x.dtype, device=x.device)
         else:
             y = torch.empty_like(x)
+    else:
+        y = torch.empty(0, dtype=x.dtype, device=x.device)
+
     if N == 0:
         return (
             torch.zeros_like(x),
@@ -1220,8 +1328,8 @@ def triton_layer_norm_mul_dropout_bwd(
     dbias = torch.empty((D,), dtype=weight.dtype, device=x.device)
 
     # Use separated RNG when random_mask is provided (from forward pass on SM100+ path)
-    # Note: On SM100+ path, forward should ALWAYS pass the mask, avoiding regeneration here.
-    if random_mask is not None:
+    has_random_mask = random_mask.numel() > 0
+    if has_random_mask:
         # pyre-ignore[28]
         _ln_mul_dropout_bwd_dx_du_rng[(tile_num,)](
             dx,
@@ -1231,7 +1339,7 @@ def triton_layer_norm_mul_dropout_bwd(
             _dbias,
             x,
             u,
-            y,
+            y if compute_y else None,
             weight,
             bias,
             mean,
@@ -1242,7 +1350,7 @@ def triton_layer_norm_mul_dropout_bwd(
             dy.stride(0),
             x.stride(0),
             u.stride(0),
-            y.stride(0) if compute_y else 0,  # pyre-ignore [16]
+            y.stride(0) if compute_y else 0,
             random_mask.stride(0),
             D,
             eps,
@@ -1268,7 +1376,7 @@ def triton_layer_norm_mul_dropout_bwd(
             _dbias,
             x,
             u,
-            y,
+            y if compute_y else None,
             weight,
             bias,
             mean,
@@ -1278,7 +1386,7 @@ def triton_layer_norm_mul_dropout_bwd(
             dy.stride(0),
             x.stride(0),
             u.stride(0),
-            y.stride(0) if compute_y else 0,  # pyre-ignore [16]
+            y.stride(0) if compute_y else 0,
             D,
             eps,
             seed,
@@ -1299,8 +1407,8 @@ def triton_layer_norm_mul_dropout_bwd(
         return (triton.cdiv(D, META["BLOCK_D"]),)
 
     blocks = triton.next_power_of_2(sms * 4)
-    BLOCK_D = triton.next_power_of_2(triton.cdiv(D, blocks))
-    BLOCK_D = min(max(BLOCK_D, 4), 128)
+    BLOCK_D_bwd = triton.next_power_of_2(triton.cdiv(D, blocks))
+    BLOCK_D_bwd = min(max(BLOCK_D_bwd, 4), 128)
     _ln_mul_dropout_bwd_dwdb[grid](
         _dweight,
         _dbias,
@@ -1308,8 +1416,109 @@ def triton_layer_norm_mul_dropout_bwd(
         dbias,
         tile_num,
         D,
-        BLOCK_D=BLOCK_D,
+        BLOCK_D=BLOCK_D_bwd,
     )
+    return dx, du, dweight, dbias, y
+
+
+@_triton_layer_norm_mul_dropout_bwd_impl.register_fake
+def _triton_layer_norm_mul_dropout_bwd_impl_fake(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    u: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    BLOCK_D: int,
+    num_warps: int,
+    eps: float,
+    training: bool,
+    dropout_ratio: float,
+    seed: int,
+    silu_u: bool,
+    concat_u: bool,
+    concat_x: bool,
+    mul_u_activation_type: str,
+    compute_y: bool,
+    random_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fake implementation for FakeTensor tracing."""
+    N, D = x.shape
+    dx = torch.empty_like(x)
+    du = torch.empty_like(u)
+    dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
+    dbias = torch.empty((D,), dtype=weight.dtype, device=x.device)
+    if compute_y:
+        if concat_u and concat_x:
+            y = torch.empty((N, 3 * D), dtype=x.dtype, device=x.device)
+        elif concat_u:
+            y = torch.empty((N, 2 * D), dtype=x.dtype, device=x.device)
+        elif concat_x:
+            y = torch.empty((N, 2 * D), dtype=x.dtype, device=x.device)
+        else:
+            y = torch.empty_like(x)
+    else:
+        y = torch.empty(0, dtype=x.dtype, device=x.device)
+    return dx, du, dweight, dbias, y
+
+
+def triton_layer_norm_mul_dropout_bwd(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    u: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    BLOCK_D: int,
+    num_warps: int,
+    eps: float,
+    training: bool,
+    dropout_ratio: float,
+    seed: Optional[int] = None,
+    silu_u: bool = False,
+    concat_u: bool = False,
+    concat_x: bool = False,
+    mul_u_activation_type: str = "none",
+    compute_y: bool = False,
+    random_mask: Optional[torch.Tensor] = None,
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]
+]:
+    N, D = x.shape
+
+    # Use empty tensor as sentinel for no random_mask
+    random_mask_tensor = (
+        random_mask
+        if random_mask is not None
+        else torch.empty(0, dtype=x.dtype, device=x.device)
+    )
+
+    dx, du, dweight, dbias, y_tensor = _triton_layer_norm_mul_dropout_bwd_impl(
+        dy,
+        x,
+        u,
+        weight,
+        bias,
+        mean,
+        rstd,
+        BLOCK_D,
+        num_warps,
+        eps,
+        training,
+        dropout_ratio,
+        seed if seed is not None else 0,
+        silu_u,
+        concat_u,
+        concat_x,
+        mul_u_activation_type,
+        compute_y,
+        random_mask_tensor,
+    )
+
+    # Convert empty tensor back to None
+    y: Optional[torch.Tensor] = y_tensor if compute_y else None
     return dx, du, dweight, dbias, y
 
 

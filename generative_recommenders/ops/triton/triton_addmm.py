@@ -25,6 +25,7 @@ import triton
 
 # @manual=//triton:triton
 import triton.language as tl
+from generative_recommenders.ops.utils import is_sm100_plus, maybe_register_custom_op
 
 try:
     # @manual=//triton:triton
@@ -36,7 +37,6 @@ except ImportError:
     HAS_TLX = False
 
 from generative_recommenders.common import triton_autotune, triton_cc
-from generative_recommenders.ops.utils import is_sm100_plus
 
 try:
     # @manual=//triton:triton
@@ -1166,7 +1166,7 @@ def triton_addmm_fwd_tma_ws_persistent_tlx(
     return z
 
 
-@torch.fx.wrap
+@maybe_register_custom_op("generative_recommenders::triton_addmm_fwd", mutates_args=())
 def triton_addmm_fwd(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -1212,6 +1212,18 @@ def triton_addmm_fwd(
     return z
 
 
+@triton_addmm_fwd.register_fake
+def triton_addmm_fwd_fake(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    y: torch.Tensor,
+) -> torch.Tensor:
+    """Fake implementation for FakeTensor tracing."""
+    M, _ = x.shape
+    _, N = w.shape
+    return torch.empty((M, N), device=x.device, dtype=x.dtype)
+
+
 def triton_addmm_bwd(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -1228,7 +1240,9 @@ def triton_addmm_bwd(
     return dx, dw, dy
 
 
-@torch.fx.wrap
+@maybe_register_custom_op(
+    "generative_recommenders::maybe_triton_addmm_fwd", mutates_args=()
+)
 def maybe_triton_addmm_fwd(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -1240,6 +1254,18 @@ def maybe_triton_addmm_fwd(
         return torch.addmm(y, x, w)
     else:
         return triton_addmm_fwd(x=x, w=w, y=y)
+
+
+@maybe_triton_addmm_fwd.register_fake
+def maybe_triton_addmm_fwd_fake(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    y: torch.Tensor,
+) -> torch.Tensor:
+    """Fake implementation for FakeTensor tracing."""
+    M, _ = x.shape
+    _, N = w.shape
+    return torch.empty((M, N), device=x.device, dtype=x.dtype)
 
 
 class _AddMmFunction(torch.autograd.Function):
