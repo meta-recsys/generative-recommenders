@@ -81,17 +81,28 @@ def _check_tma_alignment(
     return (K % min_alignment == 0) and (N % min_alignment == 0)
 
 
-def _prune_configs_for_pair_cta(configs, named_args, **kwargs):  # noqa
+def _prune_configs_for_tlx_persistent_addmm(configs, named_args, **kwargs):  # noqa
     M = named_args.get("M", 0)
     N = named_args.get("N", 0)
+    BROADCAST_Y = kwargs.get("BROADCAST_Y", False)
 
     pruned = []
     for c in configs:
         BLOCK_M = c.kwargs.get("BLOCK_M", 0)
         BLOCK_N = c.kwargs.get("BLOCK_N", 0)
+        EPILOGUE_SUBTILE = c.kwargs.get("EPILOGUE_SUBTILE", 1)
 
         # BLOCK_N >= 64 required for PAIR_CTA
         if BLOCK_N < 64:
+            continue
+
+        # Subslice loads cannot be smaller than 32
+        if (BLOCK_N // EPILOGUE_SUBTILE) < 32:
+            continue
+
+        # TMA loads must be at least 128 bytes. With BROADCAST_Y
+        # this may not be met.
+        if BROADCAST_Y and (BLOCK_N // EPILOGUE_SUBTILE) < 64:
             continue
 
         # PAIR_CTA requires even number of M tiles and even total tiles
@@ -99,7 +110,9 @@ def _prune_configs_for_pair_cta(configs, named_args, **kwargs):  # noqa
         num_tiles_n = math.ceil(N / BLOCK_N) if BLOCK_N > 0 else 0
         total_tiles = num_tiles_m * num_tiles_n
 
-        pair_cta_compatible = (num_tiles_m % 2 == 0) and (total_tiles % 2 == 0)
+        pair_cta_compatible = (
+            (num_tiles_m % 2 == 0) and (total_tiles % 2 == 0) and BLOCK_M == 128
+        )
 
         c.kwargs["PAIR_CTA"] = pair_cta_compatible
         # Set ctas_per_cga for CUDA-native cluster launch semantics (TLX way)
@@ -295,6 +308,68 @@ def get_mm_configs(pre_hook=None) -> List[triton.Config]:
             return configs
 
 
+def _get_addmm_tma_ws_persistent_configs(pre_hook=None) -> List[triton.Config]:
+    """Get configs for _addmm_fwd_tma_ws_persistent (sm100+ TLX kernel).
+
+    This kernel has unique requirements (warp specialization, PAIR_CTA,
+    EPILOGUE_SUBTILE) that don't apply to the other addmm kernels.
+    """
+    if ENABLE_FULL_TURNING_SPACE:
+        block_m_range = [64, 128]
+        block_n_range = [64, 128, 256]
+        block_k_range = [64, 128, 256]
+        group_m_range = [8]
+        num_warps_range = [4]
+        num_stage_range = [1]
+        epilogue_subtile_range = [1, 2]
+        return [
+            triton.Config(
+                {
+                    "BLOCK_M": block_m,
+                    "BLOCK_N": block_n,
+                    "BLOCK_K": block_k,
+                    "GROUP_M": group_m,
+                    "EPILOGUE_SUBTILE": epilogue_subtile,
+                },
+                num_stages=num_stages,
+                num_warps=num_warps,
+                pre_hook=pre_hook,
+            )
+            for block_m in block_m_range
+            for block_n in block_n_range
+            for block_k in block_k_range
+            for group_m in group_m_range
+            for num_stages in num_stage_range
+            for num_warps in num_warps_range
+            for epilogue_subtile in epilogue_subtile_range
+        ]
+    else:
+        configs = []
+        for block_m, block_n, block_k in [
+            (128, 256, 64),
+            (128, 128, 64),
+            (64, 128, 64),
+            (64, 256, 64),
+            (128, 64, 128),
+        ]:
+            for epilogue_subtile in [1, 2]:
+                configs.append(
+                    triton.Config(
+                        {
+                            "BLOCK_M": block_m,
+                            "BLOCK_N": block_n,
+                            "BLOCK_K": block_k,
+                            "GROUP_M": 8,
+                            "EPILOGUE_SUBTILE": epilogue_subtile,
+                        },
+                        num_stages=1,
+                        num_warps=4,
+                        pre_hook=pre_hook,
+                    ),
+                )
+        return configs
+
+
 @triton_cc(
     annotations={
         "M": "i32",
@@ -397,19 +472,12 @@ def _addmm_tma_set_block_size_hook(nargs):
         nargs["w_desc"].block_shape = [BLOCK_K, BLOCK_N // 2]
     else:
         nargs["w_desc"].block_shape = [BLOCK_K, BLOCK_N]
-    EPILOGUE_SUBTILE = nargs.get("EPILOGUE_SUBTILE", False)
-    if EPILOGUE_SUBTILE:
-        nargs["z_desc"].block_shape = [BLOCK_M, BLOCK_N // 2]
-        if nargs["BROADCAST_Y"]:
-            nargs["y_desc"].block_shape = [1, BLOCK_N // 2]
-        else:
-            nargs["y_desc"].block_shape = [BLOCK_M, BLOCK_N // 2]
+    EPILOGUE_SUBTILE = nargs.get("EPILOGUE_SUBTILE", 1)
+    nargs["z_desc"].block_shape = [BLOCK_M, BLOCK_N // EPILOGUE_SUBTILE]
+    if nargs["BROADCAST_Y"]:
+        nargs["y_desc"].block_shape = [1, BLOCK_N // EPILOGUE_SUBTILE]
     else:
-        nargs["z_desc"].block_shape = [BLOCK_M, BLOCK_N]
-        if nargs["BROADCAST_Y"]:
-            nargs["y_desc"].block_shape = [1, BLOCK_N]
-        else:
-            nargs["y_desc"].block_shape = [BLOCK_M, BLOCK_N]
+        nargs["y_desc"].block_shape = [BLOCK_M, BLOCK_N // EPILOGUE_SUBTILE]
 
 
 @triton.jit
@@ -614,9 +682,11 @@ def _addmm_fwd_tma_ws(
 
 
 @triton_autotune(
-    configs=get_mm_configs(pre_hook=_addmm_tma_set_block_size_hook),
+    configs=_get_addmm_tma_ws_persistent_configs(
+        pre_hook=_addmm_tma_set_block_size_hook
+    ),
     key=["M", "N", "K"],
-    prune_configs_by={"early_config_prune": _prune_configs_for_pair_cta},
+    prune_configs_by={"early_config_prune": _prune_configs_for_tlx_persistent_addmm},
 )
 @triton.jit
 def _addmm_fwd_tma_ws_persistent(
@@ -651,28 +721,13 @@ def _addmm_fwd_tma_ws_persistent(
     tmem_buffers = tlx.local_alloc(
         (BLOCK_M, BLOCK_N), tl.float32, NUM_TMEM_BUFFERS, tlx.storage_kind.tmem
     )
-    if EPILOGUE_SUBTILE:
-        if BROADCAST_Y:
-            y_buffer_first = tlx.local_alloc(
-                (1, BLOCK_N // 2), y_desc.dtype, tl.constexpr(1)
-            )
-            y_buffer_second = tlx.local_alloc(
-                (1, BLOCK_N // 2), y_desc.dtype, tl.constexpr(1)
-            )
-        else:
-            y_buffer_first = tlx.local_alloc(
-                (BLOCK_M, BLOCK_N // 2), y_desc.dtype, tl.constexpr(1)
-            )
-            y_buffer_second = tlx.local_alloc(
-                (BLOCK_M, BLOCK_N // 2), y_desc.dtype, tl.constexpr(1)
-            )
+    slice_size: tl.constexpr = BLOCK_N // EPILOGUE_SUBTILE
+    if BROADCAST_Y:
+        y_buffers = tlx.local_alloc((1, slice_size), y_desc.dtype, EPILOGUE_SUBTILE)
     else:
-        if BROADCAST_Y:
-            y_buffer = tlx.local_alloc((1, BLOCK_N), y_desc.dtype, tl.constexpr(1))
-        else:
-            y_buffer = tlx.local_alloc(
-                (BLOCK_M, BLOCK_N), y_desc.dtype, tl.constexpr(1)
-            )
+        y_buffers = tlx.local_alloc(
+            (BLOCK_M, slice_size), y_desc.dtype, EPILOGUE_SUBTILE
+        )
 
     if PAIR_CTA:
         cluster_cta_rank = tlx.cluster_cta_rank()
@@ -688,14 +743,8 @@ def _addmm_fwd_tma_ws_persistent(
     # Barriers for producer <-> Epilogue
     # y_load_bar: producer signals when y data is ready
     # y_empty_bar: epilogue signals when done using y buffer
-    if EPILOGUE_SUBTILE:
-        y_load_bar_first = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
-        y_load_bar_second = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
-        y_empty_bar_first = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
-        y_empty_bar_second = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
-    else:
-        y_load_bar = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
-        y_empty_bar = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
+    y_load_bars = tlx.alloc_barriers(num_barriers=EPILOGUE_SUBTILE, arrive_count=1)
+    y_empty_bars = tlx.alloc_barriers(num_barriers=EPILOGUE_SUBTILE, arrive_count=1)
 
     with tlx.async_tasks():
         # Epilogue consumer: waits for Y from producer, adds bias, stores Z
@@ -726,68 +775,33 @@ def _addmm_fwd_tma_ws_persistent(
                 # Load result from TMEM and add bias
                 acc_tmem = tmem_buffers[cur_tmem_buf]
 
-                if EPILOGUE_SUBTILE:
-                    # Wait for y loads from producer
-                    # pyre-ignore[61]
-                    y_bar_first = tlx.local_view(y_load_bar_first, 0)
-                    # pyre-ignore[61]
-                    y_bar_second = tlx.local_view(y_load_bar_second, 0)
-                    # pyre-ignore[61]
-                    y_empty_first = tlx.local_view(y_empty_bar_first, 0)
-                    # pyre-ignore[61]
-                    y_empty_second = tlx.local_view(y_empty_bar_second, 0)
-                    tlx.barrier_wait(y_bar_first, y_load_phase)
-                    tlx.barrier_wait(y_bar_second, y_load_phase)
-
-                    # Process first half of the tile
-                    acc_tmem_subslice1 = tlx.subslice(acc_tmem, 0, BLOCK_N // 2)
-                    result = tlx.local_load(acc_tmem_subslice1)
-                    # pyre-ignore[61]
-                    y_buf_first_view = tlx.local_view(y_buffer_first, 0)
-                    y = tlx.local_load(y_buf_first_view)
-                    z = (result + y.to(tl.float32)).to(z_desc.dtype)
-                    z_desc.store([offs_xm, offs_wn], z)
-
-                    # Process second half of the tile
-                    acc_tmem_subslice2 = tlx.subslice(
-                        acc_tmem, BLOCK_N // 2, BLOCK_N // 2
+                # Process each subtile slice
+                for slice_id in tl.static_range(EPILOGUE_SUBTILE):
+                    acc_subslice = tlx.subslice(
+                        acc_tmem, slice_id * slice_size, slice_size
                     )
-                    result = tlx.local_load(acc_tmem_subslice2)
-                    # pyre-ignore[61]
-                    y_buf_second_view = tlx.local_view(y_buffer_second, 0)
-                    y = tlx.local_load(y_buf_second_view)
-                    z = (result + y.to(tl.float32)).to(z_desc.dtype)
-                    z_desc.store([offs_xm, offs_wn + BLOCK_N // 2], z)
+                    result = tlx.local_load(acc_subslice)
+                    if slice_id == EPILOGUE_SUBTILE - 1:
+                        # Signal MMA that this TMEM buffer is now free
+                        tlx.barrier_arrive(tmem_empty_bars[cur_tmem_buf], 1)
 
-                    tlx.barrier_arrive(y_empty_first, 1)
-                    tlx.barrier_arrive(y_empty_second, 1)
-                    y_load_phase = y_load_phase ^ 1
-                else:
-                    # Wait for y load from producer
-                    # pyre-ignore[61]
-                    y_bar = tlx.local_view(y_load_bar, 0)
-                    # pyre-ignore[61]
-                    y_empty = tlx.local_view(y_empty_bar, 0)
+                    y_buf_view = tlx.local_view(y_buffers, slice_id)
+                    y_bar = tlx.local_view(y_load_bars, slice_id)
+                    # Wait for the bias tile to be ready.
                     tlx.barrier_wait(y_bar, y_load_phase)
-
-                    # Load y from SMEM
-                    # pyre-ignore[61]
-                    y_buf_view = tlx.local_view(y_buffer, 0)
                     y = tlx.local_load(y_buf_view)
-                    result = tlx.local_load(acc_tmem)
-                    z = (result + y.to(tl.float32)).to(z_desc.dtype)
-                    z_desc.store([offs_xm, offs_wn], z)
-
+                    y_empty = tlx.local_view(y_empty_bars, slice_id)
+                    # Signal the bias tile as free.
                     tlx.barrier_arrive(y_empty, 1)
-                    y_load_phase = y_load_phase ^ 1
+                    z = (result + y.to(tl.float32)).to(z_desc.dtype)
+                    z_desc.store([offs_xm, offs_wn + slice_id * slice_size], z)
 
-                # Signal MMA that this TMEM buffer is now free
-                tlx.barrier_arrive(tmem_empty_bars[cur_tmem_buf], 1)
+                y_load_phase = y_load_phase ^ 1
 
                 cur_tmem_buf = (cur_tmem_buf + 1) % int(NUM_TMEM_BUFFERS)
 
         # MMA consumer: performs matrix multiplication
-        with tlx.async_task(num_warps=4, num_regs=232):
+        with tlx.async_task(num_warps=1, num_regs=24):
             start_pid = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BLOCK_M)
             num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -900,84 +914,30 @@ def _addmm_fwd_tma_ws_persistent(
 
                     load_phase = load_phase ^ (buf == int(NUM_SMEM_BUFFERS) - 1)
 
-                # Loads y for the tile
-                if EPILOGUE_SUBTILE:
-                    # pyre-ignore[61]
-                    y_buf_first_view = tlx.local_view(y_buffer_first, 0)
-                    # pyre-ignore[61]
-                    y_buf_second_view = tlx.local_view(y_buffer_second, 0)
-                    # pyre-ignore[61]
-                    y_bar_first = tlx.local_view(y_load_bar_first, 0)
-                    # pyre-ignore[61]
-                    y_bar_second = tlx.local_view(y_load_bar_second, 0)
-                    # pyre-ignore[61]
-                    y_empty_first = tlx.local_view(y_empty_bar_first, 0)
-                    # pyre-ignore[61]
-                    y_empty_second = tlx.local_view(y_empty_bar_second, 0)
-
-                    # Wait for epilogue to finish using previous y data
-                    if tile_id > start_pid:
-                        tlx.barrier_wait(y_empty_first, y_load_phase ^ 1)
-                        tlx.barrier_wait(y_empty_second, y_load_phase ^ 1)
-
+                for slice_id in tl.static_range(EPILOGUE_SUBTILE):
+                    y_buf_view = tlx.local_view(y_buffers, slice_id)
+                    y_bar = tlx.local_view(y_load_bars, slice_id)
+                    # Wait for the bias tile to be ready.
+                    y_empty = tlx.local_view(y_empty_bars, slice_id)
+                    tlx.barrier_wait(y_empty, y_load_phase ^ 1)
                     if BROADCAST_Y:
-                        tlx.barrier_expect_bytes(y_bar_first, 1 * (BLOCK_N // 2) * 2)
-                        tlx.barrier_expect_bytes(y_bar_second, 1 * (BLOCK_N // 2) * 2)
-                        tlx.async_descriptor_load(
-                            y_desc, y_buf_first_view, [0, offs_wn_full], y_bar_first
-                        )
+                        tlx.barrier_expect_bytes(y_bar, 1 * slice_size * 2)
                         tlx.async_descriptor_load(
                             y_desc,
-                            y_buf_second_view,
-                            [0, offs_wn_full + BLOCK_N // 2],
-                            y_bar_second,
+                            y_buf_view,
+                            [0, offs_wn_full + slice_id * slice_size],
+                            y_bar,
                         )
                     else:
-                        tlx.barrier_expect_bytes(
-                            y_bar_first, BLOCK_M * (BLOCK_N // 2) * 2
-                        )
-                        tlx.barrier_expect_bytes(
-                            y_bar_second, BLOCK_M * (BLOCK_N // 2) * 2
-                        )
+                        tlx.barrier_expect_bytes(y_bar, BLOCK_M * slice_size * 2)
                         tlx.async_descriptor_load(
                             y_desc,
-                            y_buf_first_view,
-                            [offs_xm, offs_wn_full],
-                            y_bar_first,
-                        )
-                        tlx.async_descriptor_load(
-                            y_desc,
-                            y_buf_second_view,
-                            [offs_xm, offs_wn_full + BLOCK_N // 2],
-                            y_bar_second,
+                            y_buf_view,
+                            [offs_xm, offs_wn_full + slice_id * slice_size],
+                            y_bar,
                         )
 
-                    y_load_phase = y_load_phase ^ 1
-                else:
-                    # Load full y tile
-                    # pyre-ignore[61]
-                    y_buf_view = tlx.local_view(y_buffer, 0)
-                    # pyre-ignore[61]
-                    y_bar = tlx.local_view(y_load_bar, 0)
-                    # pyre-ignore[61]
-                    y_empty = tlx.local_view(y_empty_bar, 0)
-
-                    # Wait for epilogue to finish using previous y data
-                    if tile_id > start_pid:
-                        tlx.barrier_wait(y_empty, y_load_phase ^ 1)
-
-                    if BROADCAST_Y:
-                        tlx.barrier_expect_bytes(y_bar, 1 * BLOCK_N * 2)
-                        tlx.async_descriptor_load(
-                            y_desc, y_buf_view, [0, offs_wn_full], y_bar
-                        )
-                    else:
-                        tlx.barrier_expect_bytes(y_bar, BLOCK_M * BLOCK_N * 2)
-                        tlx.async_descriptor_load(
-                            y_desc, y_buf_view, [offs_xm, offs_wn_full], y_bar
-                        )
-
-                    y_load_phase = y_load_phase ^ 1
+                y_load_phase = y_load_phase ^ 1
 
                 processed_k_iters += k_tiles
 
@@ -1161,7 +1121,6 @@ def triton_addmm_fwd_tma_ws_persistent_tlx(
         NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
         NUM_TMEM_BUFFERS=NUM_TMEM_BUFFERS,
         NUM_SMS=NUM_SMS,
-        EPILOGUE_SUBTILE=True,
     )
     return z
 
