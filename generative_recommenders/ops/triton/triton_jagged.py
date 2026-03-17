@@ -15,6 +15,7 @@
 #!/usr/bin/env python3
 
 
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -78,6 +79,20 @@ def get_split_2d_jagged_kernel() -> Optional[str]:
     return None
 
 
+def _should_use_multirow() -> bool:
+    """Check if multirow kernel should be used based on current hardware.
+
+    Can be overridden via the JAGGED_USE_MULTIROW_MI350 environment variable:
+      JAGGED_USE_MULTIROW_MI350=1  -> force multirow on
+      JAGGED_USE_MULTIROW_MI350=0  -> force multirow off
+      unset                  -> auto-detect based on hardware (SM100+ or MI350)
+    """
+    env = os.environ.get("JAGGED_USE_MULTIROW_MI350")
+    if env is not None:
+        return env == "1"
+    return is_sm100_plus()
+
+
 def _triton_concat_2D_jagged_internal(
     values_a: torch.Tensor,
     values_b: torch.Tensor,
@@ -95,8 +110,9 @@ def _triton_concat_2D_jagged_internal(
     is_replace: bool,
     BLOCK_D: int,
 ) -> None:
+    use_multirow = _should_use_multirow()
     if n_prefix != 0:
-        if is_sm100_plus():
+        if use_multirow:
 
             def grid(meta):
                 return (triton.cdiv(max_seq_len, meta["BLOCK_N"]), B)
@@ -129,7 +145,7 @@ def _triton_concat_2D_jagged_internal(
                 BLOCK_D=BLOCK_D,  # pyre-ignore[6]
             )
     else:
-        if is_sm100_plus():
+        if use_multirow:
 
             def grid(meta):
                 return (triton.cdiv(max_seq_len, meta["BLOCK_N"]), B)
@@ -182,6 +198,32 @@ def _get_split_concat_2d_jagged_multirow_configs() -> List[triton.Config]:
                 )
             )
     return configs
+
+
+def _get_split_concat_2d_jagged_multirow_configs_wrapper() -> List[triton.Config]:
+    # Use extended config space only when JAGGED_USE_MULTIROW_MI350 is explicitly set,
+    # otherwise fall back to the existing configs to avoid breaking autotune.
+    if os.environ.get("JAGGED_USE_MULTIROW_MI350") is not None:
+        configs = []
+        # Extended config space for MI350 tuning
+        # - BLOCK_N: number of rows processed per block
+        # - num_warps: number of warps (AMD wavefront = 64 threads)
+        # - num_stages: software pipeline depth for memory latency hiding
+        #   NOTE: num_stages=0 is invalid for AMD GPUs, start from 1
+        # - waves_per_eu: AMD-specific, controls occupancy (waves per execution unit)
+        for BLOCK_N in [1, 2, 4, 8, 16, 32]:
+            for num_warps in [1, 2, 4, 8, 16, 32]:
+                for num_stages in [1, 2, 3, 4]:
+                    for waves_per_eu in [0, 1, 2, 4]:
+                        configs.append(
+                            triton.Config(
+                                {"BLOCK_N": BLOCK_N, "waves_per_eu": waves_per_eu},
+                                num_warps=num_warps,
+                                num_stages=num_stages,
+                            )
+                        )
+        return configs
+    return _get_split_concat_2d_jagged_multirow_configs()
 
 
 def _get_bmm_configs() -> List[triton.Config]:
@@ -1247,8 +1289,9 @@ def _triton_split_2D_jagged_internal(
     is_replace: bool,
     BLOCK_D: int,
 ) -> None:
+    use_multirow = _should_use_multirow()
     if n_prefix != 0:
-        if is_sm100_plus():
+        if use_multirow:
 
             def grid(meta):
                 return (triton.cdiv(max_seq_len, meta["BLOCK_N"]), B)
@@ -1281,7 +1324,7 @@ def _triton_split_2D_jagged_internal(
                 BLOCK_D=BLOCK_D,  # pyre-ignore[6]
             )
     else:
-        if is_sm100_plus():
+        if use_multirow:
 
             def grid(meta):
                 return (triton.cdiv(max_seq_len, meta["BLOCK_N"]), B)
@@ -1818,7 +1861,7 @@ def concat_2D_jagged_w_prefix_multirow(
 
 
 @triton_autotune(
-    configs=_get_split_concat_2d_jagged_multirow_configs(),
+    configs=_get_split_concat_2d_jagged_multirow_configs_wrapper(),
     key=["BLOCK_D"],
 )
 @triton.jit
@@ -1989,7 +2032,7 @@ def split_2D_jagged_w_prefix_multirow(
 
 
 @triton_autotune(
-    configs=_get_split_concat_2d_jagged_multirow_configs(),
+    configs=_get_split_concat_2d_jagged_multirow_configs_wrapper(),
     key=["BLOCK_D"],
 )
 @triton.jit
