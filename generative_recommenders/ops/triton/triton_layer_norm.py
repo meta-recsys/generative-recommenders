@@ -67,15 +67,16 @@ def _bwd_pre_hook(nargs):
 def _get_norm_bwd_configs() -> List[triton.Config]:
     """Generate autotune configs for multi-row LayerNorm kernels."""
     configs = []
-    block_ns = [2, 4, 8] if is_sm100_plus() else [1, 2]
+    block_ns = [2, 4, 8, 16] if is_sm100_plus() else [1, 2, 4]
     for BLOCK_N in block_ns:
         for num_warps in [2, 4]:
-            configs.append(
-                triton.Config(
-                    {"BLOCK_N": BLOCK_N},
-                    num_warps=num_warps,
+            for num_shards in [4, 8, 16]:
+                configs.append(
+                    triton.Config(
+                        {"BLOCK_N": BLOCK_N, "SHARDS_PER_SM": num_shards},
+                        num_warps=num_warps,
+                    )
                 )
-            )
     return configs
 
 
@@ -948,6 +949,7 @@ def _weighted_rms_norm_bwd(
     SILU: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    SHARDS_PER_SM: tl.constexpr,
 ):
     pid = tl.program_id(0)
     tile_num = tl.num_programs(0)
@@ -1136,9 +1138,12 @@ class RMSNormFunction(torch.autograd.Function):
             return dx, dweight, None, None
 
         sms = torch.cuda.get_device_properties(x.device).multi_processor_count
-        tile_num = max(1, min(sms * 8, N // 4))
 
-        _weighted_rms_norm_bwd[(tile_num,)](
+        # pyre-ignore[28]
+        grid = lambda meta: (  # noqa E731
+            max(1, min(sms * meta["SHARDS_PER_SM"], N // 4)),
+        )
+        _weighted_rms_norm_bwd[grid](
             dx,
             dy,
             dweight,
