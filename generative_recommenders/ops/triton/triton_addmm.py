@@ -738,7 +738,7 @@ def _addmm_fwd_tma_ws_persistent(
                 cur_tmem_buf = (cur_tmem_buf + 1) % int(NUM_TMEM_BUFFERS)
 
         # MMA consumer: performs matrix multiplication
-        with tlx.async_task(num_warps=4, num_regs=232):
+        with tlx.async_task(num_warps=1, num_regs=24):
             start_pid = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BLOCK_M)
             num_pid_n = tl.cdiv(N, BLOCK_N)
