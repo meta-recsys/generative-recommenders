@@ -711,29 +711,28 @@ def _addmm_fwd_tma_ws_persistent(
                 # Load result from TMEM and add bias
                 acc_tmem = tmem_buffers[cur_tmem_buf]
 
-                # Wait for y loads from producer
-                for slice_id in tl.static_range(EPILOGUE_SUBTILE):
-                    y_bar = tlx.local_view(y_load_bars, slice_id)
-                    tlx.barrier_wait(y_bar, y_load_phase)
-
                 # Process each subtile slice
                 for slice_id in tl.static_range(EPILOGUE_SUBTILE):
                     acc_subslice = tlx.subslice(
                         acc_tmem, slice_id * slice_size, slice_size
                     )
                     result = tlx.local_load(acc_subslice)
+                    if slice_id == EPILOGUE_SUBTILE - 1:
+                        # Signal MMA that this TMEM buffer is now free
+                        tlx.barrier_arrive(tmem_empty_bars[cur_tmem_buf], 1)
+
                     y_buf_view = tlx.local_view(y_buffers, slice_id)
+                    y_bar = tlx.local_view(y_load_bars, slice_id)
+                    # Wait for the bias tile to be ready.
+                    tlx.barrier_wait(y_bar, y_load_phase)
                     y = tlx.local_load(y_buf_view)
+                    y_empty = tlx.local_view(y_empty_bars, slice_id)
+                    # Signal the bias tile as free.
+                    tlx.barrier_arrive(y_empty, 1)
                     z = (result + y.to(tl.float32)).to(z_desc.dtype)
                     z_desc.store([offs_xm, offs_wn + slice_id * slice_size], z)
 
-                for slice_id in tl.static_range(EPILOGUE_SUBTILE):
-                    y_empty = tlx.local_view(y_empty_bars, slice_id)
-                    tlx.barrier_arrive(y_empty, 1)
                 y_load_phase = y_load_phase ^ 1
-
-                # Signal MMA that this TMEM buffer is now free
-                tlx.barrier_arrive(tmem_empty_bars[cur_tmem_buf], 1)
 
                 cur_tmem_buf = (cur_tmem_buf + 1) % int(NUM_TMEM_BUFFERS)
 
@@ -851,16 +850,12 @@ def _addmm_fwd_tma_ws_persistent(
 
                     load_phase = load_phase ^ (buf == int(NUM_SMEM_BUFFERS) - 1)
 
-                # Loads y for the tile
-                # Wait for epilogue to finish using previous y data
-                if tile_id > start_pid:
-                    for slice_id in tl.static_range(EPILOGUE_SUBTILE):
-                        y_empty = tlx.local_view(y_empty_bars, slice_id)
-                        tlx.barrier_wait(y_empty, y_load_phase ^ 1)
-
                 for slice_id in tl.static_range(EPILOGUE_SUBTILE):
                     y_buf_view = tlx.local_view(y_buffers, slice_id)
                     y_bar = tlx.local_view(y_load_bars, slice_id)
+                    # Wait for the bias tile to be ready.
+                    y_empty = tlx.local_view(y_empty_bars, slice_id)
+                    tlx.barrier_wait(y_empty, y_load_phase ^ 1)
                     if BROADCAST_Y:
                         tlx.barrier_expect_bytes(y_bar, 1 * slice_size * 2)
                         tlx.async_descriptor_load(
