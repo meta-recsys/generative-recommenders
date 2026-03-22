@@ -67,7 +67,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         attn_dim: int,
         hidden_dim: int,
         uvqk_weight: torch.Tensor,
-        uvqk_bias: torch.Tensor,
+        uvqk_bias: Optional[torch.Tensor],
         max_seq_len: int,
         seq_offsets: torch.Tensor,
         alpha: float,
@@ -112,15 +112,18 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 ],
                 dim=1,
             )
-            u_bias, vqk_bias = uvqk_bias.split(
-                [
-                    hidden_dim * num_heads,
-                    hidden_dim * num_heads
-                    + attn_dim * num_heads
-                    + attn_dim * num_heads,
-                ],
-                dim=0,
-            )
+            if uvqk_bias is not None:
+                u_bias, vqk_bias = uvqk_bias.split(
+                    [
+                        hidden_dim * num_heads,
+                        hidden_dim * num_heads
+                        + attn_dim * num_heads
+                        + attn_dim * num_heads,
+                    ],
+                    dim=0,
+                )
+            else:
+                u_bias, vqk_bias = None, None
             if fp8_in_addmm_fwd:
                 assert x_scale is not None and normed_x_fp8 is not None
                 u = fp8_rowwise_quantize_addmm(
@@ -159,21 +162,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             # different code path. Set to None to satisfy type checker.
             uvqk = None
         else:
-            if fp8_in_addmm_fwd:
-                assert x_scale is not None and normed_x_fp8 is not None
-                uvqk = fp8_rowwise_quantize_addmm(
-                    x=normed_x,
-                    x_fp8=normed_x_fp8,
-                    w=uvqk_weight,
-                    y=uvqk_bias,
-                    x_scale=x_scale,
-                    custom_kernel=False,
-                    is_inference=False,
-                ).contiguous()
-            else:
-                uvqk = maybe_triton_addmm_fwd(
-                    normed_x, uvqk_weight, uvqk_bias
-                ).contiguous()
+            uvqk = maybe_triton_addmm_fwd(normed_x, uvqk_weight, uvqk_bias).contiguous()
             u, v, q, k = uvqk.split(
                 [
                     hidden_dim * num_heads,
@@ -278,7 +267,8 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         if not recompute_normed_x_in_backward:
             saved_tensors.append(normed_x)
         if recompute_uvqk_in_backward:
-            saved_tensors.append(uvqk_bias)
+            if uvqk_bias is not None:
+                saved_tensors.append(uvqk_bias)
             if fp8_in_addmm_fwd:
                 saved_tensors.append(x_scale)  # pyre-ignore
                 saved_tensors.append(normed_x_fp8)  # pyre-ignore
@@ -303,7 +293,8 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         ctx.hidden_dim = hidden_dim
         ctx.attn_dim = attn_dim
         ctx.num_heads = num_heads
-        ctx.uvqk_bias_1d = uvqk_bias.dim() == 1
+        ctx.has_uvqk_bias = uvqk_bias is not None
+        ctx.uvqk_bias_1d = uvqk_bias.dim() == 1 if uvqk_bias is not None else False
         ctx.norm_eps = norm_eps
         ctx.norm_BLOCK_D = BLOCK_D
         ctx.contextual_seq_len = contextual_seq_len
@@ -379,8 +370,11 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             normed_x = ctx.saved_tensors[idx]
             idx += 1
         if ctx.recompute_uvqk_in_backward:
-            uvqk_bias = ctx.saved_tensors[idx]
-            idx += 1
+            if ctx.has_uvqk_bias:
+                uvqk_bias = ctx.saved_tensors[idx]
+                idx += 1
+            else:
+                uvqk_bias = None
             if not ctx.silu_u:
                 # When silu_u is False, we only recompute vqk (not u)
                 # Split the weights/biases to extract vqk portion
@@ -393,15 +387,17 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                     ],
                     dim=1,
                 )
-                _, vqk_bias = uvqk_bias.split(
-                    [
-                        ctx.hidden_dim * ctx.num_heads,
-                        ctx.hidden_dim * ctx.num_heads
-                        + ctx.attn_dim * ctx.num_heads
-                        + ctx.attn_dim * ctx.num_heads,
-                    ],
-                    dim=0,
-                )
+                vqk_bias = None
+                if ctx.has_uvqk_bias:
+                    _, vqk_bias = uvqk_bias.split(
+                        [
+                            ctx.hidden_dim * ctx.num_heads,
+                            ctx.hidden_dim * ctx.num_heads
+                            + ctx.attn_dim * ctx.num_heads
+                            + ctx.attn_dim * ctx.num_heads,
+                        ],
+                        dim=0,
+                    )
                 if ctx.fp8_in_addmm_fwd:
                     x_scale, normed_x_fp8 = ctx.saved_tensors[idx : idx + 2]
                     vqk = fp8_rowwise_quantize_addmm(
@@ -608,7 +604,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             x=normed_x,
             w=uvqk_weight,
             dz=duvqk,
-            is_y_1d=ctx.uvqk_bias_1d,
+            is_y_1d=ctx.uvqk_bias_1d and ctx.has_uvqk_bias,
         )
         d_x, d_norm_weight, d_norm_bias = triton_weighted_layer_norm_bwd(
             dy=d_normed_x,
@@ -631,7 +627,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             None,
             None,
             d_uvqk_weight,
-            d_uvqk_bias,
+            d_uvqk_bias if ctx.has_uvqk_bias else None,
             None,
             None,
             None,
