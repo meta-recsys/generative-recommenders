@@ -16,7 +16,7 @@
 
 
 import math
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -1142,10 +1142,12 @@ def triton_addmm_bwd(
 def maybe_triton_addmm_fwd(
     x: torch.Tensor,
     w: torch.Tensor,
-    y: torch.Tensor,
+    y: Optional[torch.Tensor],
 ) -> torch.Tensor:
     # triton addmm is slower than torch (cublas) on AMD/Blackwell.
     # Default to pytorch addmm on AMD/Blackwell for now.
+    if y is None:
+        return torch.mm(x, w)
     if is_sm100_plus() or torch.version.hip is not None:
         return torch.addmm(y, x, w)
     else:
