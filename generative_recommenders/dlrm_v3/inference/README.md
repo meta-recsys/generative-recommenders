@@ -59,7 +59,7 @@ The config file is listed in `dlrm_v3/inference/gin/streaming_100b.gin`.
 `WORLD_SIZE` is the number of GPUs used in the inference benchmark.
 
 To load checkpoint from training, modify `run.model_path` inside the inference
-gin config file. (We will relase the checkpoint soon.)
+gin config file. (We will release the checkpoint soon.)
 
 To achieve the best performance, tune `run.target_qps` and `run.batchsize` in
 the config file.
