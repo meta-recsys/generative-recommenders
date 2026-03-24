@@ -199,6 +199,9 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         k = k.view(-1, num_heads, attn_dim)
         v = v.view(-1, num_heads, hidden_dim)
         if is_sm100_plus():
+            assert contextual_seq_len == 0, (
+                "Contextual seq len is not supported on SM100"
+            )
             out = torch.ops.bw_hstu.bw_hstu_mha_fwd(
                 max_seq_len,
                 alpha,
@@ -211,7 +214,6 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 attn_scale,
                 max_attn_len,
                 full_attn_size,
-                contextual_seq_len,
                 None,  # q_descale
                 None,  # k_descale
                 None,  # v_descale
@@ -219,7 +221,6 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 max_seq_len,  # max_q_len,
                 None,  # seq_offsets_q,
                 None,  # max_seq_len_tensor,
-                None,  # contextual_seq_len_tensor,
                 None,  # max_attn_len_tensor,
                 None,  # min_full_attn_seq_len_tensor,
                 1,  # num_groups
@@ -539,14 +540,12 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 attn_scale,
                 ctx.max_attn_len,
                 ctx.full_attn_size,
-                ctx.contextual_seq_len,
                 ctx.sort_by_length,
                 False,  # deterministic
                 0,  # sm_margin
                 ctx.max_seq_len,  # max_q_len,
                 None,  # seq_offsets_q,
                 None,  # max_seq_len_tensor,
-                None,  # contextual_seq_len_tensor,
                 None,  # max_attn_len_tensor,
                 None,  # min_full_attn_seq_len_tensor,
                 1,  # num_groups

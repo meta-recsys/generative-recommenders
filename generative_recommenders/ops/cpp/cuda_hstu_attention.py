@@ -70,6 +70,9 @@ def cuda_hstu_mha(
         q, k, v: (batch_size, seqlen, nheads, headdim) or (total_seqlen, nheads, headdim)
     """
     if is_sm100_plus() and not is_inference:
+        assert contextual_seq_len == 0 and contextual_seq_len_tensor is None, (
+            "Contextual seq len is not supported on SM100"
+        )
         return torch.ops.bw_hstu.bw_hstu_mha(
             max_seq_len,
             alpha,
@@ -82,7 +85,6 @@ def cuda_hstu_mha(
             attn_scale,
             max_attn_len,
             min_full_attn_seq_len,
-            contextual_seq_len,
             q_descale,
             k_descale,
             v_descale,
@@ -92,7 +94,6 @@ def cuda_hstu_mha(
             max_q_len,
             seq_offsets_q,
             max_seq_len_tensor,
-            contextual_seq_len_tensor,
             max_attn_len_tensor,
             min_full_attn_seq_len_tensor,
             num_groups,
