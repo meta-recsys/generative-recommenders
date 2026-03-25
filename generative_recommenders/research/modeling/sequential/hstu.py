@@ -330,7 +330,7 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
                     self._attention_dim * self._num_heads,
                     self._attention_dim * self._num_heads,
                 ],
-                dim=1,
+                dim=-1, # Changed from 'dim=1,' to expend the application. Changes on the hyperparameters of hstu may cause errors.
             )
         else:
             raise ValueError(f"Unknown self._linear_config {self._linear_config}")
