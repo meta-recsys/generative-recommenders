@@ -524,7 +524,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         dv = dv.view(-1, ctx.num_heads, ctx.hidden_dim)
         # Note: the two operations below update duvqk in place
         if is_sm100_plus():
-            _dq, _dk, _dv = torch.ops.bw_hstu.bw_hstu_mha_bwd(
+            dq, dk, dv = torch.ops.bw_hstu.bw_hstu_mha_bwd(
                 ctx.max_seq_len,
                 ctx.alpha,
                 dout,
@@ -551,7 +551,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 1,  # num_groups
             )
         else:
-            _dq, _dk, _dv = torch.ops.hstu.hstu_mha_bwd(
+            dq, dk, dv = torch.ops.hstu.hstu_mha_bwd(
                 ctx.max_seq_len,
                 ctx.alpha,
                 dout,
@@ -579,22 +579,21 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             )
         if ctx.has_rotary_weights:
             _dq = triton_apply_rope_bwd(
-                grad=_dq,
+                grad=dq,
                 N=ctx.max_seq_len,
                 seq_offsets=seq_offsets,
                 cos_rope=q_cos_weights,
                 sin_rope=q_sin_weights,
             )
             _dk = triton_apply_rope_bwd(
-                grad=_dk,
+                grad=dk,
                 N=ctx.max_seq_len,
                 seq_offsets=seq_offsets,
                 cos_rope=k_cos_weights,
                 sin_rope=k_sin_weights,
             )
-        copy_if_different_ptr(dq, _dq)
-        copy_if_different_ptr(dk, _dk)
-        copy_if_different_ptr(dv, _dv)
+            copy_if_different_ptr(dq, _dq)
+            copy_if_different_ptr(dk, _dk)
         if ctx.silu_u:
             torch.ops.aten.silu_backward(_du, u, grad_input=du)
         else:
