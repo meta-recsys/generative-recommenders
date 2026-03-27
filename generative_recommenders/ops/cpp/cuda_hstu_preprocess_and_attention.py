@@ -202,7 +202,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             assert contextual_seq_len == 0, (
                 "Contextual seq len is not supported on SM100"
             )
-            out = torch.ops.bw_hstu.bw_hstu_mha_fwd(
+            out, softmax_lse = torch.ops.bw_hstu.bw_hstu_mha_fwd(
                 max_seq_len,
                 alpha,
                 q,
@@ -224,8 +224,8 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 None,  # max_attn_len_tensor,
                 None,  # min_full_attn_seq_len_tensor,
                 1,  # num_groups
+                num_softmax_heads,  # num_softmax_heads
             )
-            softmax_lse = None
         else:
             out, softmax_lse = torch.ops.hstu.hstu_mha_fwd(
                 max_seq_len,
@@ -549,6 +549,9 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 None,  # max_attn_len_tensor,
                 None,  # min_full_attn_seq_len_tensor,
                 1,  # num_groups
+                ctx.num_softmax_heads,  # num_softmax_heads
+                out,  # out
+                softmax_lse,  # lse
             )
         else:
             _dq, _dk, _dv = torch.ops.hstu.hstu_mha_bwd(
