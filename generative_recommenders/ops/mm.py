@@ -21,7 +21,7 @@ import torch
 try:
     from hammer.ops.triton.cc.addmm.triton_cc_addmm import triton_cc_addmm
 except ImportError:
-    pass
+    triton_cc_addmm = None
 from generative_recommenders.common import HammerKernel
 from generative_recommenders.ops.triton.triton_addmm import triton_addmm
 
@@ -35,6 +35,8 @@ def addmm(
     if kernel == HammerKernel.TRITON:
         return triton_addmm(input, mat1, mat2)
     elif kernel == HammerKernel.TRITON_CC:
+        if triton_cc_addmm is None:
+            raise ImportError("hammer is required for the TRITON_CC kernel in addmm.")
         return triton_cc_addmm(input, mat1, mat2)
     else:
         return torch.addmm(input, mat1, mat2)

@@ -28,15 +28,13 @@ from generative_recommenders.ops.pytorch.pt_layer_norm import (
 from generative_recommenders.ops.triton.triton_layer_norm import triton_rms_norm
 
 try:
+    from hammer.ops.triton.cc.rms_norm.triton_cc_rms_norm import triton_cc_rms_norm
     from hammer.ops.triton.cc.swish_layer_norm.triton_cc_swish_layer_norm import (
         triton_cc_swish_layer_norm,
     )
 except ImportError:
-    pass
-try:
-    from hammer.ops.triton.cc.rms_norm.triton_cc_rms_norm import triton_cc_rms_norm
-except ImportError:
-    pass
+    triton_cc_swish_layer_norm = None
+    triton_cc_rms_norm = None
 from generative_recommenders.common import HammerKernel, HammerModule
 from generative_recommenders.ops.triton.triton_layer_norm import (
     triton_layer_norm,
@@ -62,6 +60,10 @@ def layer_norm(
             torch._assert(not bias.is_cpu, "bias must be device tensor")
         return triton_layer_norm(x, weight, bias, eps)
     elif kernel == HammerKernel.TRITON_CC:
+        if triton_cc_swish_layer_norm is None:
+            raise ImportError(
+                "hammer is required for the TRITON_CC kernel in layer_norm."
+            )
         return triton_cc_swish_layer_norm(
             x,
             weight,
@@ -94,6 +96,10 @@ def rms_norm(
             torch._assert(not weight.is_cpu, "weight must be device tensor")
         return triton_rms_norm(x, weight, eps, silu)
     elif kernel == HammerKernel.TRITON_CC:
+        if triton_cc_rms_norm is None:
+            raise ImportError(
+                "hammer is required for the TRITON_CC kernel in rms_norm."
+            )
         return triton_cc_rms_norm(
             x,
             weight,
@@ -126,6 +132,10 @@ def swish_layer_norm(
             torch._assert(not bias.is_cpu, "bias must be device tensor")
         return triton_swish_layer_norm(x, [x.shape[-1]], weight, bias, eps)
     elif kernel == HammerKernel.TRITON_CC:
+        if triton_cc_swish_layer_norm is None:
+            raise ImportError(
+                "hammer is required for the TRITON_CC kernel in swish_layer_norm."
+            )
         return triton_cc_swish_layer_norm(
             x,
             weight,

@@ -41,7 +41,7 @@ try:
         triton_cc_jagged_dense_bmm,
     )
 except ImportError:
-    pass
+    triton_cc_jagged_dense_bmm = None
 
 
 torch.fx.wrap("triton_concat_2D_jagged")
@@ -233,6 +233,10 @@ def jagged_dense_bmm_broadcast_add(
             elementwise=False,
         )
     elif kernel == HammerKernel.TRITON_CC:
+        if triton_cc_jagged_dense_bmm is None:
+            raise ImportError(
+                "hammer is required for the TRITON_CC kernel in jagged_dense_bmm_broadcast_add."
+            )
         return triton_cc_jagged_dense_bmm(
             max_seq_len=max_seq_len,
             seq_offsets=seq_offsets,
