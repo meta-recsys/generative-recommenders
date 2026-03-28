@@ -81,6 +81,7 @@ def _flops(
 @click.option("--bench-forward", type=bool, default=True)
 @click.option("--bench-tlx", type=bool, default=False)
 @click.option("--bench-pytorch", type=bool, default=False)
+@click.option("--bench-ragged", type=bool, default=True)
 @click.option("--report-flops", type=bool, default=False)
 @click.option("--return-result", type=bool, default=False)
 @click.option("--max-attn-len", type=int, default=0)
@@ -89,6 +90,7 @@ def _flops(
 @click.option("--sampling-alpha", type=float, default=2.0)
 @click.option("--triton-enable-tma", type=bool, default=False)
 @click.option("--dynamic-attn-scale", type=bool, default=False)
+@click.option("--num-softmax-heads", type=int, default=0)
 def main(  # noqa: C901
     batch_size: int,
     heads: int,
@@ -104,6 +106,7 @@ def main(  # noqa: C901
     bench_forward: bool,
     bench_tlx: bool,
     bench_pytorch: bool,
+    bench_ragged: bool,
     report_flops: bool,
     return_result: bool,
     max_attn_len: int,
@@ -112,6 +115,7 @@ def main(  # noqa: C901
     sampling_alpha: float,
     triton_enable_tma: bool,
     dynamic_attn_scale: bool,
+    num_softmax_heads: int,
 ) -> Optional[Tuple[List[triton.testing.Benchmark], List[pd.DataFrame]]]:
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -131,6 +135,10 @@ def main(  # noqa: C901
         line_vals.append("pytorch")
         line_names.append("PyTorch")
         styles.append(("green", "-"))
+    if bench_ragged:
+        line_vals.append("ragged")
+        line_names.append("ragged")
+        styles.append(("red", "-"))
     if bench_tlx and not blackwell_tlx_unavailable[0]:
         line_vals.append("tlx")
         line_names.append("tlx")
@@ -153,7 +161,7 @@ def main(  # noqa: C901
             line_names=line_names,
             styles=styles,
             ylabel="ms",
-            plot_name=f"hstu-attn-b{batch_size}-h{heads}-d{attn_dim}-v{hidden_dim}--sparsity{seq_sparsity}-{mode}-{dtype}-target{target_size}-mattn{max_attn_len}-full{min_full_attn_seq_len}-c{contextual_seq_len}-sl_alpha{sampling_alpha}-triton_tma{triton_enable_tma}-dynamic_scale{dynamic_attn_scale}",
+            plot_name=f"hstu-attn-b{batch_size}-h{heads}-d{attn_dim}-v{hidden_dim}--sparsity{seq_sparsity}-{mode}-{dtype}-target{target_size}-mattn{max_attn_len}-full{min_full_attn_seq_len}-c{contextual_seq_len}-sl_alpha{sampling_alpha}-triton_tma{triton_enable_tma}-dynamic_scale{dynamic_attn_scale}-num_softmax_heads{num_softmax_heads}",
             args={
                 "batch_size": batch_size,
                 "heads": heads,
@@ -173,6 +181,7 @@ def main(  # noqa: C901
                 "sampling_alpha": sampling_alpha,
                 "triton_enable_tma": triton_enable_tma,
                 "dynamic_attn_scale": dynamic_attn_scale,
+                "num_softmax_heads": num_softmax_heads,
             },
         )
         for mode in modes
@@ -200,6 +209,7 @@ def main(  # noqa: C901
         sampling_alpha: float,
         triton_enable_tma: bool,
         dynamic_attn_scale: bool,
+        num_softmax_heads: int,
     ) -> float:
         assert mode in ["fwd", "bwd"]
         warmup = 25
@@ -270,6 +280,7 @@ def main(  # noqa: C901
             "flash_cuda_jagged",
             "flash_cuda",
             "tlx",
+            "ragged",
         ]
         if has_delta_q:
             fn = lambda: delta_hstu_mha(  # noqa E731
@@ -298,6 +309,7 @@ def main(  # noqa: C901
                     contextual_seq_len=contextual_seq_len,
                     num_targets=num_targets,
                     sort_by_length=False,
+                    num_softmax_heads=num_softmax_heads,
                 )
             elif provider == "flash_cuda":
                 q, k, v = [
@@ -324,45 +336,46 @@ def main(  # noqa: C901
                     contextual_seq_len=contextual_seq_len,
                     num_targets=num_targets,
                     sort_by_length=False,
+                    num_softmax_heads=num_softmax_heads,
+                )
+            elif provider == "ragged":
+                fn = lambda: ragged_hstu_mha(  # noqa E731
+                    max_seq_len=seq_len,
+                    alpha=alpha,
+                    q=q,
+                    k=k,
+                    v=v,
+                    seq_offsets=seq_offsets,
+                    dropout_pr=0.0,
+                    training=True,
+                    invalid_attn_mask_type="lower_triangular",
+                    num_targets=num_targets,
+                    attn_scale=attn_scale if dynamic_attn_scale else None,
+                    max_attn_len=max_attn_len,
+                    contextual_seq_len=contextual_seq_len,
+                    full_attn_size=min_full_attn_seq_len,
+                    sort_by_length=True,
+                    kernel=HammerKernel2.TRITON,
+                    num_softmax_heads=num_softmax_heads,
                 )
             else:
-                if min_full_attn_seq_len > 0 or dynamic_attn_scale:
-                    fn = lambda: ragged_hstu_mha(  # noqa E73
-                        max_seq_len=seq_len,
-                        alpha=alpha,
-                        q=q,
-                        k=k,
-                        v=v,
-                        seq_offsets=seq_offsets,
-                        dropout_pr=0.0,
-                        training=True,
-                        invalid_attn_mask_type="lower_triangular",
-                        num_targets=num_targets,
-                        attn_scale=attn_scale if dynamic_attn_scale else None,
-                        max_attn_len=max_attn_len,
-                        contextual_seq_len=contextual_seq_len,
-                        full_attn_size=min_full_attn_seq_len,
-                        sort_by_length=True,
-                        kernel=HammerKernel2.TRITON,
-                    )
-                else:
-                    fn = lambda: hstu_mha(  # noqa E73
-                        max_seq_len=seq_len,
-                        alpha=alpha,
-                        q=q,
-                        k=k,
-                        v=v,
-                        seq_offsets=seq_offsets,
-                        causal=causal,
-                        dropout_pr=0.0,
-                        training=True,
-                        num_targets=num_targets,
-                        max_attn_len=max_attn_len,
-                        contextual_seq_len=contextual_seq_len,
-                        sort_by_length=True,
-                        kernel=_get_kernel(provider),
-                        enable_tma=triton_enable_tma,
-                    )
+                fn = lambda: hstu_mha(  # noqa E731
+                    max_seq_len=seq_len,
+                    alpha=alpha,
+                    q=q,
+                    k=k,
+                    v=v,
+                    seq_offsets=seq_offsets,
+                    causal=causal,
+                    dropout_pr=0.0,
+                    training=True,
+                    num_targets=num_targets,
+                    max_attn_len=max_attn_len,
+                    contextual_seq_len=contextual_seq_len,
+                    sort_by_length=True,
+                    kernel=_get_kernel(provider),
+                    enable_tma=triton_enable_tma,
+                )
         if mode == "bwd":
             o = fn()
             do = torch.randn_like(o)

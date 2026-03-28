@@ -97,6 +97,7 @@ def cuda_hstu_mha(
             max_attn_len_tensor,
             min_full_attn_seq_len_tensor,
             num_groups,
+            num_softmax_heads,
         )
     else:
         return cuda_hstu_mha_inference_wrapper(
