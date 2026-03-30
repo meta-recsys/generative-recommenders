@@ -28,7 +28,7 @@ try:
         triton_cc_add_timestamp_position_embeddings,
     )
 except ImportError:
-    pass
+    triton_cc_add_timestamp_position_embeddings = None
 from generative_recommenders.common import HammerKernel
 from generative_recommenders.ops.triton.triton_position import (
     triton_add_timestamp_positional_embeddings,
@@ -67,6 +67,10 @@ def add_timestamp_positional_embeddings(
             time_bucket_fn=time_bucket_fn,
         )
     elif kernel == HammerKernel.TRITON_CC:
+        if triton_cc_add_timestamp_position_embeddings is None:
+            raise ImportError(
+                "hammer is required for the TRITON_CC kernel in add_timestamp_positional_embeddings."
+            )
         return triton_cc_add_timestamp_position_embeddings(
             seq_embeddings=seq_embeddings,
             seq_offsets=seq_offsets,

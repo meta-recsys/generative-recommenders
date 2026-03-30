@@ -35,7 +35,9 @@ try:
         triton_cc_layer_norm_mul_dropout_wrapper,
     )
 except ImportError:
-    pass
+    triton_cc_addmm = None
+    triton_cc_group_norm_mul_dropout_wrapper = None
+    triton_cc_layer_norm_mul_dropout_wrapper = None
 from generative_recommenders.common import HammerKernel
 from generative_recommenders.ops.hstu_attention import hstu_mha
 from generative_recommenders.ops.triton.triton_hstu_linear import (
@@ -129,6 +131,10 @@ def hstu_compute_output(
             recompute_y_in_backward=recompute_y_in_backward,
         )
     elif kernel == HammerKernel.TRITON_CC:
+        if triton_cc_group_norm_mul_dropout_wrapper is None or triton_cc_addmm is None:
+            raise ImportError(
+                "hammer is required for the TRITON_CC kernel in hstu_compute_output."
+            )
         if group_norm:
             y = triton_cc_group_norm_mul_dropout_wrapper(
                 x=attn,

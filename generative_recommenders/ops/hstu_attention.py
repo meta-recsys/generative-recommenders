@@ -28,13 +28,16 @@ from generative_recommenders.ops.triton.triton_hstu_attention import (
     triton_cached_hstu_mha,
     triton_hstu_mha,
 )
-from hammer.v2.ops.triton.template.tlx_bw_hstu_attention import tlx_bw_hstu_mha_wrapper
 
 try:
     from hammer.ops.triton.cc.hstu_attention.triton_cc_hstu_attention import (
         triton_cc_hstu_mha,
     )
-except:
+    from hammer.v2.ops.triton.template.tlx_bw_hstu_attention import (
+        tlx_bw_hstu_mha_wrapper,
+    )
+except ImportError:
+    tlx_bw_hstu_mha_wrapper = None
     from generative_recommenders.ops.triton.triton_hstu_attention import (
         triton_hstu_mha as triton_cc_hstu_mha,
     )
@@ -101,6 +104,11 @@ def hstu_mha(
             enable_tma=enable_tma,
         )
     elif kernel == HammerKernel.TLX:
+        if tlx_bw_hstu_mha_wrapper is None:
+            raise ImportError(
+                "hammer.v2 is required for the TLX kernel. "
+                "Falling back to TRITON or PYTORCH kernel instead."
+            )
         return tlx_bw_hstu_mha_wrapper(
             max_seq_len=max_seq_len,
             alpha=alpha,
