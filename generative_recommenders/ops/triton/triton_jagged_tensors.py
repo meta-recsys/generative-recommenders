@@ -737,6 +737,7 @@ class _Split2DJaggedFunction(torch.autograd.Function):
         return None, d_jagged_in, None, None, None, None, None, None, None
 
 
+@torch.jit.unused
 @torch.fx.wrap
 def triton_concat_2D_jagged(
     max_seq_len: int,
@@ -760,6 +761,7 @@ def triton_concat_2D_jagged(
     )
 
 
+@torch.jit.unused
 @torch.fx.wrap
 def triton_split_2D_jagged(
     max_seq_len: int,
@@ -1016,6 +1018,7 @@ class _Split2DJaggedMultirowFunction(torch.autograd.Function):
         return None, d_jagged_in, None, None, None, None, None, None
 
 
+@torch.jit.unused
 @torch.fx.wrap
 def triton_concat_2D_jagged_multirow(
     max_seq_len: int,
@@ -1038,6 +1041,7 @@ def triton_concat_2D_jagged_multirow(
     )
 
 
+@torch.jit.unused
 @torch.fx.wrap
 def triton_split_2D_jagged_multirow(
     max_seq_len: int,

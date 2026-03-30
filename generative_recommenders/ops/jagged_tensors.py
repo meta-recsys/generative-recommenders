@@ -36,6 +36,8 @@ from generative_recommenders.ops.triton.triton_jagged_tensors import (
 )
 from torch.fx._symbolic_trace import is_fx_tracing
 
+torch.fx.wrap("triton_jagged_dense_bmm_add")
+
 try:
     from hammer.ops.triton.cc.jagged_dense_bmm.triton_cc_jagged_dense_bmm import (
         triton_cc_jagged_dense_bmm,
@@ -46,6 +48,8 @@ except ImportError:
 
 torch.fx.wrap("triton_concat_2D_jagged")
 torch.fx.wrap("triton_split_2D_jagged")
+torch.fx.wrap("triton_concat_2D_jagged_multirow")
+torch.fx.wrap("triton_split_2D_jagged_multirow")
 
 
 def concat_2D_jagged(

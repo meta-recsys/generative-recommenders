@@ -48,6 +48,8 @@ from generative_recommenders.ops.triton.triton_hstu_preprocess_and_attention imp
 )
 from torch.fx._symbolic_trace import is_fx_tracing
 
+torch.fx.wrap("triton_hstu_compute_output")
+
 
 def hstu_compute_uqvk(
     x: torch.Tensor,
