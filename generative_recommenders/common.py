@@ -396,7 +396,8 @@ def fx_arange(len: int, device: torch.device) -> torch.Tensor:
 def fx_infer_max_len(
     lengths: torch.Tensor,
 ) -> int:
-    max_len = int(lengths.max().item())
+    # Do not call ".item()" to avoid unbacked symint problems for lowering
+    max_len = int(lengths.max())
     if not torch.jit.is_scripting() and torch.compiler.is_compiling():
         # Tell Dynamo this data-dependent value is in the range [0, 10**9)
         torch._check_is_size(max_len)
