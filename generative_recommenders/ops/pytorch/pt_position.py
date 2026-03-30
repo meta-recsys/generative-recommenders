@@ -103,7 +103,7 @@ def pytorch_add_timestamp_positional_embeddings(
         values=timestamps.unsqueeze(-1),
         offsets=[seq_offsets],
         max_lengths=[max_seq_len],
-        padding_value=0,
+        padding_value=0.0,
     ).squeeze(-1)
     query_time = torch.gather(
         timestamps, dim=1, index=(seq_lengths - 1).unsqueeze(1).clamp(min=0)

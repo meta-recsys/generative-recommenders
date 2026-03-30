@@ -46,6 +46,7 @@ from torch.fx._symbolic_trace import is_fx_tracing
 
 torch.fx.wrap("triton_layer_norm")
 torch.fx.wrap("triton_swish_layer_norm")
+torch.fx.wrap("triton_rms_norm")
 
 
 def layer_norm(
