@@ -32,23 +32,26 @@ from generative_recommenders.ops.utils import is_sm100_plus, maybe_register_cust
 
 try:
     # @manual=//triton:triton
-    from triton.language.extra.libdevice import fast_dividef
+    from triton.language.extra.libdevice import fast_dividef, rsqrt as libdevice_rsqrt
 except ImportError:
     try:
         # @manual=//triton:triton
-        from triton.language.extra.cuda.libdevice import fast_dividef
+        from triton.language.extra.cuda.libdevice import (
+            fast_dividef,
+            rsqrt as libdevice_rsqrt,
+        )
     except ImportError:
         # pyre-ignore: Undefined import [21]
         # @manual=//triton:triton
-        from triton.language.math import fast_dividef
+        from triton.language.math import fast_dividef, rsqrt as libdevice_rsqrt
 
 
 def _get_layer_norm_fwd_configs() -> List[triton.Config]:
     """Generate autotune configs for multi-row LayerNorm kernels."""
     configs = []
-    block_ns = [4, 8, 16] if is_sm100_plus() else [1, 2]
+    block_ns = [4, 8, 16] if is_sm100_plus() else [1, 2, 4, 8]
     for BLOCK_N in block_ns:
-        for num_warps in [1, 2, 4]:
+        for num_warps in [1, 2, 4, 8]:
             configs.append(
                 triton.Config(
                     {"BLOCK_N": BLOCK_N},
@@ -230,7 +233,7 @@ def _weighted_layer_norm_fwd(
     if COMPUTE_MEAN_AND_RSTD:
         _var = x_mean * x_mean
         var = tl.sum(_var, axis=1) / D
-        rstd = 1 / tl.sqrt(var + eps)
+        rstd = libdevice_rsqrt(var + eps)
         if TRAINING:
             tl.store(Rstd + rows, rstd, row_mask)
     else:
@@ -524,9 +527,7 @@ def triton_weighted_layer_norm_fwd(
         return y, out_mean, out_rstd
 
     # pyre-ignore[28]
-    grid = lambda meta: (  # noqa E731
-        triton.cdiv(N, meta["BLOCK_N"]),
-    )
+    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]),)  # noqa E731
     if learnable:
         _weighted_layer_norm_fwd[grid](
             x,
@@ -1101,9 +1102,7 @@ class RMSNormFunction(torch.autograd.Function):
             return y
 
         # pyre-ignore[28]
-        grid = lambda meta: (  # noqa E731
-            triton.cdiv(N, meta["BLOCK_N"]),
-        )
+        grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]),)  # noqa E731
         _weighted_rms_norm_fwd[grid](
             x,
             y,
@@ -1193,9 +1192,7 @@ class SwishLayerNormFunction(torch.autograd.Function):
             return y
 
         # pyre-ignore[28]
-        grid = lambda meta: (  # noqa E731
-            triton.cdiv(N, meta["BLOCK_N"]),
-        )
+        grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]),)  # noqa E731
         _weighted_layer_norm_fwd[grid](
             x,
             y,
