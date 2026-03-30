@@ -406,6 +406,7 @@ class _AddTimestampPositionEmbeddingsFunction(torch.autograd.Function):
         )
 
 
+@torch.jit.unused
 @torch.fx.wrap
 def triton_add_timestamp_positional_embeddings(
     seq_embeddings: torch.Tensor,

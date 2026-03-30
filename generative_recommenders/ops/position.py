@@ -34,6 +34,8 @@ from generative_recommenders.ops.triton.triton_position import (
     triton_add_timestamp_positional_embeddings,
 )
 
+torch.fx.wrap("triton_add_timestamp_positional_embeddings")
+
 
 def add_timestamp_positional_embeddings(
     alpha: float,

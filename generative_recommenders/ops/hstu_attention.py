@@ -40,6 +40,9 @@ except:
     )
 from torch.fx._symbolic_trace import is_fx_tracing
 
+torch.fx.wrap("triton_hstu_mha")
+torch.fx.wrap("triton_cached_hstu_mha")
+
 
 def hstu_mha(
     max_seq_len: int,

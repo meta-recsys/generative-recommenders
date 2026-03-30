@@ -2996,6 +2996,7 @@ def triton_norm_mul_dropout(
         )
 
 
+@torch.jit.unused
 @torch.fx.wrap
 def triton_hstu_compute_output(
     attn: torch.Tensor,

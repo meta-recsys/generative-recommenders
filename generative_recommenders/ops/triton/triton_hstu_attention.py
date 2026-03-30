@@ -2944,6 +2944,7 @@ class _AttentionFunction(torch.autograd.Function):
             )
 
 
+@torch.jit.unused
 @torch.fx.wrap
 def triton_hstu_mha(
     N: int,
@@ -2973,6 +2974,7 @@ def triton_hstu_mha(
     )
 
 
+@torch.jit.unused
 @torch.fx.wrap
 def triton_cached_hstu_mha(
     N: int,
