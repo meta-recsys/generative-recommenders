@@ -18,8 +18,9 @@
 
 import abc
 import copy
+import os
 from enum import Enum, unique
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 
@@ -281,8 +282,19 @@ def next_power_of_2(n: int) -> int:
     return n
 
 
+def _prev_power_of_2_bitwise(x: int) -> int:
+    """Return the largest power of 2 less than or equal to x."""
+    x |= x >> 1
+    x |= x >> 2
+    x |= x >> 4
+    x |= x >> 8
+    x |= x >> 16
+    x |= x >> 32
+    return (x >> 1) + 1
+
+
 @torch.fx.wrap
-def prev_power_of_2(x: int) -> int:
+def _prev_power_of_2_legacy(x: int) -> int:
     if torch.compiler.is_compiling():
         # Re-write to make Dynamo happy
         x_tensor = torch.scalar_tensor(x, dtype=torch.int64)  # type: ignore[arg-type]
@@ -293,6 +305,13 @@ def prev_power_of_2(x: int) -> int:
     else:
         out = next_power_of_2(x)
         return out // 2 if out > x else out
+
+
+prev_power_of_2: Callable[[int], int] = (
+    _prev_power_of_2_legacy
+    if os.environ.get("PREV_POWER_OF_2_IMPL", "legacy") == "legacy"
+    else _prev_power_of_2_bitwise
+)
 
 
 STATIC_MAX_SEQ_LENS: List[int] = []
