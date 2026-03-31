@@ -47,7 +47,7 @@ except ImportError:
     pass
 
 
-def is_triton_swiglu_supported() -> bool:
+def is_blackwell_triton_swiglu_supported() -> bool:
     return is_sm100_plus() and TMA_AVAILABLE and HAS_TLX
 
 
@@ -476,19 +476,251 @@ def triton_swiglu_fwd_tma_ws_persistent_tlx(
     return out
 
 
+# =============================================================================
+# Standard fused SwiGLU kernel for A100/H100 (non-TLX path).
+#
+# Fuses silu(x @ W_gate^T) * (x @ W_up^T) into a single kernel launch.
+# Uses standard Triton pointer arithmetic (no TMA), works on SM80+.
+#
+# Key optimization: x is loaded from HBM ONCE and reused for both GEMMs.
+# Activation (silu * up) is computed in float32 registers, no HBM round-trip.
+#
+# Weight layout: expects [N, K] (nn.Linear native format).
+# The wrapper transposes to [K, N] for the GEMM internally.
+# =============================================================================
+
+
+def _get_swiglu_fwd_configs() -> List[triton.Config]:
+    """
+    Autotune configs for the standard (non-TLX) fused SwiGLU kernel.
+
+    Two float32 accumulators (gate + up) double register pressure vs single
+    GEMM, so smaller block sizes are included.
+    """
+    return [
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
+            num_stages=3,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_M": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
+            num_stages=3,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
+            num_stages=3,
+            num_warps=8,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 8},
+            num_stages=3,
+            num_warps=8,
+        ),
+        triton.Config(
+            {"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 32, "GROUP_M": 8},
+            num_stages=4,
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_M": 8},
+            num_stages=3,
+            num_warps=8,
+        ),
+    ]
+
+
+@triton_autotune(
+    configs=_get_swiglu_fwd_configs(),
+    key=["M_BLOCK", "N", "K"],
+)
+@triton.jit
+def _swiglu_fwd_kernel(
+    # Pointers to input/output tensors
+    x_ptr,  # [M, K] input activation
+    w_gate_ptr,  # [K, N] gate weight (already transposed from [N, K])
+    w_up_ptr,  # [K, N] up weight (already transposed from [N, K])
+    out_ptr,  # [M, N] output = silu(x @ w_gate) * (x @ w_up)
+    # Matrix dimensions
+    M,  # rows in x (batch_size * seq_len)
+    N,  # output dimension (hidden_dim)
+    K,  # input/reduction dimension (input_dim)
+    M_BLOCK,  # next_power_of_2(M) for stable autotuning
+    # Strides
+    stride_xm,
+    stride_xk,
+    stride_wgk,
+    stride_wgn,
+    stride_wuk,
+    stride_wun,
+    stride_om,
+    stride_on,
+    # Compile-time constants
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
+):
+    """
+    Fused SwiGLU forward: out = silu(x @ W_gate) * (x @ W_up).
+
+    Each thread block computes one [BLOCK_M, BLOCK_N] output tile.
+    Two accumulators share the same x tile loads (the fusion benefit).
+    """
+    # -- Step 1: Compute tile coordinates with grouped ordering (L2 reuse) --
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_in_group = pid % num_pid_in_group
+    pid_m = first_pid_m + (pid_in_group % group_size_m)
+    pid_n = pid_in_group // group_size_m
+
+    # -- Step 2: Set up pointers for x, w_gate, w_up tiles --
+    offs_m = tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_m = (pid_m * BLOCK_M + offs_m)[:, None] < M
+    mask_n = (pid_n * BLOCK_N + offs_n)[None, :] < N
+    # [BLOCK_M, BLOCK_K]
+    x_ptrs = (
+        x_ptr
+        + (pid_m.to(tl.int64) * BLOCK_M + offs_m)[:, None] * stride_xm
+        + offs_k[None, :] * stride_xk
+    )
+    # [BLOCK_K, BLOCK_N]
+    wg_ptrs = (
+        w_gate_ptr
+        + offs_k[:, None] * stride_wgk
+        + (pid_n.to(tl.int64) * BLOCK_N + offs_n)[None, :] * stride_wgn
+    )
+
+    # [BLOCK_K, BLOCK_N]
+    wu_ptrs = (
+        w_up_ptr
+        + offs_k[:, None] * stride_wuk
+        + (pid_n.to(tl.int64) * BLOCK_N + offs_n)[None, :] * stride_wun
+    )
+
+    # -- Step 3: K-loop - two GEMMs sharing the same x tile --
+    acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        mask_k = offs_k[None, :] < K - k * BLOCK_K
+        x = tl.load(x_ptrs, mask=mask_m & mask_k, other=0.0)
+        mask_k = offs_k[:, None] < K - k * BLOCK_K
+        wg = tl.load(wg_ptrs, mask=mask_k & mask_n, other=0.0)
+        wu = tl.load(wu_ptrs, mask=mask_k & mask_n, other=0.0)
+
+        acc_gate += tl.dot(x, wg, allow_tf32=ALLOW_TF32)
+        acc_up += tl.dot(x, wu, allow_tf32=ALLOW_TF32)
+
+        x_ptrs += BLOCK_K * stride_xk
+        wg_ptrs += BLOCK_K * stride_wgk
+        wu_ptrs += BLOCK_K * stride_wuk
+
+    # -- Step 4: Apply SwiGLU activation in registers (no HBM round-trip) --
+    gate_activated = acc_gate * tl.sigmoid(acc_gate)  # silu
+    result = (gate_activated * acc_up).to(out_ptr.dtype.element_ty)
+
+    # -- Step 5: Store result --
+    offs_m = pid_m * BLOCK_M + offs_m
+    offs_n = pid_n * BLOCK_N + offs_n
+    out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    tl.store(out_ptrs, result, mask=mask_m & mask_n)
+
+
+def triton_swiglu_fwd(
+    x: torch.Tensor,
+    w_gate: torch.Tensor,
+    w_up: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Forward pass of fused SwiGLU for A100/H100 (non-TLX path).
+
+    Computes: silu(x @ w_gate^T) * (x @ w_up^T)
+
+    Args:
+        x: [M, K] input tensor
+        w_gate: [N, K] gate weight (nn.Linear format)
+        w_up: [N, K] up weight (nn.Linear format)
+
+    Returns:
+        [M, N] output tensor
+    """
+    M, K = x.shape
+    N, K_gate = w_gate.shape
+    N_up, K_up = w_up.shape
+    assert K == K_gate, f"x.K={K} != w_gate.K={K_gate}"
+    assert K == K_up, f"x.K={K} != w_up.K={K_up}"
+    assert N == N_up, f"w_gate.N={N} != w_up.N={N_up}"
+
+    out = torch.empty((M, N), device=x.device, dtype=x.dtype)
+    if M == 0 or N == 0:
+        return out
+
+    M_BLOCK = triton.next_power_of_2(M)
+
+    # Transpose weights from [N, K] to [K, N] for the GEMM kernel
+    w_gate_t = w_gate.t().contiguous()
+    w_up_t = w_up.t().contiguous()
+
+    grid = lambda meta: (  # noqa E731
+        triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
+    )
+
+    _swiglu_fwd_kernel[grid](
+        x,
+        w_gate_t,
+        w_up_t,
+        out,
+        M,
+        N,
+        K,
+        M_BLOCK,
+        x.stride(0),
+        x.stride(1),
+        w_gate_t.stride(0),
+        w_gate_t.stride(1),
+        w_up_t.stride(0),
+        w_up_t.stride(1),
+        out.stride(0),
+        out.stride(1),
+        ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
+    )
+    return out
+
+
 def triton_swiglu(
     x: torch.Tensor,
     w_gate: torch.Tensor,
     w_up: torch.Tensor,
 ) -> torch.Tensor:
-    assert is_sm100_plus() and TMA_AVAILABLE and HAS_TLX, (
-        "triton_swiglu requires Blackwell (SM100+) with TMA and TLX support"
-    )
-
-    _, K = x.shape
-    N, _ = w_gate.shape
-    assert K % 16 == 0 and N % 16 == 0, (
-        f"K ({K}) and N ({N}) must be divisible by 16 for TMA alignment"
-    )
-
-    return triton_swiglu_fwd_tma_ws_persistent_tlx(x, w_gate, w_up)
+    if is_sm100_plus() and TMA_AVAILABLE and HAS_TLX:
+        # Blackwell: use the fast TLX persistent kernel with TMA
+        _, K = x.shape
+        N, _ = w_gate.shape
+        assert K % 16 == 0 and N % 16 == 0, (
+            f"K ({K}) and N ({N}) must be divisible by 16 for TMA alignment"
+        )
+        return triton_swiglu_fwd_tma_ws_persistent_tlx(x, w_gate, w_up)
+    else:
+        # A100/H100: use the standard fused kernel
+        return triton_swiglu_fwd(x, w_gate, w_up)
