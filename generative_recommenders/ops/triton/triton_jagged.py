@@ -45,6 +45,7 @@ CUDA_JAGGED_DENSE_BMM_FWD = False
 CUDA_JAGGED_DENSE_BMM_BWD = False
 
 SPLIT_2D_JAGGED_KERNEL = None
+GLN_MUL_DROPOUT_KERNEL = None
 
 
 def set_cuda_jagged_dense_bmm_fwd(value: bool) -> None:
@@ -91,6 +92,16 @@ def _should_use_multirow() -> bool:
     if env is not None:
         return env == "1"
     return is_sm100_plus()
+
+
+def set_gln_mul_dropout_kernel(value: Optional[str]) -> None:
+    global GLN_MUL_DROPOUT_KERNEL
+    GLN_MUL_DROPOUT_KERNEL = value
+
+
+def get_gln_mul_dropout_kernel() -> Optional[str]:
+    # only override during training
+    return GLN_MUL_DROPOUT_KERNEL
 
 
 def _triton_concat_2D_jagged_internal(
