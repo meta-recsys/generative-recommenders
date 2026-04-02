@@ -1503,6 +1503,7 @@ class _Split2DJaggedFunction(torch.autograd.Function):
         n_prefix_to_right: int = 0,
         seq_len_a: Optional[int] = None,
         seq_len_b: Optional[int] = None,
+        total_seq_len: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         values = switch_to_contiguous_if_needed(values)
         is_dense_a: bool = offsets_a is None
@@ -1529,27 +1530,33 @@ class _Split2DJaggedFunction(torch.autograd.Function):
             # "int(offsets_a[-1].item())" so that it won't cause "Cannot cast
             # FakeTensor to python number" error for AOTI.
             if torch.compiler.is_compiling():
-                offsets_a_last_idx = torch.tensor(offsets_a.size(0) - 1).to(
-                    offsets_a.device, non_blocking=True
-                )
                 offsets_b_last_idx = torch.tensor(offsets_b.size(0) - 1).to(
                     offsets_b.device, non_blocking=True
                 )
-                if seq_len_a is None:
-                    seq_len_a = offsets_a.index_select(dim=0, index=offsets_a_last_idx)
                 if seq_len_b is None:
                     seq_len_b = offsets_b.index_select(dim=0, index=offsets_b_last_idx)
+                if seq_len_a is None and total_seq_len is None:
+                    offsets_a_last_idx = torch.tensor(offsets_a.size(0) - 1).to(
+                        offsets_a.device, non_blocking=True
+                    )
+                    seq_len_a = offsets_a.index_select(dim=0, index=offsets_a_last_idx)
             else:
-                if seq_len_a is None:
-                    seq_len_a = int(offsets_a[-1].item())
                 if seq_len_b is None:
                     seq_len_b = int(offsets_b[-1].item())
+                if seq_len_a is None and total_seq_len is None:
+                    seq_len_a = int(offsets_a[-1].item())
         _, D = values.shape
         BLOCK_D = triton.next_power_of_2(D)
         # pyre-ignore[6] Incompatible parameter type
-        values_a = torch.empty((seq_len_a, D), device=values.device, dtype=values.dtype)
-        # pyre-ignore[6] Incompatible parameter type
         values_b = torch.empty((seq_len_b, D), device=values.device, dtype=values.dtype)
+        if seq_len_a is None:
+            # Derive seq_len_a from total_seq_len and values_b.size(0).
+            # values_b.size(0) is a SymInt (from the torch.empty above),
+            # so this is SymInt arithmetic — no new unbacked SymInt.
+            assert total_seq_len is not None
+            seq_len_a = total_seq_len - values_b.size(0)
+        # pyre-ignore[6] Incompatible parameter type
+        values_a = torch.empty((seq_len_a, D), device=values.device, dtype=values.dtype)
         _triton_split_2D_jagged_internal(
             jagged_in=values,
             max_seq_len=max_seq_len,
@@ -1585,7 +1592,7 @@ class _Split2DJaggedFunction(torch.autograd.Function):
     @staticmethod
     def backward(
         ctx, *d_values
-    ) -> Tuple[torch.Tensor, None, None, None, None, None, None, None]:
+    ) -> Tuple[torch.Tensor, None, None, None, None, None, None, None, None]:
         offsets_a, offsets_b = ctx.saved_tensors
         is_dense_a, is_dense_b = ctx.is_dense_a, ctx.is_dense_b
         values_a, values_b = d_values
@@ -1620,7 +1627,7 @@ class _Split2DJaggedFunction(torch.autograd.Function):
             BLOCK_D=BLOCK_D,
         )
 
-        return dvalues, None, None, None, None, None, None, None
+        return dvalues, None, None, None, None, None, None, None, None
 
 
 @torch.jit.unused
@@ -1723,6 +1730,7 @@ def triton_split_2D_jagged(
     n_prefix_to_right: int = 0,
     seq_len_a: Optional[int] = None,
     seq_len_b: Optional[int] = None,
+    total_seq_len: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return _Split2DJaggedFunction.apply(
         values,
@@ -1733,6 +1741,7 @@ def triton_split_2D_jagged(
         n_prefix_to_right,
         seq_len_a,
         seq_len_b,
+        total_seq_len,
     )
 
 
