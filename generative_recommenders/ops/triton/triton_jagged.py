@@ -46,6 +46,7 @@ CUDA_JAGGED_DENSE_BMM_BWD = False
 
 SPLIT_2D_JAGGED_KERNEL = None
 GLN_MUL_DROPOUT_KERNEL = None
+CONCAT_2D_JAGGED_KERNEL = None
 
 
 def set_cuda_jagged_dense_bmm_fwd(value: bool) -> None:
@@ -77,6 +78,18 @@ def get_split_2d_jagged_kernel() -> Optional[str]:
     # only override during training
     if torch.is_grad_enabled():
         return SPLIT_2D_JAGGED_KERNEL
+    return None
+
+
+def set_concat_2d_jagged_kernel(value: Optional[str]) -> None:
+    global CONCAT_2D_JAGGED_KERNEL
+    CONCAT_2D_JAGGED_KERNEL = value
+
+
+def get_concat_2d_jagged_kernel() -> Optional[str]:
+    # only override during training
+    if torch.is_grad_enabled():
+        return CONCAT_2D_JAGGED_KERNEL
     return None
 
 
@@ -1501,6 +1514,72 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
         return None, values_a, values_b, None, None, None, None
 
 
+class _HelionConcat2DJaggedFunction(torch.autograd.Function):
+    @staticmethod
+    # pyre-ignore[14]
+    def forward(
+        ctx,
+        max_seq_len: int,
+        values_a: torch.Tensor,
+        values_b: torch.Tensor,
+        offsets_a: Optional[torch.Tensor] = None,
+        offsets_b: Optional[torch.Tensor] = None,
+    ):
+        values_a = switch_to_contiguous_if_needed(values_a)
+        values_b = switch_to_contiguous_if_needed(values_b)
+
+        assert offsets_a is not None and offsets_b is not None
+        B = offsets_a.shape[0] - 1
+        seq_len_a, D = values_a.shape
+        seq_len_b, _ = values_b.shape
+        device = values_a.device
+        dtype = values_a.dtype
+
+        BLOCK_D = triton.next_power_of_2(D)
+        values_out = torch.empty((seq_len_a + seq_len_b, D), device=device, dtype=dtype)
+        _triton_concat_2D_jagged_internal(
+            values_a=values_a,
+            values_b=values_b,
+            values_out=values_out,
+            max_seq_len=max_seq_len,
+            B=B,
+            offsets_a=offsets_a,
+            offsets_b=offsets_b,
+            D=D,
+            dense_size=0,
+            stride_dense_batch=0,
+            n_prefix=0,
+            is_dense_a=False,
+            is_dense_b=False,
+            is_replace=False,
+            BLOCK_D=BLOCK_D,
+        )
+        ctx.save_for_backward(offsets_a, offsets_b)
+        ctx.max_seq_len = max_seq_len
+        ctx.seq_len_a = seq_len_a
+        ctx.seq_len_b = seq_len_b
+        return values_out
+
+    @staticmethod
+    # pyre-ignore[14]
+    def backward(
+        ctx, d_out: torch.Tensor
+    ) -> Tuple[None, torch.Tensor, torch.Tensor, None, None, None, None]:
+        offsets_a, offsets_b = ctx.saved_tensors
+        d_out = switch_to_contiguous_if_needed(d_out)
+        values_a, values_b = _helion_split_2D_jagged_impl(
+            values=d_out,
+            max_seq_len=ctx.max_seq_len,
+            offsets_a=offsets_a,
+            offsets_b=offsets_b,
+            dense_size=0,
+            total_len_a=ctx.seq_len_a,
+            total_len_b=ctx.seq_len_b,
+        )
+
+        return None, values_a, values_b, None, None, None, None
+
+
 class _Split2DJaggedFunction(torch.autograd.Function):
     @staticmethod
     # pyre-ignore[14]
@@ -1701,6 +1780,23 @@ def triton_concat_2D_jagged_jagged(
         offsets_b=offsets_right,
         is_replace=is_replace,
         n_prefix_from_right=n_prefix_from_right,
+    )
+
+
+@torch.fx.wrap
+def helion_concat_2D_jagged(
+    max_seq_len: int,
+    values_a: torch.Tensor,
+    values_b: torch.Tensor,
+    offsets_a: Optional[torch.Tensor] = None,
+    offsets_b: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    return _HelionConcat2DJaggedFunction.apply(
+        max_seq_len,
+        values_a,
+        values_b,
+        offsets_a,
+        offsets_b,
     )
 
 
@@ -2306,6 +2402,8 @@ class _HelionSplit2DJaggedFunction(torch.autograd.Function):
             offsets_a=offsets_a,
             offsets_b=offsets_b,
             dense_size=dense_size,
+            total_len_a=seq_len_a,
+            total_len_b=seq_len_b,
         )
 
         ctx.save_for_backward(offsets_a, offsets_b)
@@ -2354,6 +2452,8 @@ def _helion_split_2D_jagged_impl(
     offsets_a: torch.Tensor,
     offsets_b: torch.Tensor,
     dense_size: int = 0,  # noqa: F841
+    total_len_a: Optional[int] = None,
+    total_len_b: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     D = values.size(1)
 
@@ -2381,6 +2481,8 @@ def _helion_split_2D_jagged_impl(
         block_size_1=block_size_1,
         num_warps=num_warps,
         num_stages=num_stages,
+        total_len_a=total_len_a,
+        total_len_b=total_len_b,
     )
 
 
@@ -2394,12 +2496,16 @@ def _helion_split_2d_jagged(
     block_size_1: int = 64,
     num_warps: int = 4,
     num_stages: int = 4,
+    total_len_a: Optional[int] = None,
+    total_len_b: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     num_batches = offsets_a.size(0) - 1
     D = values.size(1)
     num_seq_blocks = (max_seq_len + block_size_0 - 1) // block_size_0
-    total_len_a = int(offsets_a[-1].item())
-    total_len_b = int(offsets_b[-1].item())
+    if total_len_a is None:
+        total_len_a = int(offsets_a[-1].item())
+    if total_len_b is None:
+        total_len_b = int(offsets_b[-1].item())
     out_a = torch.empty([total_len_a, D], dtype=values.dtype, device=values.device)
     out_b = torch.empty([total_len_b, D], dtype=values.dtype, device=values.device)
     values_flat = values.view(-1)
