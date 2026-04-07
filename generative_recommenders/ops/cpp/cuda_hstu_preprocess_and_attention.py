@@ -162,7 +162,25 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             # different code path. Set to None to satisfy type checker.
             uvqk = None
         else:
-            uvqk = maybe_triton_addmm_fwd(normed_x, uvqk_weight, uvqk_bias).contiguous()
+            if fp8_in_addmm_fwd:
+                assert (
+                    x_scale is not None
+                    and normed_x_fp8 is not None
+                    and uvqk_bias is not None
+                )
+                uvqk = fp8_rowwise_quantize_addmm(
+                    x=normed_x,
+                    x_fp8=normed_x_fp8,
+                    w=uvqk_weight,
+                    y=uvqk_bias,
+                    x_scale=x_scale,
+                    custom_kernel=False,
+                    is_inference=False,
+                ).contiguous()
+            else:
+                uvqk = maybe_triton_addmm_fwd(
+                    normed_x, uvqk_weight, uvqk_bias
+                ).contiguous()
             u, v, q, k = uvqk.split(
                 [
                     hidden_dim * num_heads,
