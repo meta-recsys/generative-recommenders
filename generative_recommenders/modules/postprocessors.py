@@ -21,6 +21,7 @@ from typing import Dict, List, Tuple
 
 import torch
 from generative_recommenders.common import HammerModule, init_mlp_weights_optional_bias
+from generative_recommenders.ops.layer_norm import SwishLayerNorm
 
 
 @torch.fx.wrap
@@ -180,3 +181,116 @@ class TimestampLayerNormPostprocessor(OutputPostprocessor):
             )
         )
         return self._layer_norm(user_embeddings)
+
+
+class SurfaceTypeOutputPostprocessor(OutputPostprocessor):
+    """Surface-conditioned MoE postprocessor for HSTU output.
+
+    Applies per-surface expert MLPs with shared components and gating,
+    producing surface-specific user embeddings. Works with jagged (L, D) tensors.
+    """
+
+    PADDED_SURFACES_PAYLOAD_KEY: str = "padded_surfaces"
+    PADDED_SURFACE_GATING_EMB_PAYLOAD_KEY: str = "padded_surface_gating_embedding"
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_surfaces: int,
+        num_shared_components: int,
+        surface_gating_input_dim: int,
+        is_inference: bool = False,
+        eps: float = 1e-5,
+    ) -> None:
+        super().__init__(is_inference=is_inference)
+        self._num_surfaces = num_surfaces
+        self._num_shared_components = num_shared_components
+        self._embedding_dim = embedding_dim
+
+        self.surface_mlp: torch.nn.Sequential = torch.nn.Sequential(
+            torch.nn.Linear(embedding_dim, embedding_dim),
+            SwishLayerNorm(
+                embedding_dim,
+                is_inference=is_inference,
+            ),
+            torch.nn.Linear(embedding_dim, embedding_dim * num_surfaces),
+        ).apply(init_mlp_weights_optional_bias)
+
+        self.shared_mlp: torch.nn.Module = torch.nn.Sequential(
+            torch.nn.Linear(embedding_dim, embedding_dim),
+            SwishLayerNorm(
+                embedding_dim,
+                is_inference=is_inference,
+            ),
+            torch.nn.Linear(embedding_dim, embedding_dim * num_shared_components),
+        ).apply(init_mlp_weights_optional_bias)
+
+        self._gating_mlp: torch.nn.Module = torch.nn.Linear(
+            surface_gating_input_dim,
+            1 + num_shared_components,
+        )
+        self._layer_norm: torch.nn.Module = torch.nn.LayerNorm(
+            normalized_shape=[embedding_dim], eps=eps
+        )
+
+    def forward(
+        self,
+        seq_embeddings: torch.Tensor,
+        seq_timestamps: torch.Tensor,
+        seq_payloads: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Args:
+            seq_embeddings: (L, D) jagged embeddings.
+            seq_timestamps: (L,) unused.
+            seq_payloads: must contain:
+                - "padded_surfaces": (L,) int tensor of remapped surface indices.
+                - "padded_surface_gating_embedding": (L, gating_dim) surface gating embeddings.
+
+        Returns:
+            (L, D) postprocessed embeddings, L2-normalized.
+        """
+        # Cast input to match weight dtype, following LayerNormPostprocessor pattern.
+        # Postprocessor runs outside autocast; downstream expects Float32 output.
+        # pyre-fixme[6]: For 1st argument expected `dtype` but got `Union[dtype,
+        #  Tensor, Module]`.
+        seq_embeddings = seq_embeddings.to(self.surface_mlp[0].weight.dtype)
+
+        L = seq_embeddings.size(0)
+        D = self._embedding_dim
+
+        # 1. Surface-specific branch: project to num_surfaces heads, then select
+        seq_embeddings_surface = self.surface_mlp(seq_embeddings).reshape(
+            L, self._num_surfaces, D
+        )
+        surface_ids = seq_payloads[self.PADDED_SURFACES_PAYLOAD_KEY].long()  # (L,)
+        # Gather the surface-specific expert for each position
+        seq_embeddings_surface = seq_embeddings_surface[
+            torch.arange(L, device=seq_embeddings.device), surface_ids
+        ]  # (L, D)
+
+        # 2. Shared branch: project to num_shared_components heads
+        seq_embeddings_shared = self.shared_mlp(seq_embeddings).reshape(
+            L, self._num_shared_components, D
+        )
+
+        # 3. Gating: sigmoid over surface gating embedding
+        gating_embeddings = torch.sigmoid(
+            self._gating_mlp(
+                seq_payloads[self.PADDED_SURFACE_GATING_EMB_PAYLOAD_KEY].to(
+                    seq_embeddings.dtype
+                )
+            )
+        )  # (L, 1 + num_shared_components)
+
+        # 4. Weighted combination of surface expert + shared components
+        seq_embeddings = torch.matmul(
+            gating_embeddings.unsqueeze(-2),  # (L, 1, 1+num_shared)
+            torch.cat(
+                [seq_embeddings_surface.unsqueeze(-2), seq_embeddings_shared],
+                dim=-2,
+            ),  # (L, 1+num_shared, D)
+        ).squeeze(-2)  # (L, D)
+
+        # pyre-fixme[6]: For 1st argument expected `dtype` but got `Union[dtype, Tensor, Module]`.
+        return self._layer_norm(seq_embeddings.to(self._layer_norm.weight.dtype))
