@@ -85,12 +85,12 @@ def _prune_configs_for_tlx_persistent_addmm(configs, named_args, **kwargs):  # n
     M = named_args.get("M", 0)
     N = named_args.get("N", 0)
     BROADCAST_Y = kwargs.get("BROADCAST_Y", False)
-    EPILOGUE_SUBTILE = kwargs.get("EPILOGUE_SUBTILE", 1)
 
     pruned = []
     for c in configs:
         BLOCK_M = c.kwargs.get("BLOCK_M", 0)
         BLOCK_N = c.kwargs.get("BLOCK_N", 0)
+        EPILOGUE_SUBTILE = c.kwargs.get("EPILOGUE_SUBTILE", 1)
 
         # BLOCK_N >= 64 required for PAIR_CTA
         if BLOCK_N < 64:
@@ -306,6 +306,68 @@ def get_mm_configs(pre_hook=None) -> List[triton.Config]:
                 return [c for c in configs if c.num_warps >= 4]
 
             return configs
+
+
+def _get_addmm_tma_ws_persistent_configs(pre_hook=None) -> List[triton.Config]:
+    """Get configs for _addmm_fwd_tma_ws_persistent (sm100+ TLX kernel).
+
+    This kernel has unique requirements (warp specialization, PAIR_CTA,
+    EPILOGUE_SUBTILE) that don't apply to the other addmm kernels.
+    """
+    if ENABLE_FULL_TURNING_SPACE:
+        block_m_range = [64, 128]
+        block_n_range = [64, 128, 256]
+        block_k_range = [64, 128, 256]
+        group_m_range = [8]
+        num_warps_range = [4]
+        num_stage_range = [1]
+        epilogue_subtile_range = [1, 2]
+        return [
+            triton.Config(
+                {
+                    "BLOCK_M": block_m,
+                    "BLOCK_N": block_n,
+                    "BLOCK_K": block_k,
+                    "GROUP_M": group_m,
+                    "EPILOGUE_SUBTILE": epilogue_subtile,
+                },
+                num_stages=num_stages,
+                num_warps=num_warps,
+                pre_hook=pre_hook,
+            )
+            for block_m in block_m_range
+            for block_n in block_n_range
+            for block_k in block_k_range
+            for group_m in group_m_range
+            for num_stages in num_stage_range
+            for num_warps in num_warps_range
+            for epilogue_subtile in epilogue_subtile_range
+        ]
+    else:
+        configs = []
+        for block_m, block_n, block_k in [
+            (128, 256, 64),
+            (128, 128, 64),
+            (64, 128, 64),
+            (64, 256, 64),
+            (128, 64, 128),
+        ]:
+            for epilogue_subtile in [1, 2]:
+                configs.append(
+                    triton.Config(
+                        {
+                            "BLOCK_M": block_m,
+                            "BLOCK_N": block_n,
+                            "BLOCK_K": block_k,
+                            "GROUP_M": 8,
+                            "EPILOGUE_SUBTILE": epilogue_subtile,
+                        },
+                        num_stages=1,
+                        num_warps=4,
+                        pre_hook=pre_hook,
+                    ),
+                )
+        return configs
 
 
 @triton_cc(
@@ -620,7 +682,9 @@ def _addmm_fwd_tma_ws(
 
 
 @triton_autotune(
-    configs=get_mm_configs(pre_hook=_addmm_tma_set_block_size_hook),
+    configs=_get_addmm_tma_ws_persistent_configs(
+        pre_hook=_addmm_tma_set_block_size_hook
+    ),
     key=["M", "N", "K"],
     prune_configs_by={"early_config_prune": _prune_configs_for_tlx_persistent_addmm},
 )
@@ -1057,7 +1121,6 @@ def triton_addmm_fwd_tma_ws_persistent_tlx(
         NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
         NUM_TMEM_BUFFERS=NUM_TMEM_BUFFERS,
         NUM_SMS=NUM_SMS,
-        EPILOGUE_SUBTILE=2,
     )
     return z
 
