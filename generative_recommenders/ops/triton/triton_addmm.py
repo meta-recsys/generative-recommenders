@@ -91,6 +91,14 @@ def _prune_configs_for_tlx_persistent_addmm(configs, named_args, **kwargs):  # n
         BLOCK_M = c.kwargs.get("BLOCK_M", 0)
         BLOCK_N = c.kwargs.get("BLOCK_N", 0)
         EPILOGUE_SUBTILE = c.kwargs.get("EPILOGUE_SUBTILE", 1)
+        NUM_MMA_GROUPS = c.kwargs.get("NUM_MMA_GROUPS", 1)
+        BLOCK_M_SPLIT = BLOCK_M // NUM_MMA_GROUPS
+        NUM_SMEM_BUFFERS = c.kwargs.get("NUM_SMEM_BUFFERS", 1)
+        EPILOGUE_SUBTILE = c.kwargs.get("EPILOGUE_SUBTILE", 1)
+
+        # Hardware constraint: Always make MMA tile 128.
+        if BLOCK_M_SPLIT != 128:
+            continue
 
         # BLOCK_N >= 64 required for PAIR_CTA
         if BLOCK_N < 64:
@@ -105,13 +113,29 @@ def _prune_configs_for_tlx_persistent_addmm(configs, named_args, **kwargs):  # n
         if BROADCAST_Y and (BLOCK_N // EPILOGUE_SUBTILE) < 64:
             continue
 
+        # Prune the support SMEM_BUFFER configurations.
+        if BROADCAST_Y:
+            if NUM_MMA_GROUPS == 1 and NUM_SMEM_BUFFERS != 5:
+                continue
+            elif NUM_MMA_GROUPS == 2 and NUM_SMEM_BUFFERS != 4:
+                continue
+        else:
+            if NUM_MMA_GROUPS == 1 and NUM_SMEM_BUFFERS != 4:
+                continue
+            elif NUM_MMA_GROUPS == 2 and NUM_SMEM_BUFFERS != 3:
+                continue
+
         # PAIR_CTA requires even number of M tiles and even total tiles
         num_tiles_m = math.ceil(M / BLOCK_M) if BLOCK_M > 0 else 0
         num_tiles_n = math.ceil(N / BLOCK_N) if BLOCK_N > 0 else 0
         total_tiles = num_tiles_m * num_tiles_n
 
+        # PAIR_CTA incompatible with MMA M=64
         pair_cta_compatible = (
-            (num_tiles_m % 2 == 0) and (total_tiles % 2 == 0) and BLOCK_M == 128
+            (num_tiles_m % 2 == 0)
+            and (total_tiles % 2 == 0)
+            and BLOCK_M == 128
+            and NUM_MMA_GROUPS == 1
         )
 
         c.kwargs["PAIR_CTA"] = pair_cta_compatible
@@ -315,13 +339,14 @@ def _get_addmm_tma_ws_persistent_configs(pre_hook=None) -> List[triton.Config]:
     EPILOGUE_SUBTILE) that don't apply to the other addmm kernels.
     """
     if ENABLE_FULL_TURNING_SPACE:
-        block_m_range = [64, 128]
+        block_m_range = [64, 128, 256]
         block_n_range = [64, 128, 256]
         block_k_range = [64, 128, 256]
         group_m_range = [8]
         num_warps_range = [4]
         num_stage_range = [1]
-        epilogue_subtile_range = [1, 2]
+        epilogue_subtile_range = [1, 2, 4]
+        num_mma_groups_range = [1, 2]
         return [
             triton.Config(
                 {
@@ -330,6 +355,9 @@ def _get_addmm_tma_ws_persistent_configs(pre_hook=None) -> List[triton.Config]:
                     "BLOCK_K": block_k,
                     "GROUP_M": group_m,
                     "EPILOGUE_SUBTILE": epilogue_subtile,
+                    "NUM_MMA_GROUPS": num_mma_groups,
+                    "NUM_TMEM_BUFFERS": 1 if num_mma_groups == 2 else 2,
+                    "NUM_SMEM_BUFFERS": num_smem_buffers,
                 },
                 num_stages=num_stages,
                 num_warps=num_warps,
@@ -342,6 +370,8 @@ def _get_addmm_tma_ws_persistent_configs(pre_hook=None) -> List[triton.Config]:
             for num_stages in num_stage_range
             for num_warps in num_warps_range
             for epilogue_subtile in epilogue_subtile_range
+            for num_mma_groups in num_mma_groups_range
+            for num_smem_buffers in [3, 4, 5]
         ]
     else:
         configs = []
@@ -352,7 +382,9 @@ def _get_addmm_tma_ws_persistent_configs(pre_hook=None) -> List[triton.Config]:
             (64, 256, 64),
             (128, 64, 128),
         ]:
-            for epilogue_subtile in [1, 2]:
+            # Note: num_smem_buffers is pruned to 1 in
+            # the pruning function.
+            for num_smem_buffers in [3, 4, 5]:
                 configs.append(
                     triton.Config(
                         {
@@ -360,7 +392,10 @@ def _get_addmm_tma_ws_persistent_configs(pre_hook=None) -> List[triton.Config]:
                             "BLOCK_N": block_n,
                             "BLOCK_K": block_k,
                             "GROUP_M": 8,
-                            "EPILOGUE_SUBTILE": epilogue_subtile,
+                            "EPILOGUE_SUBTILE": 1,
+                            "NUM_MMA_GROUPS": 1,
+                            "NUM_TMEM_BUFFERS": 2,
+                            "NUM_SMEM_BUFFERS": num_smem_buffers,
                         },
                         num_stages=1,
                         num_warps=4,
@@ -465,19 +500,21 @@ def _addmm_tma_set_block_size_hook(nargs):
     BLOCK_M = nargs["BLOCK_M"]
     BLOCK_N = nargs["BLOCK_N"]
     BLOCK_K = nargs["BLOCK_K"]
+    NUM_MMA_GROUPS = nargs.get("NUM_MMA_GROUPS", 1)
+    BLOCK_M_SPLIT = BLOCK_M // NUM_MMA_GROUPS
     PAIR_CTA = nargs.get("PAIR_CTA", False)
-    nargs["x_desc"].block_shape = [BLOCK_M, BLOCK_K]
+    nargs["x_desc"].block_shape = [BLOCK_M_SPLIT, BLOCK_K]
     # In PAIR_CTA mode, each CTA loads BLOCK_N // 2 of W
     if PAIR_CTA:
         nargs["w_desc"].block_shape = [BLOCK_K, BLOCK_N // 2]
     else:
         nargs["w_desc"].block_shape = [BLOCK_K, BLOCK_N]
     EPILOGUE_SUBTILE = nargs.get("EPILOGUE_SUBTILE", 1)
-    nargs["z_desc"].block_shape = [BLOCK_M, BLOCK_N // EPILOGUE_SUBTILE]
+    nargs["z_desc"].block_shape = [BLOCK_M_SPLIT, BLOCK_N // EPILOGUE_SUBTILE]
     if nargs["BROADCAST_Y"]:
         nargs["y_desc"].block_shape = [1, BLOCK_N // EPILOGUE_SUBTILE]
     else:
-        nargs["y_desc"].block_shape = [BLOCK_M, BLOCK_N // EPILOGUE_SUBTILE]
+        nargs["y_desc"].block_shape = [BLOCK_M_SPLIT, BLOCK_N // EPILOGUE_SUBTILE]
 
 
 @triton.jit
@@ -708,9 +745,14 @@ def _addmm_fwd_tma_ws_persistent(
     NUM_SMS: tl.constexpr,
     EPILOGUE_SUBTILE: tl.constexpr,
     PAIR_CTA: tl.constexpr,
+    NUM_MMA_GROUPS: tl.constexpr,
 ):
+    BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
+
     # Allocate buffers once for all tiles
-    x_buffers = tlx.local_alloc((BLOCK_M, BLOCK_K), x_desc.dtype, NUM_SMEM_BUFFERS)
+    x_buffers = tlx.local_alloc(
+        (BLOCK_M_SPLIT, BLOCK_K), x_desc.dtype, NUM_SMEM_BUFFERS * NUM_MMA_GROUPS
+    )
     # In pair CTA mode, each CTA only needs to load half of W
     if PAIR_CTA:
         w_buffers = tlx.local_alloc(
@@ -719,83 +761,151 @@ def _addmm_fwd_tma_ws_persistent(
     else:
         w_buffers = tlx.local_alloc((BLOCK_K, BLOCK_N), w_desc.dtype, NUM_SMEM_BUFFERS)
     tmem_buffers = tlx.local_alloc(
-        (BLOCK_M, BLOCK_N), tl.float32, NUM_TMEM_BUFFERS, tlx.storage_kind.tmem
+        (BLOCK_M_SPLIT, BLOCK_N),
+        tl.float32,
+        NUM_TMEM_BUFFERS * NUM_MMA_GROUPS,
+        tlx.storage_kind.tmem,
     )
     slice_size: tl.constexpr = BLOCK_N // EPILOGUE_SUBTILE
-    if BROADCAST_Y:
-        y_buffers = tlx.local_alloc((1, slice_size), y_desc.dtype, EPILOGUE_SUBTILE)
+
+    Y_Z_SHARED: tl.constexpr = NUM_MMA_GROUPS == 2 and not BROADCAST_Y
+    if Y_Z_SHARED:
+        NUM_Z_BUFFERS: tl.constexpr = EPILOGUE_SUBTILE * NUM_MMA_GROUPS
     else:
+        NUM_Z_BUFFERS: tl.constexpr = NUM_MMA_GROUPS
+
+    if Y_Z_SHARED:
+        bias_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
         y_buffers = tlx.local_alloc(
-            (BLOCK_M, slice_size), y_desc.dtype, EPILOGUE_SUBTILE
+            (BLOCK_M_SPLIT, slice_size),
+            y_desc.dtype,
+            NUM_Z_BUFFERS,
+            reuse=bias_storage_alias,
+        )
+        z_buffers = tlx.local_alloc(
+            (BLOCK_M_SPLIT, slice_size),
+            z_desc.dtype,
+            NUM_Z_BUFFERS,
+            reuse=bias_storage_alias,
+        )
+        # Define y and z to share a single buffer
+        bias_storage_alias.set_buffer_overlap(
+            tlx.reuse_group(
+                y_buffers,
+                z_buffers,
+                group_type=tlx.reuse_group_type.shared,
+            )
+        )
+    else:
+        if BROADCAST_Y:
+            y_buffers = tlx.local_alloc(
+                (1, slice_size), y_desc.dtype, EPILOGUE_SUBTILE * NUM_MMA_GROUPS
+            )
+        else:
+            y_buffers = tlx.local_alloc(
+                (BLOCK_M_SPLIT, slice_size),
+                y_desc.dtype,
+                EPILOGUE_SUBTILE * NUM_MMA_GROUPS,
+            )
+        z_buffers = tlx.local_alloc(
+            (BLOCK_M_SPLIT, slice_size), z_desc.dtype, NUM_Z_BUFFERS
         )
 
+    cluster_cta_rank = tlx.cluster_cta_rank()
+    pred_cta0 = cluster_cta_rank == 0
     if PAIR_CTA:
-        cluster_cta_rank = tlx.cluster_cta_rank()
-        pred_cta0 = cluster_cta_rank == 0
-        cta_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=2)
+        cta_bars = tlx.alloc_barriers(
+            num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=2
+        )
 
-    # Barriers for producer <-> MMA
-    smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
-    smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
+    # Barriers for producer <-> MMA (separate X and W barriers)
+    x_smem_full_bars = tlx.alloc_barriers(
+        num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1
+    )
+    x_smem_empty_bars = tlx.alloc_barriers(
+        num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1
+    )
+    w_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
     # Barriers for MMA <-> Epilogue
-    tmem_full_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
-    tmem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_TMEM_BUFFERS, arrive_count=1)
+    tmem_full_bars = tlx.alloc_barriers(
+        num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1
+    )
+    tmem_empty_bars = tlx.alloc_barriers(
+        num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1
+    )
     # Barriers for producer <-> Epilogue
     # y_load_bar: producer signals when y data is ready
     # y_empty_bar: epilogue signals when done using y buffer
-    y_load_bars = tlx.alloc_barriers(num_barriers=EPILOGUE_SUBTILE, arrive_count=1)
-    y_empty_bars = tlx.alloc_barriers(num_barriers=EPILOGUE_SUBTILE, arrive_count=1)
+    y_load_bars = tlx.alloc_barriers(
+        num_barriers=EPILOGUE_SUBTILE * NUM_MMA_GROUPS, arrive_count=1
+    )
+    y_empty_bars = tlx.alloc_barriers(
+        num_barriers=EPILOGUE_SUBTILE * NUM_MMA_GROUPS, arrive_count=1
+    )
+    z_load_bars = tlx.alloc_barriers(num_barriers=NUM_Z_BUFFERS, arrive_count=1)
+    z_empty_bars = tlx.alloc_barriers(num_barriers=NUM_Z_BUFFERS, arrive_count=1)
 
     with tlx.async_tasks():
-        # Epilogue consumer: waits for Y from producer, adds bias, stores Z
+        # Epilogue consumer: waits for Y from producer, adds bias, stores to SMEM.
         with tlx.async_task("default"):
             start_pid = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BLOCK_M)
+            if PAIR_CTA:
+                # Round up to even for proper CTA pairing
+                num_pid_m = (num_pid_m + 1) // 2 * 2
             num_pid_n = tl.cdiv(N, BLOCK_N)
-            num_pid_in_group = GROUP_M * num_pid_n
             num_tiles = num_pid_m * num_pid_n
 
             tmem_read_phase = 0
             cur_tmem_buf = 0
             y_load_phase = 0
+            z_load_phase = 0
 
-            for tile_id in range(start_pid, num_tiles, NUM_SMS):
-                pid_m, pid_n = _compute_pid(
-                    tile_id, num_pid_in_group, num_pid_m, GROUP_M, NUM_SMS
-                )
-                offs_xm = pid_m * BLOCK_M
-                offs_wn = pid_n * BLOCK_N
+            z_idx = 0
+            for _ in range(start_pid, num_tiles, NUM_SMS):
+                for slice_id in tl.static_range(EPILOGUE_SUBTILE):
+                    for group_id in tl.static_range(NUM_MMA_GROUPS):
+                        buf_idx = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
+                        acc_tmem = tmem_buffers[buf_idx]
+                        if slice_id == 0:
+                            # Wait for MMA to finish computing this group
+                            tlx.barrier_wait(tmem_full_bars[buf_idx], tmem_read_phase)
 
-                # Wait for MMA to finish computing this tile
-                tlx.barrier_wait(tmem_full_bars[cur_tmem_buf], tmem_read_phase)
+                        # Load result from TMEM and add bias
+                        acc_subslice = tlx.subslice(
+                            acc_tmem, slice_id * slice_size, slice_size
+                        )
+                        result = tlx.local_load(acc_subslice)
+                        if slice_id == EPILOGUE_SUBTILE - 1:
+                            # Signal MMA that this TMEM buffer is now free
+                            tlx.barrier_arrive(tmem_empty_bars[buf_idx], 1)
+
+                        y_idx = slice_id * NUM_MMA_GROUPS + group_id
+                        y_buf_view = tlx.local_view(y_buffers, y_idx)
+                        y_full = tlx.local_view(y_load_bars, y_idx)
+                        tlx.barrier_wait(y_full, y_load_phase)
+                        y = tlx.local_load(y_buf_view)
+                        # If Y and Z are not shared signal we can load the next bias.
+                        if not Y_Z_SHARED:
+                            y_empty = tlx.local_view(y_empty_bars, y_idx)
+                            tlx.barrier_arrive(y_empty, 1)
+                        z = (result + y.to(tl.float32)).to(z_desc.dtype)
+                        z_buf_view = tlx.local_view(z_buffers, z_idx)
+                        # If Y and Z are not shared wait for Z to be empty.
+                        # If there are shared this already guarenteed.
+                        if not Y_Z_SHARED:
+                            z_empty = tlx.local_view(z_empty_bars, z_idx)
+                            tlx.barrier_wait(z_empty, z_load_phase ^ 1)
+                        tlx.local_store(z_buf_view, z)
+                        z_full = tlx.local_view(z_load_bars, z_idx)
+                        tlx.barrier_arrive(z_full, 1)
+                        z_load_phase = z_load_phase ^ (z_idx == (NUM_Z_BUFFERS - 1))
+                        # pyre-ignore[58]
+                        z_idx = (z_idx + 1) % NUM_Z_BUFFERS
+
                 tmem_read_phase = tmem_read_phase ^ (
                     cur_tmem_buf == int(NUM_TMEM_BUFFERS) - 1
                 )
-
-                # Load result from TMEM and add bias
-                acc_tmem = tmem_buffers[cur_tmem_buf]
-
-                # Process each subtile slice
-                for slice_id in tl.static_range(EPILOGUE_SUBTILE):
-                    acc_subslice = tlx.subslice(
-                        acc_tmem, slice_id * slice_size, slice_size
-                    )
-                    result = tlx.local_load(acc_subslice)
-                    if slice_id == EPILOGUE_SUBTILE - 1:
-                        # Signal MMA that this TMEM buffer is now free
-                        tlx.barrier_arrive(tmem_empty_bars[cur_tmem_buf], 1)
-
-                    y_buf_view = tlx.local_view(y_buffers, slice_id)
-                    y_bar = tlx.local_view(y_load_bars, slice_id)
-                    # Wait for the bias tile to be ready.
-                    tlx.barrier_wait(y_bar, y_load_phase)
-                    y = tlx.local_load(y_buf_view)
-                    y_empty = tlx.local_view(y_empty_bars, slice_id)
-                    # Signal the bias tile as free.
-                    tlx.barrier_arrive(y_empty, 1)
-                    z = (result + y.to(tl.float32)).to(z_desc.dtype)
-                    z_desc.store([offs_xm, offs_wn + slice_id * slice_size], z)
-
                 y_load_phase = y_load_phase ^ 1
 
                 cur_tmem_buf = (cur_tmem_buf + 1) % int(NUM_TMEM_BUFFERS)
@@ -804,6 +914,9 @@ def _addmm_fwd_tma_ws_persistent(
         with tlx.async_task(num_warps=1, num_regs=24):
             start_pid = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BLOCK_M)
+            if PAIR_CTA:
+                # Round up to even for proper CTA pairing
+                num_pid_m = (num_pid_m + 1) // 2 * 2
             num_pid_n = tl.cdiv(N, BLOCK_N)
             num_pid_in_group = GROUP_M * num_pid_n
             num_tiles = num_pid_m * num_pid_n
@@ -819,45 +932,90 @@ def _addmm_fwd_tma_ws_persistent(
                     tile_id, num_pid_in_group, num_pid_m, GROUP_M, NUM_SMS
                 )
 
-                # Wait for epilogue to finish with this TMEM buffer
-                tlx.barrier_wait(tmem_empty_bars[cur_tmem_buf], tmem_write_phase)
-                tmem_write_phase = tmem_write_phase ^ (
-                    cur_tmem_buf == int(NUM_TMEM_BUFFERS) - 1
-                )
+                # First K iteration (peeled): use_acc=False
+                buf = processed_k_iters % int(NUM_SMEM_BUFFERS)
+                tlx.barrier_wait(w_smem_full_bars[buf], dot_phase)
 
-                # Perform K-dimension reduction
-                for k in range(0, k_tiles):
-                    buf = (processed_k_iters + k) % int(NUM_SMEM_BUFFERS)
-                    tlx.barrier_wait(smem_full_bars[buf], dot_phase)
+                for group_id in tl.static_range(NUM_MMA_GROUPS):
+                    a_buf = group_id * NUM_SMEM_BUFFERS + buf
+                    acc_buf = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
 
-                    # CTA0 waits for both CTA0 and CTA1 to finish loading before issuing dot op
-                    # "Arrive Remote, Wait Local" pattern: all CTAs signal CTA 0's barrier, only CTA 0 waits
+                    tlx.barrier_wait(x_smem_full_bars[a_buf], dot_phase)
+
+                    # Wait for epilogue to finish with this TMEM buffer
+                    tlx.barrier_wait(tmem_empty_bars[acc_buf], tmem_write_phase)
+
                     if PAIR_CTA:
                         # pyre-ignore[61]
-                        tlx.barrier_arrive(cta_bars[buf], 1, remote_cta_rank=0)
+                        tlx.barrier_arrive(cta_bars[a_buf], 1, remote_cta_rank=0)
                         # pyre-ignore[61]
-                        tlx.barrier_wait(cta_bars[buf], phase=dot_phase, pred=pred_cta0)
+                        tlx.barrier_wait(
+                            # pyre-ignore[61]
+                            cta_bars[a_buf],
+                            phase=dot_phase,
+                            pred=pred_cta0,
+                        )
 
                     tlx.async_dot(
-                        x_buffers[buf],
+                        x_buffers[a_buf],
                         w_buffers[buf],
-                        tmem_buffers[cur_tmem_buf],
-                        use_acc=(k > 0),
-                        mBarriers=[smem_empty_bars[buf]],
+                        tmem_buffers[acc_buf],
+                        use_acc=False,
+                        mBarriers=[x_smem_empty_bars[a_buf]],
                         two_ctas=PAIR_CTA,
                         out_dtype=tl.float32,
                     )
 
+                dot_phase = dot_phase ^ (buf == int(NUM_SMEM_BUFFERS) - 1)
+
+                # Remaining K iterations: use_acc=True
+                for k in range(1, k_tiles):
+                    buf = (processed_k_iters + k) % int(NUM_SMEM_BUFFERS)
+                    tlx.barrier_wait(w_smem_full_bars[buf], dot_phase)
+
+                    for group_id in tl.static_range(NUM_MMA_GROUPS):
+                        a_buf = group_id * NUM_SMEM_BUFFERS + buf
+                        acc_buf = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
+
+                        tlx.barrier_wait(x_smem_full_bars[a_buf], dot_phase)
+
+                        if PAIR_CTA:
+                            # pyre-ignore[61]
+                            tlx.barrier_arrive(cta_bars[a_buf], 1, remote_cta_rank=0)
+                            # pyre-ignore[61]
+                            tlx.barrier_wait(
+                                # pyre-ignore[61]
+                                cta_bars[a_buf],
+                                phase=dot_phase,
+                                # pyre-ignore[61]
+                                pred=pred_cta0,
+                            )
+
+                        tlx.async_dot(
+                            x_buffers[a_buf],
+                            w_buffers[buf],
+                            tmem_buffers[acc_buf],
+                            use_acc=True,
+                            mBarriers=[x_smem_empty_bars[a_buf]],
+                            two_ctas=PAIR_CTA,
+                            out_dtype=tl.float32,
+                        )
+
                     dot_phase = dot_phase ^ (buf == int(NUM_SMEM_BUFFERS) - 1)
 
-                # Wait for last MMA to complete
+                # Wait for last MMA to complete and signal epilogue
                 last_buf = (processed_k_iters + k_tiles - 1) % int(NUM_SMEM_BUFFERS)
                 last_dot_phase = dot_phase ^ (last_buf == int(NUM_SMEM_BUFFERS) - 1)
-                tlx.barrier_wait(smem_empty_bars[last_buf], last_dot_phase)
+                for group_id in tl.static_range(NUM_MMA_GROUPS):
+                    a_buf = group_id * NUM_SMEM_BUFFERS + last_buf
+                    tlx.barrier_wait(x_smem_empty_bars[a_buf], last_dot_phase)
+                    acc_buf = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
+                    # Signal epilogue that result is ready
+                    tlx.barrier_arrive(tmem_full_bars[acc_buf], 1)
 
-                # Signal epilogue that result is ready
-                tlx.barrier_arrive(tmem_full_bars[cur_tmem_buf], 1)
-
+                tmem_write_phase = tmem_write_phase ^ (
+                    cur_tmem_buf == int(NUM_TMEM_BUFFERS) - 1
+                )
                 cur_tmem_buf = (cur_tmem_buf + 1) % int(NUM_TMEM_BUFFERS)
                 processed_k_iters += k_tiles
 
@@ -865,6 +1023,9 @@ def _addmm_fwd_tma_ws_persistent(
         with tlx.async_task(num_warps=1, num_regs=24):
             start_pid = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BLOCK_M)
+            if PAIR_CTA:
+                # Round up to even for proper CTA pairing
+                num_pid_m = (num_pid_m + 1) // 2 * 2
             num_pid_n = tl.cdiv(N, BLOCK_N)
             num_pid_in_group = GROUP_M * num_pid_n
             num_tiles = num_pid_m * num_pid_n
@@ -890,56 +1051,174 @@ def _addmm_fwd_tma_ws_persistent(
 
                 for k in range(0, k_tiles):
                     buf = (processed_k_iters + k) % int(NUM_SMEM_BUFFERS)
-
-                    # Wait for buffer to be free
-                    tlx.barrier_wait(smem_empty_bars[buf], load_phase ^ 1)
-
                     offs_k = k * BLOCK_K
+
+                    # Load X for group 0
+                    a_buf = buf  # 0 * NUM_SMEM_BUFFERS + buf
+                    tlx.barrier_wait(x_smem_empty_bars[a_buf], load_phase ^ 1)
+                    tlx.barrier_expect_bytes(
+                        x_smem_full_bars[a_buf],
+                        2 * BLOCK_M_SPLIT * BLOCK_K,
+                    )
+                    tlx.async_descriptor_load(
+                        x_desc,
+                        x_buffers[a_buf],
+                        [offs_xm, offs_k],
+                        x_smem_full_bars[a_buf],
+                    )
+
+                    # Load W (wait for last group's x_empty to know W is free)
+                    last_a_buf = (NUM_MMA_GROUPS - 1) * NUM_SMEM_BUFFERS + buf
+                    tlx.barrier_wait(x_smem_empty_bars[last_a_buf], load_phase ^ 1)
                     if PAIR_CTA:
                         tlx.barrier_expect_bytes(
-                            smem_full_bars[buf],
-                            2 * (BLOCK_M + BLOCK_N // 2) * BLOCK_K,
+                            w_smem_full_bars[buf],
+                            2 * BLOCK_K * (BLOCK_N // 2),
                         )
                     else:
                         tlx.barrier_expect_bytes(
-                            smem_full_bars[buf],
-                            2 * (BLOCK_M + BLOCK_N) * BLOCK_K,
+                            w_smem_full_bars[buf],
+                            2 * BLOCK_K * BLOCK_N,
                         )
                     tlx.async_descriptor_load(
-                        x_desc, x_buffers[buf], [offs_xm, offs_k], smem_full_bars[buf]
+                        w_desc,
+                        w_buffers[buf],
+                        [offs_k, offs_wn],
+                        w_smem_full_bars[buf],
                     )
-                    tlx.async_descriptor_load(
-                        w_desc, w_buffers[buf], [offs_k, offs_wn], smem_full_bars[buf]
-                    )
+
+                    # Load X for remaining groups
+                    for group_id in tl.static_range(1, NUM_MMA_GROUPS):
+                        a_buf = group_id * NUM_SMEM_BUFFERS + buf
+                        tlx.barrier_wait(x_smem_empty_bars[a_buf], load_phase ^ 1)
+                        offs_xm2 = offs_xm + group_id * BLOCK_M_SPLIT
+                        tlx.barrier_expect_bytes(
+                            x_smem_full_bars[a_buf],
+                            2 * BLOCK_M_SPLIT * BLOCK_K,
+                        )
+                        tlx.async_descriptor_load(
+                            x_desc,
+                            x_buffers[a_buf],
+                            [offs_xm2, offs_k],
+                            x_smem_full_bars[a_buf],
+                        )
 
                     load_phase = load_phase ^ (buf == int(NUM_SMEM_BUFFERS) - 1)
 
                 for slice_id in tl.static_range(EPILOGUE_SUBTILE):
-                    y_buf_view = tlx.local_view(y_buffers, slice_id)
-                    y_bar = tlx.local_view(y_load_bars, slice_id)
-                    # Wait for the bias tile to be ready.
-                    y_empty = tlx.local_view(y_empty_bars, slice_id)
-                    tlx.barrier_wait(y_empty, y_load_phase ^ 1)
-                    if BROADCAST_Y:
-                        tlx.barrier_expect_bytes(y_bar, 1 * slice_size * 2)
-                        tlx.async_descriptor_load(
-                            y_desc,
-                            y_buf_view,
-                            [0, offs_wn_full + slice_id * slice_size],
-                            y_bar,
-                        )
-                    else:
-                        tlx.barrier_expect_bytes(y_bar, BLOCK_M * slice_size * 2)
-                        tlx.async_descriptor_load(
-                            y_desc,
-                            y_buf_view,
-                            [offs_xm, offs_wn_full + slice_id * slice_size],
-                            y_bar,
-                        )
+                    for group_id in tl.static_range(NUM_MMA_GROUPS):
+                        y_idx = slice_id * NUM_MMA_GROUPS + group_id
+                        y_buf_view = tlx.local_view(y_buffers, y_idx)
+                        y_bar = tlx.local_view(y_load_bars, y_idx)
+                        # If Y and Z are shared we need to wait for Z to be empty.
+                        if Y_Z_SHARED:
+                            y_empty = tlx.local_view(z_empty_bars, y_idx)
+                        else:
+                            y_empty = tlx.local_view(y_empty_bars, y_idx)
+                        tlx.barrier_wait(y_empty, y_load_phase ^ 1)
+                        if BROADCAST_Y:
+                            tlx.barrier_expect_bytes(y_bar, 1 * slice_size * 2)
+                            tlx.async_descriptor_load(
+                                y_desc,
+                                y_buf_view,
+                                [0, offs_wn_full + slice_id * slice_size],
+                                y_bar,
+                            )
+                        else:
+                            tlx.barrier_expect_bytes(
+                                y_bar, BLOCK_M_SPLIT * slice_size * 2
+                            )
+                            tlx.async_descriptor_load(
+                                y_desc,
+                                y_buf_view,
+                                [
+                                    offs_xm + group_id * BLOCK_M_SPLIT,
+                                    offs_wn_full + slice_id * slice_size,
+                                ],
+                                y_bar,
+                            )
 
                 y_load_phase = y_load_phase ^ 1
 
                 processed_k_iters += k_tiles
+
+        # TMA Store consumer. Added to simplify the barrier
+        # logic.
+        with tlx.async_task(num_warps=1, num_regs=24):
+            start_pid = tl.program_id(axis=0)
+            num_pid_m = tl.cdiv(M, BLOCK_M)
+            if PAIR_CTA:
+                # Round up to even for proper CTA pairing
+                num_pid_m = (num_pid_m + 1) // 2 * 2
+            num_pid_n = tl.cdiv(N, BLOCK_N)
+            num_pid_in_group = GROUP_M * num_pid_n
+            num_tiles = num_pid_m * num_pid_n
+            z_load_phase = 0
+
+            # Unroll the first iteration.
+            # This guraranteed safe from our grid size.
+            pid_m, pid_n = _compute_pid(
+                start_pid, num_pid_in_group, num_pid_m, GROUP_M, NUM_SMS
+            )
+            offs_xm = pid_m * BLOCK_M
+            offs_wn = pid_n * BLOCK_N
+            z_idx = 0
+            for slice_id in tl.static_range(EPILOGUE_SUBTILE):
+                for group_id in tl.static_range(NUM_MMA_GROUPS):
+                    # Determine the base "index" to decide if we need to wait on TMA.
+                    z_idx_unrolled = slice_id * NUM_MMA_GROUPS + group_id
+                    if z_idx_unrolled >= NUM_Z_BUFFERS:
+                        tlx.async_descriptor_store_wait(NUM_Z_BUFFERS - 1)
+                        z_empty = tlx.local_view(z_empty_bars, z_idx)
+                        tlx.barrier_arrive(z_empty, 1)
+
+                    z_full = tlx.local_view(z_load_bars, z_idx)
+                    tlx.barrier_wait(z_full, z_load_phase)
+                    z_buf_view = tlx.local_view(z_buffers, z_idx)
+                    tlx.fence_async_shared()
+                    tlx.async_descriptor_store(
+                        z_desc,
+                        z_buf_view,
+                        [
+                            offs_xm + group_id * BLOCK_M_SPLIT,
+                            offs_wn + slice_id * slice_size,
+                        ],
+                    )
+
+                    z_load_phase = z_load_phase ^ (z_idx == (NUM_Z_BUFFERS - 1))
+                    # pyre-ignore[58]
+                    z_idx = (z_idx + 1) % NUM_Z_BUFFERS
+
+            for tile_id in range(start_pid + NUM_SMS, num_tiles, NUM_SMS):
+                pid_m, pid_n = _compute_pid(
+                    tile_id, num_pid_in_group, num_pid_m, GROUP_M, NUM_SMS
+                )
+                offs_xm = pid_m * BLOCK_M
+                offs_wn = pid_n * BLOCK_N
+                for slice_id in tl.static_range(EPILOGUE_SUBTILE):
+                    for group_id in tl.static_range(NUM_MMA_GROUPS):
+                        # Wait on prior store to finish.
+                        tlx.async_descriptor_store_wait(NUM_Z_BUFFERS - 1)
+                        z_empty = tlx.local_view(z_empty_bars, z_idx)
+                        tlx.barrier_arrive(z_empty, 1)
+                        # Wait for the next load to be ready
+                        z_full = tlx.local_view(z_load_bars, z_idx)
+                        tlx.barrier_wait(z_full, z_load_phase)
+                        z_buf_view = tlx.local_view(z_buffers, z_idx)
+                        tlx.async_descriptor_store(
+                            z_desc,
+                            z_buf_view,
+                            [
+                                offs_xm + group_id * BLOCK_M_SPLIT,
+                                offs_wn + slice_id * slice_size,
+                            ],
+                        )
+                        z_load_phase = z_load_phase ^ (z_idx == (NUM_Z_BUFFERS - 1))
+                        # pyre-ignore[58]
+                        z_idx = (z_idx + 1) % NUM_Z_BUFFERS
+
+            # Wait for the last store.
+            tlx.async_descriptor_store_wait(0)
 
 
 @torch.fx.wrap
@@ -1074,12 +1353,6 @@ def triton_addmm_fwd_tma_ws_persistent_tlx(
     if M == 0 or N == 0:
         return z
 
-    if is_y_1d:
-        NUM_SMEM_BUFFERS = 5
-        NUM_TMEM_BUFFERS = 2
-    else:
-        NUM_SMEM_BUFFERS = 4
-        NUM_TMEM_BUFFERS = 2
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
     # A dummy block value that will be overwritten by the hook
@@ -1101,12 +1374,19 @@ def triton_addmm_fwd_tma_ws_persistent_tlx(
     def grid(meta):
         BLOCK_M = meta["BLOCK_M"]
         BLOCK_N = meta["BLOCK_N"]
-        return (
-            min(
-                NUM_SMS,
-                triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
-            ),
-        )
+        num_pid_m = triton.cdiv(M, BLOCK_M)
+        num_pid_n = triton.cdiv(N, BLOCK_N)
+        # Round up num_pid_m to even for PAIR_CTA cluster compatibility
+        num_pid_m = (num_pid_m + 1) // 2 * 2
+        total_tiles = num_pid_m * num_pid_n
+        grid_size = min(NUM_SMS, total_tiles)
+        # Ensure grid is even for cluster compatibility
+        if grid_size % 2 == 1:
+            grid_size = min(grid_size + 1, NUM_SMS)
+            # If rounding up exceeds NUM_SMS and NUM_SMS is odd, round down instead
+            if grid_size % 2 == 1:
+                grid_size = grid_size - 1
+        return (grid_size,)
 
     _addmm_fwd_tma_ws_persistent[grid](
         x_desc,
@@ -1118,8 +1398,6 @@ def triton_addmm_fwd_tma_ws_persistent_tlx(
         K,
         ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
         BROADCAST_Y=is_y_1d,
-        NUM_SMEM_BUFFERS=NUM_SMEM_BUFFERS,
-        NUM_TMEM_BUFFERS=NUM_TMEM_BUFFERS,
         NUM_SMS=NUM_SMS,
     )
     return z
@@ -1242,7 +1520,6 @@ class _AddMmFunction(torch.autograd.Function):
         ctx.is_y_1d = y.dim() == 1
         if is_sm100_plus() and TMA_AVAILABLE and _check_tma_alignment(x, w, y):
             if x.dtype == torch.float32 or HAS_TLX == False:
-                # use TMA persistent kernel on sm100
                 return triton_addmm_fwd_tma_persistent(x, w, y, warp_specialize=True)
             else:
                 return triton_addmm_fwd_tma_ws_persistent_tlx(
