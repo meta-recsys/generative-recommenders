@@ -127,8 +127,16 @@ def pytorch_add_timestamp_positional_embeddings(
     time_embeddings = torch.index_select(ts_embeddings, 0, ts.reshape(-1)).view(
         B, max_seq_len, -1
     )
-    return torch.ops.fbgemm.jagged_dense_elementwise_add_jagged_output(
-        seq_embeddings,
-        [seq_offsets],
-        (time_embeddings + position_embeddings).to(seq_embeddings.dtype),
-    )[0]
+    padded_emb = torch.ops.fbgemm.jagged_to_padded_dense(
+        values=seq_embeddings,
+        offsets=[seq_offsets],
+        max_lengths=[max_seq_len],
+        padding_value=0.0,
+    )
+    summed = padded_emb + (time_embeddings + position_embeddings).to(
+        seq_embeddings.dtype
+    )
+    result, _ = torch.ops.fbgemm.dense_to_jagged(
+        summed, [seq_offsets], seq_embeddings.shape[0]
+    )
+    return result
