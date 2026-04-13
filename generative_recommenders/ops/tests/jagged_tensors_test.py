@@ -32,6 +32,9 @@ from generative_recommenders.ops.jagged_tensors import (
     split_2D_jagged,
     split_2D_jagged_multirow,
 )
+from generative_recommenders.ops.pytorch.pt_jagged_tensors import (
+    pytorch_concat_2D_jagged,
+)
 from hypothesis import given, settings, strategies as st, Verbosity
 
 
@@ -961,3 +964,42 @@ class JaggedTensorsTest(unittest.TestCase):
             real_values_b.backward(d_values_b)
             real_d_values = values.grad.clone()
             torch.testing.assert_close(ref_d_values, real_d_values)
+
+
+class ConcatJagged3DDenseInputTest(unittest.TestCase):
+    """Test that pytorch_concat_2D_jagged handles 3D dense inputs [B, S, D]."""
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_concat_2D_jagged_3d_dense_input(self) -> None:
+        """3D dense [B, S, D] input should produce same result as equivalent 2D [B*S, D]."""
+        set_dev_mode(True)
+        B, S_left, S_right, D = 4, 8, 6, 16
+        device = torch.device("cuda")
+
+        # 3D dense inputs [B, S, D]
+        values_left_3d = torch.randn(B, S_left, D, device=device)
+        values_right_3d = torch.randn(B, S_right, D, device=device)
+
+        # Equivalent 2D inputs [B*S, D]
+        values_left_2d = values_left_3d.reshape(B * S_left, D)
+        values_right_2d = values_right_3d.reshape(B * S_right, D)
+
+        ref_out = pytorch_concat_2D_jagged(
+            values_left=values_left_2d,
+            values_right=values_right_2d,
+            max_len_left=S_left,
+            max_len_right=S_right,
+            offsets_left=None,
+            offsets_right=None,
+        )
+
+        out_3d = pytorch_concat_2D_jagged(
+            values_left=values_left_3d,
+            values_right=values_right_3d,
+            max_len_left=S_left,
+            max_len_right=S_right,
+            offsets_left=None,
+            offsets_right=None,
+        )
+
+        torch.testing.assert_close(ref_out, out_3d)

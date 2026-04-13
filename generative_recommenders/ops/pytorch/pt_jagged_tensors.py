@@ -74,6 +74,11 @@ def pytorch_concat_2D_jagged(
 ) -> torch.Tensor:
     if offsets_left is None:
         assert max_len_left is not None
+        # Handle 3D dense input [B, S, D] -> reshape to 2D [B*S, D]
+        if values_left.dim() == 3:
+            B, dense_size, D = values_left.size()
+            values_left = values_left.reshape(B * dense_size, D)
+            max_len_left = dense_size
         B = values_left.shape[0] // max_len_left
         offsets_left_non_optional = max_len_left * torch.arange(
             B + 1, device=values_left.device
@@ -82,6 +87,11 @@ def pytorch_concat_2D_jagged(
         offsets_left_non_optional = offsets_left
     if offsets_right is None:
         assert max_len_right is not None
+        # Handle 3D dense input [B, S, D] -> reshape to 2D [B*S, D]
+        if values_right.dim() == 3:
+            B, dense_size, D = values_right.size()
+            values_right = values_right.reshape(B * dense_size, D)
+            max_len_right = dense_size
         B = values_right.shape[0] // max_len_right
         offsets_right_non_optional = max_len_right * torch.arange(
             B + 1, device=values_left.device
