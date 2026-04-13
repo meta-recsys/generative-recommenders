@@ -190,6 +190,8 @@ class HSTUTransducer(HammerModule):
     def _postprocess(
         self,
         max_seq_len: int,
+        max_uih_len: int,
+        max_targets: int,
         total_uih_len: int,
         total_targets: int,
         seq_lengths: torch.Tensor,
@@ -216,6 +218,8 @@ class HSTUTransducer(HammerModule):
                 max_seq_len=max_seq_len,
                 total_len_left=total_uih_len,
                 total_len_right=total_targets,
+                max_len_left=max_uih_len,
+                max_len_right=max_targets,
                 offsets_left=uih_offsets,
                 offsets_right=candidates_offsets,
                 kernel=self.hammer_kernel(),
@@ -231,6 +235,8 @@ class HSTUTransducer(HammerModule):
                     max_seq_len=max_seq_len,
                     total_len_left=total_uih_len,
                     total_len_right=total_targets,
+                    max_len_left=max_uih_len,
+                    max_len_right=max_targets,
                     offsets_left=uih_offsets,
                     offsets_right=candidates_offsets,
                     kernel=self.hammer_kernel(),
@@ -301,6 +307,8 @@ class HSTUTransducer(HammerModule):
 
         encoded_embeddings, encoded_candidate_embeddings = self._postprocess(
             max_seq_len=max_seq_len,
+            max_uih_len=max_uih_len,
+            max_targets=max_targets,
             total_uih_len=total_uih_len,
             total_targets=total_targets,
             seq_lengths=seq_lengths,
