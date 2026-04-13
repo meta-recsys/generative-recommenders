@@ -157,37 +157,46 @@ def pytorch_concat_2D_jagged_jagged(
             offsets_right,
             values_right,
         )
-    _, D = values_left.shape
-    max_seq_len = max_seq_len_left + max_seq_len_right
-    B = offsets_left.shape[0] - 1
 
     lengths_a = offsets_left[1:] - offsets_left[:-1]
     lengths_b = offsets_right[1:] - offsets_right[:-1]
-    dense_a = torch.ops.fbgemm.jagged_to_padded_dense(
-        values=values_left,
-        offsets=[offsets_left],
-        max_lengths=[max_seq_len_left],
-        padding_value=0.0,
+
+    # Compute output offsets via cumsum (no dynamic shapes).
+    output_lengths = lengths_a + lengths_b
+    output_offsets = torch.nn.functional.pad(
+        torch.cumsum(output_lengths, dim=0), (1, 0)
     )
-    dense_b = torch.ops.fbgemm.jagged_to_padded_dense(
-        values=values_right,
-        offsets=[offsets_right],
-        max_lengths=[max_seq_len_right],
-        padding_value=0.0,
+
+    total_len = values_left.shape[0] + values_right.shape[0]
+    positions = torch.arange(total_len, device=values_left.device)
+    batch_idx = torch.searchsorted(output_offsets[1:], positions, right=True)
+    local_pos = positions - output_offsets[batch_idx]
+
+    per_batch_lengths_a = lengths_a[batch_idx]
+
+    # Classify each output position into prefix / left / suffix.
+    is_prefix = local_pos < n_prefix_from_right
+    is_left = (local_pos >= n_prefix_from_right) & (
+        local_pos < n_prefix_from_right + per_batch_lengths_a
     )
-    dense_b_prefix, dense_b_suffix = torch.split(
-        dense_b, [n_prefix_from_right, max_seq_len_right - n_prefix_from_right], dim=1
+
+    # Pad with a sentinel zero row so index_select works on empty tensors
+    values_left_safe = torch.nn.functional.pad(values_left, (0, 0, 0, 1))
+    values_right_safe = torch.nn.functional.pad(values_right, (0, 0, 0, 1))
+
+    left_idx = (offsets_left[batch_idx] + (local_pos - n_prefix_from_right)).clamp(
+        min=0, max=values_left.shape[0]
     )
-    dense = torch.cat([dense_b_prefix, dense_a, dense_b_suffix], dim=1)
-    mask = _arange(max_seq_len, device=offsets_left.device).expand(B, max_seq_len)
-    mask = torch.logical_or(
-        mask < lengths_a.view(B, 1) + n_prefix_from_right,
-        torch.logical_and(
-            mask >= max_seq_len_left + n_prefix_from_right,
-            mask < max_seq_len_left + lengths_b.view(B, 1),
-        ),
+    right_prefix_idx = offsets_right[batch_idx] + local_pos
+    right_suffix_idx = offsets_right[batch_idx] + (local_pos - per_batch_lengths_a)
+    right_idx = torch.where(is_prefix, right_prefix_idx, right_suffix_idx).clamp(
+        min=0, max=values_right.shape[0]
     )
-    return dense.view(-1, D)[mask.view(-1), :]
+
+    left_values = values_left_safe.index_select(0, left_idx)
+    right_values = values_right_safe.index_select(0, right_idx)
+
+    return torch.where(is_left.unsqueeze(-1), left_values, right_values)
 
 
 def pytorch_jagged_remove_first_or_last_1D(
@@ -228,25 +237,22 @@ def pytorch_replace_last_n_with_jagged(
     offsets_right: torch.Tensor,
     values_right: torch.Tensor,
 ) -> torch.Tensor:
-    B = offsets_left.shape[0] - 1
     lengths_a = offsets_left[1:] - offsets_left[:-1]
     lengths_b = offsets_right[1:] - offsets_right[:-1]
-    dense_a = torch.ops.fbgemm.jagged_to_padded_dense(
-        values=values_left,
-        offsets=[offsets_left],
-        max_lengths=[max_seq_len_left],
-        padding_value=0.0,
+
+    total_len = values_left.shape[0]
+    positions = torch.arange(total_len, device=values_left.device)
+    batch_idx = torch.searchsorted(offsets_left[1:], positions, right=True)
+    local_pos = positions - offsets_left[batch_idx]
+
+    # Positions >= (lengths_a - lengths_b) within each batch are in the replace zone.
+    threshold = lengths_a[batch_idx] - lengths_b[batch_idx]
+    in_replace_zone = local_pos >= threshold
+
+    # Pad with a sentinel zero row so index_select works on empty tensors
+    values_right_safe = torch.nn.functional.pad(values_right, (0, 0, 0, 1))
+    right_idx = (offsets_right[batch_idx] + (local_pos - threshold)).clamp(
+        min=0, max=values_right.shape[0]
     )
-    raw_mask = torch.arange(max_seq_len_left, device=offsets_left.device).expand(
-        B, max_seq_len_left
-    )
-    mask = torch.logical_and(
-        raw_mask >= (lengths_a - lengths_b).unsqueeze(1),
-        raw_mask < lengths_a.unsqueeze(1),
-    )
-    dense_a = fx_apply_mask(dense_a, mask, values_right)
-    jagged_a = torch.ops.fbgemm.dense_to_jagged(
-        dense_a,
-        [offsets_left],
-    )[0]
-    return jagged_a
+    right_values = values_right_safe.index_select(0, right_idx)
+    return torch.where(in_replace_zone.unsqueeze(-1), right_values, values_left)
