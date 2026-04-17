@@ -51,6 +51,16 @@ except ImportError:
 ENABLE_FULL_TURNING_SPACE = False
 
 
+def _use_meta_ws() -> bool:
+    """Check if Meta's warp specialization is available, enabled, and on SM100+."""
+    return (
+        is_sm100_plus()
+        and hasattr(triton, "knobs")
+        and hasattr(triton.knobs, "nvidia")
+        and triton.knobs.nvidia.use_meta_ws
+    )
+
+
 def _check_tma_alignment(
     x: torch.Tensor, w: torch.Tensor, y: torch.Tensor, min_alignment: int = 16
 ) -> bool:
@@ -79,6 +89,20 @@ def _check_tma_alignment(
     assert N == NY, f"incompatible dimensions {N}, {NY}"
 
     return (K % min_alignment == 0) and (N % min_alignment == 0)
+
+
+def _prune_persistent_autows_configs(configs, named_args, **kwargs):  # noqa
+    if not _use_meta_ws():
+        return configs
+    pruned = []
+    for c in configs:
+        BLOCK_M = c.kwargs.get("BLOCK_M", 0)
+        DP = c.kwargs.get("DATA_PARTITION_FACTOR", 1)
+        # DATA_PARTITION_FACTOR=2 is only supported with BLOCK_M=256
+        if DP == 2 and BLOCK_M != 256:
+            continue
+        pruned.append(c)
+    return pruned
 
 
 def _prune_configs_for_tlx_persistent_addmm(configs, named_args, **kwargs):  # noqa
@@ -405,6 +429,39 @@ def _get_addmm_tma_ws_persistent_configs(pre_hook=None) -> List[triton.Config]:
         return configs
 
 
+def get_triton_persistent_configs(pre_hook=None) -> List[triton.Config]:
+    if not _use_meta_ws():
+        configs = get_mm_configs(pre_hook=pre_hook)
+        for c in configs:
+            c.kwargs["DATA_PARTITION_FACTOR"] = 1
+            c.kwargs["EPILOGUE_SUBTILE"] = 1
+        return configs
+    # TODO: Prune configs to best configs.
+    return [
+        triton.Config(  # pyre-ignore[28]
+            {
+                "BLOCK_M": block_m,
+                "BLOCK_N": block_n,
+                "BLOCK_K": block_k,
+                "GROUP_M": 8,
+                "EPILOGUE_SUBTILE": subtile,
+                "DATA_PARTITION_FACTOR": DP,
+            },
+            num_stages=num_stages,
+            num_warps=4,
+            pre_hook=pre_hook,
+            early_tma_store_lowering=1,
+            maxRegAutoWS=255,
+        )
+        for block_m in [64, 128, 256]
+        for block_n in [64, 128, 256]
+        for block_k in [64, 128, 256]
+        for num_stages in [2, 3, 4]
+        for subtile in [1, 2, 4]
+        for DP in [1, 2]
+    ]
+
+
 @triton_cc(
     annotations={
         "M": "i32",
@@ -527,9 +584,104 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_SIZE_M, NUM_SMS):
     return pid_m, pid_n
 
 
+@triton.jit
+def _addmm_persistent_tile_body(
+    x_desc,
+    w_desc,
+    y_desc,
+    z_desc,
+    tile_id,
+    num_pid_in_group,
+    num_pid_m,
+    k_tiles,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    ALLOW_TF32: tl.constexpr,
+    BROADCAST_Y: tl.constexpr,
+    NUM_SMS: tl.constexpr,
+    EPILOGUE_SUBTILE: tl.constexpr,
+    INNER_WARP_SPECIALIZE: tl.constexpr,
+):
+    pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_M, NUM_SMS)
+    offs_xm = pid_m * BLOCK_M
+    offs_wn = pid_n * BLOCK_N
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in tl.range(0, k_tiles, warp_specialize=INNER_WARP_SPECIALIZE):
+        offs_k = k * BLOCK_K
+        x = x_desc.load([offs_xm, offs_k])
+        w = w_desc.load([offs_k, offs_wn])
+        accumulator = tl.dot(x, w, accumulator, allow_tf32=ALLOW_TF32)
+
+    # Epilogue subtiling breaks the store into multiple pieces to reduce
+    # shared memory consumption and allow higher stage counts.
+    if EPILOGUE_SUBTILE == 1:
+        if BROADCAST_Y:
+            y = y_desc.load([0, offs_wn])
+        else:
+            y = y_desc.load([offs_xm, offs_wn])
+        z = (accumulator + y.to(tl.float32)).to(z_desc.dtype)
+        z_desc.store([offs_xm, offs_wn], z)
+    elif EPILOGUE_SUBTILE == 2:
+        acc = tl.reshape(accumulator, (BLOCK_M, 2, BLOCK_N // 2))
+        acc = tl.permute(acc, (0, 2, 1))
+        acc0, acc1 = tl.split(acc)
+        if BROADCAST_Y:
+            y0 = y_desc.load([0, offs_wn])
+        else:
+            y0 = y_desc.load([offs_xm, offs_wn])
+        z0 = (acc0 + y0.to(tl.float32)).to(z_desc.dtype)
+        z_desc.store([offs_xm, offs_wn], z0)
+        if BROADCAST_Y:
+            y1 = y_desc.load([0, offs_wn + BLOCK_N // 2])
+        else:
+            y1 = y_desc.load([offs_xm, offs_wn + BLOCK_N // 2])
+        z1 = (acc1 + y1.to(tl.float32)).to(z_desc.dtype)
+        z_desc.store([offs_xm, offs_wn + BLOCK_N // 2], z1)
+    elif EPILOGUE_SUBTILE == 4:
+        acc = tl.reshape(accumulator, (BLOCK_M, 2, BLOCK_N // 2))
+        acc = tl.permute(acc, (0, 2, 1))
+        acc_lo, acc_hi = tl.split(acc)
+        acc_lo = tl.reshape(acc_lo, (BLOCK_M, 2, BLOCK_N // 4))
+        acc_lo = tl.permute(acc_lo, (0, 2, 1))
+        acc0, acc1 = tl.split(acc_lo)
+        acc_hi = tl.reshape(acc_hi, (BLOCK_M, 2, BLOCK_N // 4))
+        acc_hi = tl.permute(acc_hi, (0, 2, 1))
+        acc2, acc3 = tl.split(acc_hi)
+        if BROADCAST_Y:
+            y0 = y_desc.load([0, offs_wn])
+        else:
+            y0 = y_desc.load([offs_xm, offs_wn])
+        z0 = (acc0 + y0.to(tl.float32)).to(z_desc.dtype)
+        z_desc.store([offs_xm, offs_wn], z0)
+        if BROADCAST_Y:
+            y1 = y_desc.load([0, offs_wn + BLOCK_N // 4])
+        else:
+            y1 = y_desc.load([offs_xm, offs_wn + BLOCK_N // 4])
+        z1 = (acc1 + y1.to(tl.float32)).to(z_desc.dtype)
+        z_desc.store([offs_xm, offs_wn + BLOCK_N // 4], z1)
+        if BROADCAST_Y:
+            y2 = y_desc.load([0, offs_wn + 2 * BLOCK_N // 4])
+        else:
+            y2 = y_desc.load([offs_xm, offs_wn + 2 * BLOCK_N // 4])
+        z2 = (acc2 + y2.to(tl.float32)).to(z_desc.dtype)
+        z_desc.store([offs_xm, offs_wn + 2 * BLOCK_N // 4], z2)
+        if BROADCAST_Y:
+            y3 = y_desc.load([0, offs_wn + 3 * BLOCK_N // 4])
+        else:
+            y3 = y_desc.load([offs_xm, offs_wn + 3 * BLOCK_N // 4])
+        z3 = (acc3 + y3.to(tl.float32)).to(z_desc.dtype)
+        z_desc.store([offs_xm, offs_wn + 3 * BLOCK_N // 4], z3)
+    else:
+        tl.static_assert(False, "Unsupported EPILOGUE_SUBTILE value")
+
+
 @triton_autotune(
-    configs=get_mm_configs(pre_hook=_addmm_tma_set_block_size_hook),
-    key=["N", "K", "WARP_SPECIALIZE"],
+    configs=get_triton_persistent_configs(pre_hook=_addmm_tma_set_block_size_hook),
+    key=["M", "N", "K", "WARP_SPECIALIZE"],
+    prune_configs_by={"early_config_prune": _prune_persistent_autows_configs},
 )
 @triton.jit
 def _addmm_fwd_tma_persistent(
@@ -548,6 +700,9 @@ def _addmm_fwd_tma_persistent(
     BROADCAST_Y: tl.constexpr,
     WARP_SPECIALIZE: tl.constexpr,
     NUM_SMS: tl.constexpr,
+    EPILOGUE_SUBTILE: tl.constexpr,
+    DATA_PARTITION_FACTOR: tl.constexpr,
+    USE_META_WS: tl.constexpr,
 ):
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -557,27 +712,61 @@ def _addmm_fwd_tma_persistent(
 
     num_pid_in_group = GROUP_M * num_pid_n
 
-    for tile_id in tl.range(
-        start_pid, num_tiles, NUM_SMS, flatten=True, warp_specialize=WARP_SPECIALIZE
-    ):
-        pid_m, pid_n = _compute_pid(
-            tile_id, num_pid_in_group, num_pid_m, GROUP_M, NUM_SMS
-        )
-        offs_xm = pid_m * BLOCK_M
-        offs_wn = pid_n * BLOCK_N
-
-        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        for k in tl.range(0, k_tiles, warp_specialize=WARP_SPECIALIZE):
-            offs_k = k * BLOCK_K
-            x = x_desc.load([offs_xm, offs_k])
-            w = w_desc.load([offs_k, offs_wn])
-            accumulator = tl.dot(x, w, accumulator, allow_tf32=ALLOW_TF32)
-        if BROADCAST_Y:
-            y = y_desc.load([0, offs_wn])
-        else:
-            y = y_desc.load([offs_xm, offs_wn])
-        z = (accumulator + y.to(tl.float32)).to(z_desc.dtype)
-        z_desc.store([offs_xm, offs_wn], z)
+    if USE_META_WS:
+        # Some arguments are only available in FBexperimental.
+        # pyre-ignore[28]: smem_alloc_algo is FBexperimental
+        for tile_id in tl.range(
+            start_pid,
+            num_tiles,
+            NUM_SMS,
+            flatten=False,
+            warp_specialize=WARP_SPECIALIZE,
+            data_partition_factor=DATA_PARTITION_FACTOR,
+            smem_alloc_algo=1,
+        ):
+            _addmm_persistent_tile_body(
+                x_desc,
+                w_desc,
+                y_desc,
+                z_desc,
+                tile_id,
+                num_pid_in_group,
+                num_pid_m,
+                k_tiles,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                BLOCK_K=BLOCK_K,
+                GROUP_M=GROUP_M,
+                ALLOW_TF32=ALLOW_TF32,
+                BROADCAST_Y=BROADCAST_Y,
+                NUM_SMS=NUM_SMS,
+                EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+                INNER_WARP_SPECIALIZE=tl.constexpr(False),
+            )
+    else:
+        # Pure OAI Triton version.
+        for tile_id in tl.range(
+            start_pid, num_tiles, NUM_SMS, flatten=True, warp_specialize=WARP_SPECIALIZE
+        ):
+            _addmm_persistent_tile_body(
+                x_desc,
+                w_desc,
+                y_desc,
+                z_desc,
+                tile_id,
+                num_pid_in_group,
+                num_pid_m,
+                k_tiles,
+                BLOCK_M=BLOCK_M,
+                BLOCK_N=BLOCK_N,
+                BLOCK_K=BLOCK_K,
+                GROUP_M=GROUP_M,
+                ALLOW_TF32=ALLOW_TF32,
+                BROADCAST_Y=BROADCAST_Y,
+                NUM_SMS=NUM_SMS,
+                EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
+                INNER_WARP_SPECIALIZE=WARP_SPECIALIZE,
+            )
 
 
 @triton_autotune(
@@ -892,7 +1081,7 @@ def _addmm_fwd_tma_ws_persistent(
                         z = (result + y.to(tl.float32)).to(z_desc.dtype)
                         z_buf_view = tlx.local_view(z_buffers, z_idx)
                         # If Y and Z are not shared wait for Z to be empty.
-                        # If there are shared this already guarenteed.
+                        # If there are shared this already guaranteed.
                         if not Y_Z_SHARED:
                             z_empty = tlx.local_view(z_empty_bars, z_idx)
                             tlx.barrier_wait(z_empty, z_load_phase ^ 1)
@@ -1226,8 +1415,12 @@ def triton_addmm_fwd_tma_persistent(
     x: torch.Tensor,
     w: torch.Tensor,
     y: torch.Tensor,
-    warp_specialize: bool = False,
+    warp_specialize: bool | None = None,
 ) -> torch.Tensor:
+    _meta_ws = _use_meta_ws()
+    if warp_specialize is None:
+        warp_specialize = _meta_ws
+
     M, K = x.shape
     _, N = w.shape
 
@@ -1256,7 +1449,6 @@ def triton_addmm_fwd_tma_persistent(
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
     def grid(meta):
-        nonlocal x_desc, w_desc, z_desc
         BLOCK_M = meta["BLOCK_M"]
         BLOCK_N = meta["BLOCK_N"]
         return (
@@ -1278,6 +1470,7 @@ def triton_addmm_fwd_tma_persistent(
         BROADCAST_Y=is_y_1d,
         WARP_SPECIALIZE=warp_specialize,
         NUM_SMS=NUM_SMS,
+        USE_META_WS=_meta_ws,
     )
     return z
 
