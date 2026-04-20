@@ -497,7 +497,7 @@ def _get_swiglu_fwd_configs() -> List[triton.Config]:
     Two float32 accumulators (gate + up) double register pressure vs single
     GEMM, so smaller block sizes are included.
     """
-    return [
+    configs = [
         triton.Config(
             {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
             num_stages=3,
@@ -539,6 +539,33 @@ def _get_swiglu_fwd_configs() -> List[triton.Config]:
             num_warps=8,
         ),
     ]
+    if torch.version.hip:
+        hip_num_stages = 2 if triton.__version__ >= "3.2.0" else 0
+        configs.extend(
+            [
+                triton.Config(
+                    {"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 8},
+                    num_stages=hip_num_stages,
+                    num_warps=4,
+                ),
+                triton.Config(
+                    {"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP_M": 8},
+                    num_stages=hip_num_stages,
+                    num_warps=4,
+                ),
+                triton.Config(
+                    {"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
+                    num_stages=hip_num_stages,
+                    num_warps=4,
+                ),
+                triton.Config(
+                    {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 32, "GROUP_M": 8},
+                    num_stages=hip_num_stages,
+                    num_warps=4,
+                ),
+            ]
+        )
+    return configs
 
 
 @triton_autotune(
@@ -653,7 +680,7 @@ def triton_swiglu_fwd(
     w_up: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Forward pass of fused SwiGLU for A100/H100 (non-TLX path).
+    Forward pass of fused SwiGLU (non-TLX path). Works on A100/H100/MI300X.
 
     Computes: silu(x @ w_gate^T) * (x @ w_up^T)
 
