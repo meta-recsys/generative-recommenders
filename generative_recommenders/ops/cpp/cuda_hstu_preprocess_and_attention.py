@@ -355,22 +355,23 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         None,
         None,
     ]:
+        saved_tensors = ctx.saved_tensors
         x, norm_weight, norm_bias, x_mean, x_rstd, uvqk_weight, seq_offsets, out = (
-            ctx.saved_tensors[:8]
+            saved_tensors[:8]
         )
         idx = 8
         if ctx.num_softmax_heads > 0:
-            softmax_lse = ctx.saved_tensors[idx]
+            softmax_lse = saved_tensors[idx]
             idx += 1
         else:
             softmax_lse = None
         if ctx.has_multiple_targets:
-            num_targets = ctx.saved_tensors[idx]
+            num_targets = saved_tensors[idx]
             idx += 1
         else:
             num_targets = None
         if ctx.has_attn_scale:
-            attn_scale = ctx.saved_tensors[idx]
+            attn_scale = saved_tensors[idx]
             idx += 1
         else:
             attn_scale = None
@@ -385,11 +386,11 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 quantize_output=ctx.fp8_in_addmm_fwd,
             )
         else:
-            normed_x = ctx.saved_tensors[idx]
+            normed_x = saved_tensors[idx]
             idx += 1
         if ctx.recompute_uvqk_in_backward:
             if ctx.has_uvqk_bias:
-                uvqk_bias = ctx.saved_tensors[idx]
+                uvqk_bias = saved_tensors[idx]
                 idx += 1
             else:
                 uvqk_bias = None
@@ -417,7 +418,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                         dim=0,
                     )
                 if ctx.fp8_in_addmm_fwd:
-                    x_scale, normed_x_fp8 = ctx.saved_tensors[idx : idx + 2]
+                    x_scale, normed_x_fp8 = saved_tensors[idx : idx + 2]
                     vqk = fp8_rowwise_quantize_addmm(
                         x=normed_x,
                         x_fp8=normed_x_fp8,
@@ -445,7 +446,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             else:
                 # When silu_u is True, we recompute uvqk (all components)
                 if ctx.fp8_in_addmm_fwd:
-                    x_scale, normed_x_fp8 = ctx.saved_tensors[idx : idx + 2]
+                    x_scale, normed_x_fp8 = saved_tensors[idx : idx + 2]
                     uvqk = fp8_rowwise_quantize_addmm(
                         x=normed_x,
                         x_fp8=normed_x_fp8,
@@ -471,7 +472,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                     dim=1,
                 )
         else:
-            uvqk = ctx.saved_tensors[idx]
+            uvqk = saved_tensors[idx]
             idx += 1
             # Split saved uvqk into u, v, q, k components
             u, v, q, k = uvqk.split(
@@ -484,9 +485,9 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 dim=1,
             )
         if ctx.has_rotary_weights:
-            q_cos_weights, q_sin_weights, k_cos_weights, k_sin_weights = (
-                ctx.saved_tensors[idx : idx + 4]
-            )
+            q_cos_weights, q_sin_weights, k_cos_weights, k_sin_weights = saved_tensors[
+                idx : idx + 4
+            ]
             idx += 4
         else:
             q_cos_weights, q_sin_weights, k_cos_weights, k_sin_weights = (
