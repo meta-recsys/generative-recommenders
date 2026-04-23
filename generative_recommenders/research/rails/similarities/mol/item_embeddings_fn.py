@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# pyre-unsafe
+
 """
 Defines functions to generate item-side embeddings for MoL.
 

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# pyre-unsafe
+
 
 # Copied from Driss Guessous's PR in PyTorch: https://github.com/pytorch/pytorch/pull/105602
 

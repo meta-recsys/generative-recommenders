@@ -13,6 +13,8 @@
 # limitations under the License.
 #!/usr/bin/env python3
 
+# pyre-unsafe
+
 from typing import List, Optional, Tuple
 
 import torch

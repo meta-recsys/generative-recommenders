@@ -1,3 +1,4 @@
+# pyre-unsafe
 """
 Modified from https://github.com/Dao-AILab/flash-attention/blob/main/hopper/setup.py
 """
