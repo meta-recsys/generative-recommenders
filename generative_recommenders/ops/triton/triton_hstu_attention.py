@@ -2898,15 +2898,16 @@ class _AttentionFunction(torch.autograd.Function):
         None,
     ]:
         with torch.inference_mode():
-            q, k, v, seq_offsets = ctx.saved_tensors[:4]
+            _saved = ctx.saved_tensors
+            q, k, v, seq_offsets = _saved[:4]
             idx = 4
             if ctx.has_multiple_targets:
-                num_targets = ctx.saved_tensors[idx]
+                num_targets = _saved[idx]
                 idx += 1
             else:
                 num_targets = None
             if ctx.sort_by_length:
-                sort_by_length_indices = ctx.saved_tensors[idx]
+                sort_by_length_indices = _saved[idx]
             else:
                 sort_by_length_indices = None
 

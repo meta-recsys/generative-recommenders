@@ -172,12 +172,12 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         None,
         None,
     ]:
-        x, norm_weight, norm_bias, x_mean, x_rstd, uvqk_weight, seq_offsets = (
-            ctx.saved_tensors[:7]
-        )
+        # Unpack saved tensors once for selective-checkpoint compatibility.
+        _saved = ctx.saved_tensors
+        x, norm_weight, norm_bias, x_mean, x_rstd, uvqk_weight, seq_offsets = _saved[:7]
         idx = 7
         if ctx.has_multiple_targets:
-            num_targets = ctx.saved_tensors[idx]
+            num_targets = _saved[idx]
             idx += 1
         else:
             num_targets = None
@@ -191,17 +191,17 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 rstd=x_rstd,
             )
         else:
-            normed_x = ctx.saved_tensors[idx]
+            normed_x = _saved[idx]
             idx += 1
         if ctx.recompute_uvqk_in_backward:
-            uvqk_bias = ctx.saved_tensors[idx]
+            uvqk_bias = _saved[idx]
             uvqk = maybe_triton_addmm_fwd(x=normed_x, w=uvqk_weight, y=uvqk_bias)
             idx += 1
         else:
-            uvqk = ctx.saved_tensors[idx]
+            uvqk = _saved[idx]
             idx += 1
         if ctx.sort_by_length:
-            sort_by_length_indices = ctx.saved_tensors[idx]
+            sort_by_length_indices = _saved[idx]
         else:
             sort_by_length_indices = None
 
