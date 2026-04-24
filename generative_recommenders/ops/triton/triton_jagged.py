@@ -2501,6 +2501,7 @@ def _helion_split_2d_jagged(
     total_len_a: Optional[int] = None,
     total_len_b: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    values = values.contiguous()
     num_batches = offsets_a.size(0) - 1
     D = values.size(1)
     num_seq_blocks = (max_seq_len + block_size_0 - 1) // block_size_0
