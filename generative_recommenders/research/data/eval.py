@@ -151,6 +151,11 @@ def eval_metrics_v2_from_tensors(
         eval_top_k_prs = torch.cat(eval_top_k_prs_all, dim=0)
 
     assert eval_top_k_ids.size(1) == k
+    # Compute 1-based rank of `target_ids` within the retrieved `eval_top_k_ids`.
+    # NOTE: This assumes `eval_top_k_ids` does not contain duplicates for a given row.
+    # If duplicates exist, the equality mask may contain multiple True values and
+    # `torch.max(..., dim=1)` will return the *last* matching index (largest), which
+    # can bias ranks to be worse than expected.
     _, eval_rank_indices = torch.max(
         torch.cat(
             [eval_top_k_ids, target_ids],
