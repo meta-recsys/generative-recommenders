@@ -865,17 +865,17 @@ def _weighted_rms_norm_fwd(
     rows = start_row + tl.arange(0, BLOCK_N)
     row_mask = rows < N
 
-    # Compute variance (RMS norm uses x directly, not x - mean)
-    x_masked = tl.where(row_mask[:, None] & col_mask[None, :], x_block, 0.0)
-    _var = x_masked * x_masked
-    var = tl.sum(_var, axis=1) / D
+    # Compute variance (RMS norm uses x directly, not x - mean).
+    # OOB rows/cols already zeroed by tl.load(padding_option="zero"), so
+    # the explicit tl.where mask and _var temporary are redundant - fuse
+    # square + sum + scale into a single expression.
+    var = tl.sum(x_block * x_block, axis=1) / D
     rstd = 1 / tl.sqrt(var + eps)
     tl.store(Rstd + rows, rstd, row_mask)
 
-    # Normalize and apply linear transformation
-    rstd = tl.expand_dims(rstd, 1)
-    y = x_block * rstd
-    y = y * w[None, :]
+    # Normalize and apply linear transformation. Combine per-row rstd with
+    # per-col w first so the broadcast multiply collapses to one fused mul.
+    y = x_block * (tl.expand_dims(rstd, 1) * w[None, :])
 
     if SILU:
         # pyre-ignore[16]: Module `triton.language.math` has no attribute `fast_dividef`
