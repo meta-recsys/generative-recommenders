@@ -603,24 +603,40 @@ def _addmm_fwd_tma_ws(
     BROADCAST_Y: tl.constexpr,
     NUM_SMEM_BUFFERS: tl.constexpr,
 ):
+    # pyrefly: ignore [missing-attribute]
     x_buffers = tlx.local_alloc((BLOCK_M, BLOCK_K), x_desc.dtype, NUM_SMEM_BUFFERS)
+    # pyrefly: ignore [missing-attribute]
     w_buffers = tlx.local_alloc((BLOCK_K, BLOCK_N), w_desc.dtype, NUM_SMEM_BUFFERS)
+    # pyrefly: ignore [missing-attribute]
     acc_tmem_buffer = tlx.local_alloc(
-        (BLOCK_M, BLOCK_N), tl.float32, tl.constexpr(1), tlx.storage_kind.tmem
+        # pyrefly: ignore [missing-attribute]
+        (BLOCK_M, BLOCK_N),
+        tl.float32,
+        tl.constexpr(1),
+        # pyrefly: ignore [missing-attribute]
+        tlx.storage_kind.tmem,
     )
 
     if BROADCAST_Y:
+        # pyrefly: ignore [missing-attribute]
         y_buffer = tlx.local_alloc((1, BLOCK_N), y_desc.dtype, tl.constexpr(1))
     else:
+        # pyrefly: ignore [missing-attribute]
         y_buffer = tlx.local_alloc((BLOCK_M, BLOCK_N), y_desc.dtype, tl.constexpr(1))
+    # pyrefly: ignore [missing-attribute]
     z_buffer = tlx.local_alloc((BLOCK_M, BLOCK_N), z_desc.dtype, tl.constexpr(1))
 
+    # pyrefly: ignore [missing-attribute]
     smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
+    # pyrefly: ignore [missing-attribute]
     smem_empty_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
+    # pyrefly: ignore [missing-attribute]
     y_load_barrier = tlx.alloc_barriers(num_barriers=1, arrive_count=1)
 
+    # pyrefly: ignore [missing-attribute]
     with tlx.async_tasks():
         # Producer task: TMA loads
+        # pyrefly: ignore [missing-attribute]
         with tlx.async_task("default"):
             pid_0, pid_1 = tl.program_id(axis=0), tl.program_id(axis=1)
             pid = pid_0 * tl.num_programs(axis=1) + pid_1
@@ -643,16 +659,20 @@ def _addmm_fwd_tma_ws(
 
                 # Wait for buffer to be free
                 if k >= NUM_SMEM_BUFFERS:
+                    # pyrefly: ignore [missing-attribute]
                     tlx.barrier_wait(smem_empty_bars[buf], load_phase ^ 1)
 
                 offs_k = k * BLOCK_K
+                # pyrefly: ignore [missing-attribute]
                 tlx.barrier_expect_bytes(
                     smem_full_bars[buf],
                     2 * (BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N),
                 )
+                # pyrefly: ignore [missing-attribute]
                 tlx.async_descriptor_load(
                     x_desc, x_buffers[buf], [offs_xm, offs_k], smem_full_bars[buf]
                 )
+                # pyrefly: ignore [missing-attribute]
                 tlx.async_descriptor_load(
                     w_desc, w_buffers[buf], [offs_k, offs_wn], smem_full_bars[buf]
                 )
@@ -660,6 +680,7 @@ def _addmm_fwd_tma_ws(
                 load_phase = load_phase ^ (buf == NUM_SMEM_BUFFERS - 1)
 
         # Consumer task: async_dot MMA
+        # pyrefly: ignore [missing-attribute]
         with tlx.async_task(num_warps=4, num_regs=232):
             pid_0, pid_1 = tl.program_id(axis=0), tl.program_id(axis=1)
             pid = pid_0 * tl.num_programs(axis=1) + pid_1
@@ -677,13 +698,19 @@ def _addmm_fwd_tma_ws(
             k_tiles = tl.cdiv(K, BLOCK_K)
 
             # Start async load of y early
+            # pyrefly: ignore [missing-attribute]
             y_buf_view = tlx.local_view(y_buffer, 0)
+            # pyrefly: ignore [missing-attribute]
             y_load_bar = tlx.local_view(y_load_barrier, 0)
             if BROADCAST_Y:
+                # pyrefly: ignore [missing-attribute]
                 tlx.barrier_expect_bytes(y_load_bar, 1 * BLOCK_N * 2)
+                # pyrefly: ignore [missing-attribute]
                 tlx.async_descriptor_load(y_desc, y_buf_view, [0, offs_wn], y_load_bar)
             else:
+                # pyrefly: ignore [missing-attribute]
                 tlx.barrier_expect_bytes(y_load_bar, BLOCK_M * BLOCK_N * 2)
+                # pyrefly: ignore [missing-attribute]
                 tlx.async_descriptor_load(
                     y_desc, y_buf_view, [offs_xm, offs_wn], y_load_bar
                 )
@@ -691,8 +718,10 @@ def _addmm_fwd_tma_ws(
             dot_phase = 0
             for k in range(0, k_tiles):
                 buf = k % int(NUM_SMEM_BUFFERS)
+                # pyrefly: ignore [missing-attribute]
                 tlx.barrier_wait(smem_full_bars[buf], dot_phase)
 
+                # pyrefly: ignore [missing-attribute]
                 tlx.async_dot(
                     x_buffers[buf],
                     w_buffers[buf],
@@ -706,17 +735,25 @@ def _addmm_fwd_tma_ws(
 
             last_buf = (k_tiles - 1) % NUM_SMEM_BUFFERS
             last_dot_phase = dot_phase ^ (last_buf == NUM_SMEM_BUFFERS - 1)
+            # pyrefly: ignore [missing-attribute]
             tlx.barrier_wait(smem_empty_bars[last_buf], last_dot_phase)
 
+            # pyrefly: ignore [missing-attribute]
             tmem_result = tlx.local_load(acc_tmem_buffer[0])
 
+            # pyrefly: ignore [missing-attribute]
             tlx.barrier_wait(y_load_bar, 0)
+            # pyrefly: ignore [missing-attribute]
             y = tlx.local_load(y_buf_view)
 
             z = (tmem_result + y.to(tl.float32)).to(z_desc.dtype)
+            # pyrefly: ignore [missing-attribute]
             z_buf_view = tlx.local_view(z_buffer, 0)
+            # pyrefly: ignore [missing-attribute]
             tlx.local_store(z_buf_view, z)
+            # pyrefly: ignore [missing-attribute]
             tlx.async_descriptor_store(z_desc, z_buf_view, [offs_xm, offs_wn])
+            # pyrefly: ignore [missing-attribute]
             tlx.async_descriptor_store_wait(0)
 
 
@@ -752,24 +789,30 @@ def _addmm_fwd_tma_ws_persistent(
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
 
     # Allocate buffers once for all tiles
+    # pyrefly: ignore [missing-attribute]
     x_buffers = tlx.local_alloc(
         (BLOCK_M_SPLIT, BLOCK_K), x_desc.dtype, NUM_SMEM_BUFFERS * NUM_MMA_GROUPS
     )
     # In pair CTA mode, each CTA only needs to load half of W
     if PAIR_CTA:
+        # pyrefly: ignore [missing-attribute]
         w_buffers = tlx.local_alloc(
             (BLOCK_K, BLOCK_N // 2), w_desc.dtype, NUM_SMEM_BUFFERS
         )
     else:
+        # pyrefly: ignore [missing-attribute]
         w_buffers = tlx.local_alloc((BLOCK_K, BLOCK_N), w_desc.dtype, NUM_SMEM_BUFFERS)
+    # pyrefly: ignore [missing-attribute]
     tmem_buffers = tlx.local_alloc(
         (BLOCK_M_SPLIT, BLOCK_N),
         tl.float32,
         NUM_TMEM_BUFFERS * NUM_MMA_GROUPS,
+        # pyrefly: ignore [missing-attribute]
         tlx.storage_kind.tmem,
     )
     slice_size: tl.constexpr = BLOCK_N // EPILOGUE_SUBTILE
 
+    # pyrefly: ignore [bad-assignment]
     Y_Z_SHARED: tl.constexpr = NUM_MMA_GROUPS == 2 and not BROADCAST_Y
     if Y_Z_SHARED:
         NUM_Z_BUFFERS: tl.constexpr = EPILOGUE_SUBTILE * NUM_MMA_GROUPS
@@ -777,13 +820,16 @@ def _addmm_fwd_tma_ws_persistent(
         NUM_Z_BUFFERS: tl.constexpr = NUM_MMA_GROUPS
 
     if Y_Z_SHARED:
+        # pyrefly: ignore [missing-attribute]
         bias_storage_alias = tlx.storage_alias_spec(storage=tlx.storage_kind.smem)
+        # pyrefly: ignore [missing-attribute]
         y_buffers = tlx.local_alloc(
             (BLOCK_M_SPLIT, slice_size),
             y_desc.dtype,
             NUM_Z_BUFFERS,
             reuse=bias_storage_alias,
         )
+        # pyrefly: ignore [missing-attribute]
         z_buffers = tlx.local_alloc(
             (BLOCK_M_SPLIT, slice_size),
             z_desc.dtype,
@@ -792,63 +838,81 @@ def _addmm_fwd_tma_ws_persistent(
         )
         # Define y and z to share a single buffer
         bias_storage_alias.set_buffer_overlap(
+            # pyrefly: ignore [missing-attribute]
             tlx.reuse_group(
                 y_buffers,
                 z_buffers,
+                # pyrefly: ignore [missing-attribute]
                 group_type=tlx.reuse_group_type.shared,
             )
         )
     else:
         if BROADCAST_Y:
+            # pyrefly: ignore [missing-attribute]
             y_buffers = tlx.local_alloc(
                 (1, slice_size), y_desc.dtype, EPILOGUE_SUBTILE * NUM_MMA_GROUPS
             )
         else:
+            # pyrefly: ignore [missing-attribute]
             y_buffers = tlx.local_alloc(
                 (BLOCK_M_SPLIT, slice_size),
                 y_desc.dtype,
                 EPILOGUE_SUBTILE * NUM_MMA_GROUPS,
             )
+        # pyrefly: ignore [missing-attribute]
         z_buffers = tlx.local_alloc(
             (BLOCK_M_SPLIT, slice_size), z_desc.dtype, NUM_Z_BUFFERS
         )
 
+    # pyrefly: ignore [missing-attribute]
     cluster_cta_rank = tlx.cluster_cta_rank()
     pred_cta0 = cluster_cta_rank == 0
     if PAIR_CTA:
+        # pyrefly: ignore [missing-attribute]
         cta_bars = tlx.alloc_barriers(
             num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=2
         )
 
     # Barriers for producer <-> MMA (separate X and W barriers)
+    # pyrefly: ignore [missing-attribute]
     x_smem_full_bars = tlx.alloc_barriers(
         num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1
     )
+    # pyrefly: ignore [missing-attribute]
     x_smem_empty_bars = tlx.alloc_barriers(
         num_barriers=NUM_SMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1
     )
+    # pyrefly: ignore [missing-attribute]
     w_smem_full_bars = tlx.alloc_barriers(num_barriers=NUM_SMEM_BUFFERS, arrive_count=1)
     # Barriers for MMA <-> Epilogue
+    # pyrefly: ignore [missing-attribute]
     tmem_full_bars = tlx.alloc_barriers(
         num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1
     )
+    # pyrefly: ignore [missing-attribute]
     tmem_empty_bars = tlx.alloc_barriers(
         num_barriers=NUM_TMEM_BUFFERS * NUM_MMA_GROUPS, arrive_count=1
     )
     # Barriers for producer <-> Epilogue
     # y_load_bar: producer signals when y data is ready
     # y_empty_bar: epilogue signals when done using y buffer
+    # pyrefly: ignore [missing-attribute]
     y_load_bars = tlx.alloc_barriers(
         num_barriers=EPILOGUE_SUBTILE * NUM_MMA_GROUPS, arrive_count=1
     )
+    # pyrefly: ignore [missing-attribute]
     y_empty_bars = tlx.alloc_barriers(
         num_barriers=EPILOGUE_SUBTILE * NUM_MMA_GROUPS, arrive_count=1
     )
+    # pyrefly: ignore [missing-attribute]
     z_load_bars = tlx.alloc_barriers(num_barriers=NUM_Z_BUFFERS, arrive_count=1)
+    # pyrefly: ignore [missing-attribute]
     z_empty_bars = tlx.alloc_barriers(num_barriers=NUM_Z_BUFFERS, arrive_count=1)
 
+    # pyrefly: ignore [missing-attribute]
     with tlx.async_tasks():
         # Epilogue consumer: waits for Y from producer, adds bias, stores to SMEM.
+        # pyrefly: ignore [missing-attribute]
         with tlx.async_task("default"):
             start_pid = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -871,35 +935,51 @@ def _addmm_fwd_tma_ws_persistent(
                         acc_tmem = tmem_buffers[buf_idx]
                         if slice_id == 0:
                             # Wait for MMA to finish computing this group
+                            # pyrefly: ignore [missing-attribute]
                             tlx.barrier_wait(tmem_full_bars[buf_idx], tmem_read_phase)
 
                         # Load result from TMEM and add bias
+                        # pyrefly: ignore [missing-attribute]
                         acc_subslice = tlx.subslice(
                             acc_tmem, slice_id * slice_size, slice_size
                         )
+                        # pyrefly: ignore [missing-attribute]
                         result = tlx.local_load(acc_subslice)
                         if slice_id == EPILOGUE_SUBTILE - 1:
                             # Signal MMA that this TMEM buffer is now free
+                            # pyrefly: ignore [missing-attribute]
                             tlx.barrier_arrive(tmem_empty_bars[buf_idx], 1)
 
                         y_idx = slice_id * NUM_MMA_GROUPS + group_id
+                        # pyrefly: ignore [missing-attribute]
                         y_buf_view = tlx.local_view(y_buffers, y_idx)
+                        # pyrefly: ignore [missing-attribute]
                         y_full = tlx.local_view(y_load_bars, y_idx)
+                        # pyrefly: ignore [missing-attribute]
                         tlx.barrier_wait(y_full, y_load_phase)
+                        # pyrefly: ignore [missing-attribute]
                         y = tlx.local_load(y_buf_view)
                         # If Y and Z are not shared signal we can load the next bias.
                         if not Y_Z_SHARED:
+                            # pyrefly: ignore [missing-attribute]
                             y_empty = tlx.local_view(y_empty_bars, y_idx)
+                            # pyrefly: ignore [missing-attribute]
                             tlx.barrier_arrive(y_empty, 1)
                         z = (result + y.to(tl.float32)).to(z_desc.dtype)
+                        # pyrefly: ignore [missing-attribute]
                         z_buf_view = tlx.local_view(z_buffers, z_idx)
                         # If Y and Z are not shared wait for Z to be empty.
                         # If there are shared this already guarenteed.
                         if not Y_Z_SHARED:
+                            # pyrefly: ignore [missing-attribute]
                             z_empty = tlx.local_view(z_empty_bars, z_idx)
+                            # pyrefly: ignore [missing-attribute]
                             tlx.barrier_wait(z_empty, z_load_phase ^ 1)
+                        # pyrefly: ignore [missing-attribute]
                         tlx.local_store(z_buf_view, z)
+                        # pyrefly: ignore [missing-attribute]
                         z_full = tlx.local_view(z_load_bars, z_idx)
+                        # pyrefly: ignore [missing-attribute]
                         tlx.barrier_arrive(z_full, 1)
                         z_load_phase = z_load_phase ^ (z_idx == (NUM_Z_BUFFERS - 1))
                         # pyre-ignore[58]
@@ -913,6 +993,7 @@ def _addmm_fwd_tma_ws_persistent(
                 cur_tmem_buf = (cur_tmem_buf + 1) % int(NUM_TMEM_BUFFERS)
 
         # MMA consumer: performs matrix multiplication
+        # pyrefly: ignore [missing-attribute]
         with tlx.async_task(num_warps=1, num_regs=24):
             start_pid = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -936,15 +1017,18 @@ def _addmm_fwd_tma_ws_persistent(
 
                 # First K iteration (peeled): use_acc=False
                 buf = processed_k_iters % int(NUM_SMEM_BUFFERS)
+                # pyrefly: ignore [missing-attribute]
                 tlx.barrier_wait(w_smem_full_bars[buf], dot_phase)
 
                 for group_id in tl.static_range(NUM_MMA_GROUPS):
                     a_buf = group_id * NUM_SMEM_BUFFERS + buf
                     acc_buf = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
 
+                    # pyrefly: ignore [missing-attribute]
                     tlx.barrier_wait(x_smem_full_bars[a_buf], dot_phase)
 
                     # Wait for epilogue to finish with this TMEM buffer
+                    # pyrefly: ignore [missing-attribute]
                     tlx.barrier_wait(tmem_empty_bars[acc_buf], tmem_write_phase)
 
                     if PAIR_CTA:
@@ -958,6 +1042,7 @@ def _addmm_fwd_tma_ws_persistent(
                             pred=pred_cta0,
                         )
 
+                    # pyrefly: ignore [missing-attribute]
                     tlx.async_dot(
                         x_buffers[a_buf],
                         w_buffers[buf],
@@ -973,12 +1058,14 @@ def _addmm_fwd_tma_ws_persistent(
                 # Remaining K iterations: use_acc=True
                 for k in range(1, k_tiles):
                     buf = (processed_k_iters + k) % int(NUM_SMEM_BUFFERS)
+                    # pyrefly: ignore [missing-attribute]
                     tlx.barrier_wait(w_smem_full_bars[buf], dot_phase)
 
                     for group_id in tl.static_range(NUM_MMA_GROUPS):
                         a_buf = group_id * NUM_SMEM_BUFFERS + buf
                         acc_buf = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
 
+                        # pyrefly: ignore [missing-attribute]
                         tlx.barrier_wait(x_smem_full_bars[a_buf], dot_phase)
 
                         if PAIR_CTA:
@@ -993,6 +1080,7 @@ def _addmm_fwd_tma_ws_persistent(
                                 pred=pred_cta0,
                             )
 
+                        # pyrefly: ignore [missing-attribute]
                         tlx.async_dot(
                             x_buffers[a_buf],
                             w_buffers[buf],
@@ -1010,9 +1098,11 @@ def _addmm_fwd_tma_ws_persistent(
                 last_dot_phase = dot_phase ^ (last_buf == int(NUM_SMEM_BUFFERS) - 1)
                 for group_id in tl.static_range(NUM_MMA_GROUPS):
                     a_buf = group_id * NUM_SMEM_BUFFERS + last_buf
+                    # pyrefly: ignore [missing-attribute]
                     tlx.barrier_wait(x_smem_empty_bars[a_buf], last_dot_phase)
                     acc_buf = group_id * NUM_TMEM_BUFFERS + cur_tmem_buf
                     # Signal epilogue that result is ready
+                    # pyrefly: ignore [missing-attribute]
                     tlx.barrier_arrive(tmem_full_bars[acc_buf], 1)
 
                 tmem_write_phase = tmem_write_phase ^ (
@@ -1022,6 +1112,7 @@ def _addmm_fwd_tma_ws_persistent(
                 processed_k_iters += k_tiles
 
         # Producer: TMA loads for X, W, and Y
+        # pyrefly: ignore [missing-attribute]
         with tlx.async_task(num_warps=1, num_regs=24):
             start_pid = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -1057,11 +1148,14 @@ def _addmm_fwd_tma_ws_persistent(
 
                     # Load X for group 0
                     a_buf = buf  # 0 * NUM_SMEM_BUFFERS + buf
+                    # pyrefly: ignore [missing-attribute]
                     tlx.barrier_wait(x_smem_empty_bars[a_buf], load_phase ^ 1)
+                    # pyrefly: ignore [missing-attribute]
                     tlx.barrier_expect_bytes(
                         x_smem_full_bars[a_buf],
                         2 * BLOCK_M_SPLIT * BLOCK_K,
                     )
+                    # pyrefly: ignore [missing-attribute]
                     tlx.async_descriptor_load(
                         x_desc,
                         x_buffers[a_buf],
@@ -1071,17 +1165,21 @@ def _addmm_fwd_tma_ws_persistent(
 
                     # Load W (wait for last group's x_empty to know W is free)
                     last_a_buf = (NUM_MMA_GROUPS - 1) * NUM_SMEM_BUFFERS + buf
+                    # pyrefly: ignore [missing-attribute]
                     tlx.barrier_wait(x_smem_empty_bars[last_a_buf], load_phase ^ 1)
                     if PAIR_CTA:
+                        # pyrefly: ignore [missing-attribute]
                         tlx.barrier_expect_bytes(
                             w_smem_full_bars[buf],
                             2 * BLOCK_K * (BLOCK_N // 2),
                         )
                     else:
+                        # pyrefly: ignore [missing-attribute]
                         tlx.barrier_expect_bytes(
                             w_smem_full_bars[buf],
                             2 * BLOCK_K * BLOCK_N,
                         )
+                    # pyrefly: ignore [missing-attribute]
                     tlx.async_descriptor_load(
                         w_desc,
                         w_buffers[buf],
@@ -1092,12 +1190,15 @@ def _addmm_fwd_tma_ws_persistent(
                     # Load X for remaining groups
                     for group_id in tl.static_range(1, NUM_MMA_GROUPS):
                         a_buf = group_id * NUM_SMEM_BUFFERS + buf
+                        # pyrefly: ignore [missing-attribute]
                         tlx.barrier_wait(x_smem_empty_bars[a_buf], load_phase ^ 1)
                         offs_xm2 = offs_xm + group_id * BLOCK_M_SPLIT
+                        # pyrefly: ignore [missing-attribute]
                         tlx.barrier_expect_bytes(
                             x_smem_full_bars[a_buf],
                             2 * BLOCK_M_SPLIT * BLOCK_K,
                         )
+                        # pyrefly: ignore [missing-attribute]
                         tlx.async_descriptor_load(
                             x_desc,
                             x_buffers[a_buf],
@@ -1110,16 +1211,23 @@ def _addmm_fwd_tma_ws_persistent(
                 for slice_id in tl.static_range(EPILOGUE_SUBTILE):
                     for group_id in tl.static_range(NUM_MMA_GROUPS):
                         y_idx = slice_id * NUM_MMA_GROUPS + group_id
+                        # pyrefly: ignore [missing-attribute]
                         y_buf_view = tlx.local_view(y_buffers, y_idx)
+                        # pyrefly: ignore [missing-attribute]
                         y_bar = tlx.local_view(y_load_bars, y_idx)
                         # If Y and Z are shared we need to wait for Z to be empty.
                         if Y_Z_SHARED:
+                            # pyrefly: ignore [missing-attribute]
                             y_empty = tlx.local_view(z_empty_bars, y_idx)
                         else:
+                            # pyrefly: ignore [missing-attribute]
                             y_empty = tlx.local_view(y_empty_bars, y_idx)
+                        # pyrefly: ignore [missing-attribute]
                         tlx.barrier_wait(y_empty, y_load_phase ^ 1)
                         if BROADCAST_Y:
+                            # pyrefly: ignore [missing-attribute]
                             tlx.barrier_expect_bytes(y_bar, 1 * slice_size * 2)
+                            # pyrefly: ignore [missing-attribute]
                             tlx.async_descriptor_load(
                                 y_desc,
                                 y_buf_view,
@@ -1127,9 +1235,11 @@ def _addmm_fwd_tma_ws_persistent(
                                 y_bar,
                             )
                         else:
+                            # pyrefly: ignore [missing-attribute]
                             tlx.barrier_expect_bytes(
                                 y_bar, BLOCK_M_SPLIT * slice_size * 2
                             )
+                            # pyrefly: ignore [missing-attribute]
                             tlx.async_descriptor_load(
                                 y_desc,
                                 y_buf_view,
@@ -1146,6 +1256,7 @@ def _addmm_fwd_tma_ws_persistent(
 
         # TMA Store consumer. Added to simplify the barrier
         # logic.
+        # pyrefly: ignore [missing-attribute]
         with tlx.async_task(num_warps=1, num_regs=24):
             start_pid = tl.program_id(axis=0)
             num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -1170,14 +1281,22 @@ def _addmm_fwd_tma_ws_persistent(
                     # Determine the base "index" to decide if we need to wait on TMA.
                     z_idx_unrolled = slice_id * NUM_MMA_GROUPS + group_id
                     if z_idx_unrolled >= NUM_Z_BUFFERS:
+                        # pyrefly: ignore [missing-attribute]
                         tlx.async_descriptor_store_wait(NUM_Z_BUFFERS - 1)
+                        # pyrefly: ignore [missing-attribute]
                         z_empty = tlx.local_view(z_empty_bars, z_idx)
+                        # pyrefly: ignore [missing-attribute]
                         tlx.barrier_arrive(z_empty, 1)
 
+                    # pyrefly: ignore [missing-attribute]
                     z_full = tlx.local_view(z_load_bars, z_idx)
+                    # pyrefly: ignore [missing-attribute]
                     tlx.barrier_wait(z_full, z_load_phase)
+                    # pyrefly: ignore [missing-attribute]
                     z_buf_view = tlx.local_view(z_buffers, z_idx)
+                    # pyrefly: ignore [missing-attribute]
                     tlx.fence_async_shared()
+                    # pyrefly: ignore [missing-attribute]
                     tlx.async_descriptor_store(
                         z_desc,
                         z_buf_view,
@@ -1200,13 +1319,20 @@ def _addmm_fwd_tma_ws_persistent(
                 for slice_id in tl.static_range(EPILOGUE_SUBTILE):
                     for group_id in tl.static_range(NUM_MMA_GROUPS):
                         # Wait on prior store to finish.
+                        # pyrefly: ignore [missing-attribute]
                         tlx.async_descriptor_store_wait(NUM_Z_BUFFERS - 1)
+                        # pyrefly: ignore [missing-attribute]
                         z_empty = tlx.local_view(z_empty_bars, z_idx)
+                        # pyrefly: ignore [missing-attribute]
                         tlx.barrier_arrive(z_empty, 1)
                         # Wait for the next load to be ready
+                        # pyrefly: ignore [missing-attribute]
                         z_full = tlx.local_view(z_load_bars, z_idx)
+                        # pyrefly: ignore [missing-attribute]
                         tlx.barrier_wait(z_full, z_load_phase)
+                        # pyrefly: ignore [missing-attribute]
                         z_buf_view = tlx.local_view(z_buffers, z_idx)
+                        # pyrefly: ignore [missing-attribute]
                         tlx.async_descriptor_store(
                             z_desc,
                             z_buf_view,
@@ -1220,6 +1346,7 @@ def _addmm_fwd_tma_ws_persistent(
                         z_idx = (z_idx + 1) % NUM_Z_BUFFERS
 
             # Wait for the last store.
+            # pyrefly: ignore [missing-attribute]
             tlx.async_descriptor_store_wait(0)
 
 

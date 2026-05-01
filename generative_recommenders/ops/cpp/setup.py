@@ -276,6 +276,7 @@ def _write_ninja_file(
 
 
 # Monkey patching
+# pyrefly: ignore [bad-assignment]
 torch.utils.cpp_extension._write_ninja_file = _write_ninja_file
 
 

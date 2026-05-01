@@ -151,6 +151,7 @@ class DLRMKuaiRandProcessor(DataProcessor):
             if idx == 0:
                 df = df_grouped_by_user
             else:
+                # pyrefly: ignore [missing-attribute]
                 df = df.merge(df_grouped_by_user, on="user_id", suffixes=("_x", "_y"))
                 for col in seq_cols:
                     df[col] = df.apply(
@@ -158,8 +159,11 @@ class DLRMKuaiRandProcessor(DataProcessor):
                     )
                     df = df.drop(columns=[col + "_x", col + "_y"])
 
+        # pyrefly: ignore [unsupported-operation]
         max_seq_len = df["video_id"].apply(len).max()
+        # pyrefly: ignore [unsupported-operation]
         min_seq_len = df["video_id"].apply(len).min()
+        # pyrefly: ignore [unsupported-operation]
         average_seq_len = df["video_id"].apply(len).mean()
         log.info(f"{max_seq_len=}, {min_seq_len=}, {average_seq_len=}")
 
@@ -180,6 +184,7 @@ class DLRMKuaiRandProcessor(DataProcessor):
         ]:
             user_features_df[col] = _one_hot_encode(user_features_df[col])
 
+        # pyrefly: ignore [bad-argument-type]
         final_df = pd.merge(df, user_features_df, on="user_id")
         final_df.to_csv(self._output_file, index=False, sep=",")
         log.info(f"Processed file saved to {self._output_file}")

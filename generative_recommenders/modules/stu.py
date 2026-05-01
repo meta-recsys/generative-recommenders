@@ -286,6 +286,7 @@ class STULayer(STU):
             k_cache=fx_unwrap_optional_tensor(self.k_cache),
             v_cache=fx_unwrap_optional_tensor(self.v_cache),
             max_kv_caching_len=self.max_kv_caching_len,
+            # pyrefly: ignore [bad-argument-type]
             kv_caching_offsets=self.kv_caching_offsets,
         )
 

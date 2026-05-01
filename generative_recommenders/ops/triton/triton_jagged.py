@@ -460,6 +460,7 @@ def _jagged_jagged_bmm_reduce_sum(
             if off_m == 0:
                 tl.store(
                     out_reduce_ptrs,  # pyre-ignore [61]
+                    # pyrefly: ignore [unbound-name]
                     acc_reduce.to(ReduceOut.dtype.element_ty),
                     mask=(offs_n < N),
                 )
@@ -487,6 +488,7 @@ def _jagged_jagged_bmm_reduce_sum(
         accumulator += tl.dot(jg_a, jg_b, allow_tf32=ALLOW_TF32)
         if REDUCE_JAGGEDB:
             if off_m == 0:
+                # pyrefly: ignore [unbound-name]
                 acc_reduce += tl.sum(jg_b.to(tl.float32), axis=0)
 
         jg_a_ptrs += BLOCK_K * stride_ak
@@ -502,6 +504,7 @@ def _jagged_jagged_bmm_reduce_sum(
         if off_m == 0:
             tl.store(
                 out_reduce_ptrs,  # pyre-ignore [61]
+                # pyrefly: ignore [unbound-name]
                 acc_reduce.to(ReduceOut.dtype.element_ty),
                 mask=(offs_n < N),
             )
@@ -786,6 +789,7 @@ class _JaggedDenseBroadcastAddFunction(torch.autograd.Function):
             D=ctx.D,
             stride_jn=d_out.stride(0),
             stride_ob=d_dense.stride(0),
+            # pyrefly: ignore [bad-argument-type]
             BLOCK_D=BLOCK_D,
         )
         return None, None, d_out, d_dense
@@ -1626,11 +1630,13 @@ class _Split2DJaggedFunction(torch.autograd.Function):
                     offsets_b.device, non_blocking=True
                 )
                 if seq_len_b is None:
+                    # pyrefly: ignore [bad-assignment]
                     seq_len_b = offsets_b.index_select(dim=0, index=offsets_b_last_idx)
                 if seq_len_a is None and total_seq_len is None:
                     offsets_a_last_idx = torch.tensor(offsets_a.size(0) - 1).to(
                         offsets_a.device, non_blocking=True
                     )
+                    # pyrefly: ignore [bad-assignment]
                     seq_len_a = offsets_a.index_select(dim=0, index=offsets_a_last_idx)
             else:
                 if seq_len_b is None:
@@ -2524,10 +2530,15 @@ def _helion_split_2d_jagged(
         out_a_flat,
         out_b_flat,
         max_seq_len,
+        # pyrefly: ignore [bad-argument-type]
         D,
+        # pyrefly: ignore [bad-argument-type]
         block_size_0,
+        # pyrefly: ignore [bad-argument-type]
         block_size_1,
+        # pyrefly: ignore [unexpected-keyword]
         num_warps=num_warps,
+        # pyrefly: ignore [unexpected-keyword]
         num_stages=num_stages,
     )
     return (out_a, out_b)

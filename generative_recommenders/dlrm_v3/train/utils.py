@@ -104,6 +104,7 @@ class HammerToTorchDataset(TorchDataset):
     ) -> None:
         self.dataset: Dataset = dataset
 
+    # pyrefly: ignore [bad-param-name-override]
     def __getitem__(self, idx: int) -> Tuple[KeyedJaggedTensor, KeyedJaggedTensor]:
         self.dataset.load_query_samples([idx])
         sample = self.dataset.get_sample(idx)
@@ -155,6 +156,7 @@ class ChunkDistributedSampler(DistributedSampler[_T_co]):
         indices = [i + self.num_samples * self.rank for i in indices]
 
         assert len(indices) == self.num_samples
+        # pyrefly: ignore [bad-return]
         return iter(indices)
 
     def set_epoch(self, epoch: int) -> None:
@@ -325,6 +327,7 @@ def make_optimizer_and_shard(
                 ),
             )
         )
+    # pyrefly: ignore [bad-argument-type]
     output_optimizer = CombinedOptimizer(all_optimizers)
     output_optimizer.init_state(set(model.sparse_grad_parameter_names()))
     return model, output_optimizer
@@ -794,6 +797,7 @@ def streaming_train_eval_loop(
             )
 
     eval_ts = num_train_ts
+    # pyrefly: ignore [missing-attribute]
     dataset.dataset.is_eval = True
     model.eval()
     eval_batch_idx: int = 0

@@ -162,6 +162,7 @@ def get_reco_dataset(
             assert x > 0, "x in all_item_ids should be positive"
     else:
         # expected_max_item_id and item_features are not set for Amazon datasets.
+        # pyrefly: ignore [bad-assignment]
         item_features = None
         max_item_id = dp.expected_num_unique_items()
         all_item_ids = [x + 1 for x in range(max_item_id)]  # pyre-ignore [6]

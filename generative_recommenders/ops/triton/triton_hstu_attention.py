@@ -683,9 +683,12 @@ def _hstu_attn_fwd_compute_main_loop_tlx(  # noqa C901
 ):
     if WAIT_FOR_Q:
         # wait for the Q buffer to be populated by the producer
+        # pyrefly: ignore [missing-attribute]
         q_full = tlx.local_view(q_fulls, cid)
+        # pyrefly: ignore [missing-attribute]
         tlx.barrier_wait(q_full, 0)
 
+    # pyrefly: ignore [missing-attribute]
     q_tile = tlx.local_view(q_tiles, cid)
 
     for start in tl.range(low + BLOCK_N, high, BLOCK_N, num_stages=0):
@@ -698,18 +701,26 @@ def _hstu_attn_fwd_compute_main_loop_tlx(  # noqa C901
         offs_n = offs_n_start + start_n
 
         # wait for the K buffer to be populated by the producer
+        # pyrefly: ignore [missing-attribute]
         k_full = tlx.local_view(k_fulls, buf_id)
+        # pyrefly: ignore [missing-attribute]
         tlx.barrier_wait(k_full, kv_phase)
+        # pyrefly: ignore [missing-attribute]
         k_tile = tlx.local_view(k_tiles, buf_id)
 
         # tma can only be loaded in one order, use trans afterwards
+        # pyrefly: ignore [missing-attribute]
         k_tile = tlx.local_trans(k_tile)
         # second
+        # pyrefly: ignore [missing-attribute]
         qk = tlx.async_dot(q_tile, k_tile)
         # wait for the MMA using to complete
+        # pyrefly: ignore [missing-attribute]
         qk = tlx.async_dot_wait(0, qk)
         # release the K buffer
+        # pyrefly: ignore [missing-attribute]
         k_empty = tlx.local_view(k_empties, buf_id)
+        # pyrefly: ignore [missing-attribute]
         tlx.barrier_arrive(k_empty, 1)
 
         qk = qk * alpha
@@ -741,14 +752,21 @@ def _hstu_attn_fwd_compute_main_loop_tlx(  # noqa C901
         silu = silu.to(v_dtype)
 
         # wait for the V buffer to be populated by the producer
+        # pyrefly: ignore [missing-attribute]
         v_full = tlx.local_view(v_fulls, buf_id)
+        # pyrefly: ignore [missing-attribute]
         tlx.barrier_wait(v_full, kv_phase)
+        # pyrefly: ignore [missing-attribute]
         v_tile = tlx.local_view(v_tiles, buf_id)
+        # pyrefly: ignore [missing-attribute]
         acc = tlx.async_dot(silu, v_tile, acc)
         # wait for the MMA using to complete
+        # pyrefly: ignore [missing-attribute]
         acc = tlx.async_dot_wait(0, acc)
         # release the V buffer
+        # pyrefly: ignore [missing-attribute]
         v_empty = tlx.local_view(v_empties, buf_id)
+        # pyrefly: ignore [missing-attribute]
         tlx.barrier_arrive(v_empty, 1)
 
         end_n += BLOCK_N
@@ -792,8 +810,11 @@ def _hstu_attn_fwd_compute_main_loop_tlx_pipelined(  # noqa C901
 ):
     if WAIT_FOR_Q:
         # wait for the Q buffer to be populated by the producer
+        # pyrefly: ignore [missing-attribute]
         q_full = tlx.local_view(q_fulls, cid)
+        # pyrefly: ignore [missing-attribute]
         tlx.barrier_wait(q_full, 0)
+    # pyrefly: ignore [missing-attribute]
     q_tile = tlx.local_view(q_tiles, cid)
 
     # wait for the K buffer to be populated by the producer
@@ -801,33 +822,45 @@ def _hstu_attn_fwd_compute_main_loop_tlx_pipelined(  # noqa C901
     # buffers in a row share the same phase
     k_phase = (loop_trip_cnt // NUM_BUFFERS) % 2
 
+    # pyrefly: ignore [missing-attribute]
     k_full = tlx.local_view(k_fulls, k_buf_id)
+    # pyrefly: ignore [missing-attribute]
     tlx.barrier_wait(k_full, k_phase)
+    # pyrefly: ignore [missing-attribute]
     k_tile = tlx.local_view(k_tiles, k_buf_id)
 
     # tma can only be loaded in one order, use trans afterwards
+    # pyrefly: ignore [missing-attribute]
     k_tile = tlx.local_trans(k_tile)
 
     # Pingpong
     if cid == 0:
         # Consumer 0 waits for Consumer 1 to reach synchronization point at barrier 9.
+        # pyrefly: ignore [missing-attribute]
         tlx.named_barrier_wait(9, 256)
     else:
         # Consumer 1 signals its arrival at barrier 9.
+        # pyrefly: ignore [missing-attribute]
         tlx.named_barrier_arrive(9, 256)
         # Then waits at barrier 10 until Consumer 0 finishes issuing its async_dot.
+        # pyrefly: ignore [missing-attribute]
         tlx.named_barrier_wait(10, 256)
 
+    # pyrefly: ignore [missing-attribute]
     qk = tlx.async_dot(q_tile, k_tile)
 
     if cid == 0:
         # After issuing async_dot, Consumer 0 signals barrier 10 to unblock Consumer 1.
+        # pyrefly: ignore [missing-attribute]
         tlx.named_barrier_arrive(10, 256)
 
     # wait for the MMA using to complete
+    # pyrefly: ignore [missing-attribute]
     qk = tlx.async_dot_wait(0, qk)
     # release the K buffer
+    # pyrefly: ignore [missing-attribute]
     k_empty = tlx.local_view(k_empties, k_buf_id)
+    # pyrefly: ignore [missing-attribute]
     tlx.barrier_arrive(k_empty, 1)
 
     qk = qk * alpha
@@ -873,13 +906,18 @@ def _hstu_attn_fwd_compute_main_loop_tlx_pipelined(  # noqa C901
         k_phase = k_phase ^ (k_buf_id == 0)
 
         # wait for the K buffer to be populated by the producer
+        # pyrefly: ignore [missing-attribute]
         k_full = tlx.local_view(k_fulls, k_buf_id)
+        # pyrefly: ignore [missing-attribute]
         tlx.barrier_wait(k_full, k_phase)
+        # pyrefly: ignore [missing-attribute]
         k_tile = tlx.local_view(k_tiles, k_buf_id)
 
         # tma can only be loaded in one order, use trans afterwards
+        # pyrefly: ignore [missing-attribute]
         k_tile = tlx.local_trans(k_tile)
 
+        # pyrefly: ignore [missing-attribute]
         qk = tlx.async_dot(q_tile, k_tile)
         # wait for the MMA using to complete
         prev_silu = silu
@@ -887,14 +925,21 @@ def _hstu_attn_fwd_compute_main_loop_tlx_pipelined(  # noqa C901
         v_buf_id = (loop_trip_cnt - 1) % NUM_BUFFERS
         # v_phase = v_phase ^ (v_buf_id == 0)
         v_phase = ((loop_trip_cnt - 1) // NUM_BUFFERS) % 2
+        # pyrefly: ignore [missing-attribute]
         v_full = tlx.local_view(v_fulls, v_buf_id)
+        # pyrefly: ignore [missing-attribute]
         tlx.barrier_wait(v_full, v_phase)
+        # pyrefly: ignore [missing-attribute]
         v_tile = tlx.local_view(v_tiles, v_buf_id)
+        # pyrefly: ignore [missing-attribute]
         acc = tlx.async_dot(prev_silu, v_tile, acc)
+        # pyrefly: ignore [missing-attribute]
         qk = tlx.async_dot_wait(1, qk)
 
         # release the K buffer
+        # pyrefly: ignore [missing-attribute]
         k_empty = tlx.local_view(k_empties, k_buf_id)
+        # pyrefly: ignore [missing-attribute]
         tlx.barrier_arrive(k_empty, 1)
 
         qk = qk * alpha
@@ -924,9 +969,12 @@ def _hstu_attn_fwd_compute_main_loop_tlx_pipelined(  # noqa C901
         silu = fast_dividef(qk, 1.0 + fast_expf(-qk)) * scale
         silu = silu.to(v_dtype)
 
+        # pyrefly: ignore [missing-attribute]
         acc = tlx.async_dot_wait(0, acc)
         # release the V buffer
+        # pyrefly: ignore [missing-attribute]
         v_empty = tlx.local_view(v_empties, v_buf_id)
+        # pyrefly: ignore [missing-attribute]
         tlx.barrier_arrive(v_empty, 1)
 
         end_n += BLOCK_N
@@ -939,14 +987,21 @@ def _hstu_attn_fwd_compute_main_loop_tlx_pipelined(  # noqa C901
     # wait for the V buffer to be populated by the producer
     v_buf_id = (loop_trip_cnt - 1) % NUM_BUFFERS
     v_phase = ((loop_trip_cnt - 1) // NUM_BUFFERS) % 2
+    # pyrefly: ignore [missing-attribute]
     v_full = tlx.local_view(v_fulls, v_buf_id)
     # tlx.barrier_wait(v_full, v_buf_id)
+    # pyrefly: ignore [missing-attribute]
     v_tile = tlx.local_view(v_tiles, v_buf_id)
+    # pyrefly: ignore [missing-attribute]
     tlx.barrier_wait(v_full, v_phase)
+    # pyrefly: ignore [missing-attribute]
     acc = tlx.async_dot(silu, v_tile, acc)
+    # pyrefly: ignore [missing-attribute]
     acc = tlx.async_dot_wait(0, acc)
     # release the V buffer
+    # pyrefly: ignore [missing-attribute]
     v_empty = tlx.local_view(v_empties, v_buf_id)
+    # pyrefly: ignore [missing-attribute]
     tlx.barrier_arrive(v_empty, 1)
 
     return acc, end_n, loop_trip_cnt
@@ -967,12 +1022,18 @@ def _hstu_attn_fwd_load_K_or_V(
     BLOCK_N: tl.constexpr,
 ):
     # wait for the K buffer to be released by the consumer
+    # pyrefly: ignore [missing-attribute]
     k_empty = tlx.local_view(k_empties, buf_id)
+    # pyrefly: ignore [missing-attribute]
     tlx.barrier_wait(k_empty, k_phase)
     # load K
+    # pyrefly: ignore [missing-attribute]
     k_full = tlx.local_view(k_fulls, buf_id)
+    # pyrefly: ignore [missing-attribute]
     k_tile = tlx.local_view(k_tiles, buf_id)
+    # pyrefly: ignore [missing-attribute]
     tlx.barrier_expect_bytes(k_full, 2 * BLOCK_N * BLOCK_D_Q)  # float16
+    # pyrefly: ignore [missing-attribute]
     tlx.async_descriptor_load(
         K,
         k_tile,
@@ -997,11 +1058,15 @@ def _hstu_attn_fwd_load_Q(
     BLOCK_D_Q: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
+    # pyrefly: ignore [missing-attribute]
     q_full = tlx.local_view(q_fulls, cid)
+    # pyrefly: ignore [missing-attribute]
     tlx.barrier_expect_bytes(q_full, 2 * BLOCK_M * BLOCK_D_Q)  # float16
+    # pyrefly: ignore [missing-attribute]
     q_tile = tlx.local_view(q_tiles, cid)
     seq_offset = start_m + cid * BLOCK_M
     if IS_DELTA_Q:
+        # pyrefly: ignore [missing-attribute]
         tlx.async_descriptor_load(
             Q,
             q_tile,
@@ -1012,6 +1077,7 @@ def _hstu_attn_fwd_load_Q(
             q_full,
         )
     else:
+        # pyrefly: ignore [missing-attribute]
         tlx.async_descriptor_load(
             Q,
             q_tile,
@@ -1335,25 +1401,39 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
 
     BLOCK_M_SPLIT: tl.constexpr = BLOCK_M // NUM_MMA_GROUPS
     # allocate buffers
+    # pyrefly: ignore [missing-attribute]
     q_tiles = tlx.local_alloc(
-        (BLOCK_M_SPLIT, BLOCK_D_Q), tlx.dtype_of(Q), NUM_MMA_GROUPS
+        # pyrefly: ignore [missing-attribute]
+        (BLOCK_M_SPLIT, BLOCK_D_Q),
+        # pyrefly: ignore [missing-attribute]
+        tlx.dtype_of(Q),
+        NUM_MMA_GROUPS,
     )
+    # pyrefly: ignore [missing-attribute]
     k_tiles = tlx.local_alloc((BLOCK_N, BLOCK_D_Q), tlx.dtype_of(K), NUM_BUFFERS)
+    # pyrefly: ignore [missing-attribute]
     v_tiles = tlx.local_alloc((BLOCK_N, BLOCK_D_V), tlx.dtype_of(V), NUM_BUFFERS)
 
     # allocate barriers
+    # pyrefly: ignore [missing-attribute]
     q_fulls = tlx.alloc_barriers(num_barriers=NUM_MMA_GROUPS, arrive_count=1)
+    # pyrefly: ignore [missing-attribute]
     k_empties = tlx.alloc_barriers(
         num_barriers=NUM_BUFFERS, arrive_count=NUM_MMA_GROUPS
     )
+    # pyrefly: ignore [missing-attribute]
     k_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
+    # pyrefly: ignore [missing-attribute]
     v_empties = tlx.alloc_barriers(
         num_barriers=NUM_BUFFERS, arrive_count=NUM_MMA_GROUPS
     )
+    # pyrefly: ignore [missing-attribute]
     v_fulls = tlx.alloc_barriers(num_barriers=NUM_BUFFERS, arrive_count=1)
 
+    # pyrefly: ignore [missing-attribute]
     with tlx.async_tasks():
         # producer group
+        # pyrefly: ignore [missing-attribute]
         with tlx.async_task("default"):
             _hstu_attn_fwd_load_Q_K_V(
                 Q=Q,
@@ -1392,9 +1472,11 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
             )
 
         # consumer groups
+        # pyrefly: ignore [missing-attribute]
         with tlx.async_task(
             num_warps=NUM_MMA_WARPS_PER_GROUP, registers=232, replicate=NUM_MMA_GROUPS
         ):
+            # pyrefly: ignore [missing-attribute]
             cid = tlx.async_task_replica_id()
             acc = tl.zeros([BLOCK_M_SPLIT, BLOCK_D_V], dtype=tl.float32)
             # initialize offsets
@@ -1432,6 +1514,7 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
                 v_fulls=v_fulls,
                 k_empties=k_empties,
                 v_empties=v_empties,
+                # pyrefly: ignore [missing-attribute]
                 v_dtype=tlx.dtype_of(V),
                 n_targets=n_targets,
                 alpha=alpha,
@@ -1467,6 +1550,7 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
                     v_fulls=v_fulls,
                     k_empties=k_empties,
                     v_empties=v_empties,
+                    # pyrefly: ignore [missing-attribute]
                     v_dtype=tlx.dtype_of(V),
                     n_targets=n_targets,
                     alpha=alpha,
@@ -2419,36 +2503,42 @@ def _hstu_attn_bwd(  # noqa C901
         device_desc_q = tl.make_tensor_descriptor(
             Q,
             shape=[seq_len, H * DimQ],
+            # pyrefly: ignore [bad-argument-type]
             strides=[H * DimQ, 1],
             block_shape=[BLOCK_M, BLOCK_D_Q],
         )
         device_desc_do = tl.make_tensor_descriptor(
             DOut,
             shape=[seq_len, H * DimV],
+            # pyrefly: ignore [bad-argument-type]
             strides=[H * DimV, 1],
             block_shape=[BLOCK_M, BLOCK_D_V],
         )
         device_desc_k = tl.make_tensor_descriptor(
             K,
             shape=[seq_len, H * DimQ],
+            # pyrefly: ignore [bad-argument-type]
             strides=[H * DimQ, 1],
             block_shape=[BLOCK_N, BLOCK_D_Q],
         )
         device_desc_dk = tl.make_tensor_descriptor(
             DK,
             shape=[seq_len, H * DimQ],
+            # pyrefly: ignore [bad-argument-type]
             strides=[H * DimQ, 1],
             block_shape=[BLOCK_N, BLOCK_D_Q],
         )
         device_desc_v = tl.make_tensor_descriptor(
             V,
             shape=[seq_len, H * DimV],
+            # pyrefly: ignore [bad-argument-type]
             strides=[H * DimV, 1],
             block_shape=[BLOCK_N, BLOCK_D_V],
         )
         device_desc_dv = tl.make_tensor_descriptor(
             DV,
             shape=[seq_len, H * DimV],
+            # pyrefly: ignore [bad-argument-type]
             strides=[H * DimV, 1],
             block_shape=[BLOCK_N, BLOCK_D_V],
         )

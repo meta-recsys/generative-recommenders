@@ -115,6 +115,7 @@ class LocalNegativesSampler(NegativesSampler):
             dtype=positive_ids.dtype,
             device=positive_ids.device,
         )
+        # pyrefly: ignore [bad-index]
         sampled_ids = self._all_item_ids[sampled_offsets.view(-1)].reshape(output_shape)
         return sampled_ids, self.normalize_embeddings(self._item_emb(sampled_ids))
 
@@ -387,6 +388,7 @@ class BCELossWithRatings(AutoregressiveLoss):
         self._temperature: float = temperature
         self._model = model
 
+    # pyrefly: ignore [bad-override]
     def jagged_forward(
         self,
         output_embeddings: torch.Tensor,
@@ -420,6 +422,7 @@ class BCELossWithRatings(AutoregressiveLoss):
         ) * supervision_weights
         return weighted_losses.sum() / supervision_weights.sum()
 
+    # pyrefly: ignore [bad-override]
     def forward(
         self,
         lengths: torch.Tensor,

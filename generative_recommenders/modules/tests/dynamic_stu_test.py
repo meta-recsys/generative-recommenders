@@ -269,6 +269,7 @@ class DynamicStuTest(unittest.TestCase):
         )
         dout = dout.detach().clone()
         sd_stu_output.backward(dout)
+        # pyrefly: ignore [missing-attribute]
         d_sd_x = x.grad.detach().clone()
 
         self.assertTrue(sd_stu_output.shape == x.shape)

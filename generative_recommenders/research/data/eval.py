@@ -226,17 +226,24 @@ def eval_recall_metrics_from_tensors(
     target_ids = seq_features.past_ids[:, -1].unsqueeze(1)
     filtered_past_ids = seq_features.past_ids.detach().clone()
     filtered_past_ids[:, -1] = torch.zeros_like(target_ids.squeeze(1))
+    # pyrefly: ignore [missing-argument]
     return eval_metrics_v2_from_tensors(
+        # pyrefly: ignore [unexpected-keyword]
         eval_state=eval_state,
+        # pyrefly: ignore [unexpected-keyword]
         model=model,
+        # pyrefly: ignore [unexpected-keyword]
         seq_features=SequentialFeatures(
             past_lengths=seq_features.past_lengths - 1,
             past_ids=filtered_past_ids,
             past_embeddings=seq_features.past_embeddings,
             past_payloads=seq_features.past_payloads,
         ),
+        # pyrefly: ignore [unexpected-keyword]
         target_ids=target_ids,
+        # pyrefly: ignore [unexpected-keyword]
         user_max_batch_size=user_max_batch_size,
+        # pyrefly: ignore [unexpected-keyword]
         dtype=dtype,
     )
 

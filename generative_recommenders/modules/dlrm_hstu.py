@@ -282,6 +282,7 @@ class DlrmHSTU(HammerModule):
                 )
         else:
             # Dummy, offsets are unused
+            # pyrefly: ignore [bad-assignment]
             contextual_offsets = torch.empty((0, 0))
         return {
             **payload_features,
@@ -424,6 +425,7 @@ class DlrmHSTU(HammerModule):
                     == self._hstu_configs.candidates_watchtime_feature_name
                 ):
                     total_candidates = torch.sum(num_candidates).item()
+                    # pyrefly: ignore [no-matching-overload]
                     values_right = torch.zeros(
                         total_candidates,  # pyre-ignore
                         dtype=torch.int64,

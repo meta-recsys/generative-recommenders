@@ -122,13 +122,16 @@ class DLRMv3KuaiRandDataset(DLRMv3RandomDataset):
             uih_kjt_lengths: List[torch.Tensor] = []
             for name, length in self._contextual_feature_to_max_length.items():
                 uih_kjt_values.append(data[name])
+                # pyrefly: ignore [bad-argument-type]
                 uih_kjt_lengths.append(length)
 
             uih_kjt_values.extend(
+                # pyrefly: ignore [bad-argument-type]
                 video_history_uih + timestamps_uih + action_weights_uih + watch_time_uih
             )
 
             uih_kjt_lengths.extend(
+                # pyrefly: ignore [bad-argument-type]
                 [
                     uih_seq_len
                     for _ in range(

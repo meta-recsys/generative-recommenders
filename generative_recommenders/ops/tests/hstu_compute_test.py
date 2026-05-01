@@ -197,10 +197,15 @@ class HSTUComputeTest(unittest.TestCase):
             return
         # pyre-ignore[16]
         ref_dattn, attn.grad = attn.grad.detach().clone(), None
+        # pyrefly: ignore [missing-attribute]
         ref_du, u.grad = u.grad.detach().clone(), None
+        # pyrefly: ignore [missing-attribute]
         ref_d_norm_w, norm_weight.grad = norm_weight.grad.detach().clone(), None
+        # pyrefly: ignore [missing-attribute]
         ref_d_norm_b, norm_bias.grad = norm_bias.grad.detach().clone(), None
+        # pyrefly: ignore [missing-attribute]
         ref_dx, x.grad = x.grad.detach().clone(), None
+        # pyrefly: ignore [missing-attribute]
         ref_d_output_w, output_weight.grad = output_weight.grad.detach().clone(), None
 
         # opt
@@ -239,12 +244,18 @@ class HSTUComputeTest(unittest.TestCase):
         if test_backward:
             dout = dout.detach().clone()
             opt_out.backward(dout)
+            # pyrefly: ignore [missing-attribute]
             opt_dattn, attn.grad = attn.grad.detach().clone(), None
+            # pyrefly: ignore [missing-attribute]
             opt_du, u.grad = u.grad.detach().clone(), None
+            # pyrefly: ignore [missing-attribute]
             opt_d_norm_w, norm_weight.grad = norm_weight.grad.detach().clone(), None
+            # pyrefly: ignore [missing-attribute]
             opt_d_norm_b, norm_bias.grad = norm_bias.grad.detach().clone(), None
+            # pyrefly: ignore [missing-attribute]
             opt_dx, x.grad = x.grad.detach().clone(), None
             opt_d_output_w, output_weight.grad = (
+                # pyrefly: ignore [missing-attribute]
                 output_weight.grad.detach().clone(),
                 None,
             )
@@ -425,9 +436,13 @@ class HSTUComputeTest(unittest.TestCase):
 
         # pyre-ignore
         ref_dx, x.grad = x.grad.clone(), None
+        # pyrefly: ignore [missing-attribute]
         ref_d_norm_weight, norm_weight.grad = norm_weight.grad.clone(), None
+        # pyrefly: ignore [missing-attribute]
         ref_d_norm_bias, norm_bias.grad = norm_bias.grad.clone(), None
+        # pyrefly: ignore [missing-attribute]
         ref_d_uvqk_weight, uvqk_weight.grad = uvqk_weight.grad.clone(), None
+        # pyrefly: ignore [missing-attribute]
         ref_d_uvqk_bias, uvqk_bias.grad = uvqk_bias.grad.clone(), None
 
         # real implementation
@@ -482,10 +497,15 @@ class HSTUComputeTest(unittest.TestCase):
                 real_d_uvqk_weight,
                 real_d_uvqk_bias,
             ) = (
+                # pyrefly: ignore [missing-attribute]
                 x.grad.clone(),
+                # pyrefly: ignore [missing-attribute]
                 norm_weight.grad.clone(),
+                # pyrefly: ignore [missing-attribute]
                 norm_bias.grad.clone(),
+                # pyrefly: ignore [missing-attribute]
                 uvqk_weight.grad.clone(),
+                # pyrefly: ignore [missing-attribute]
                 uvqk_bias.grad.clone(),
             )
             torch.testing.assert_close(ref_dx, real_dx, atol=atol, rtol=rtol)
