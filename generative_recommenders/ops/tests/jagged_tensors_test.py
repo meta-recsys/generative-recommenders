@@ -156,6 +156,7 @@ class JaggedTensorsTest(unittest.TestCase):
             d_values_b = d_values_b.detach().clone()
             real_values_a.backward(d_values_a, retain_graph=True)
             real_values_b.backward(d_values_b)
+            # pyrefly: ignore [missing-attribute]
             real_d_values = values.grad.clone()
             torch.testing.assert_close(ref_d_values, real_d_values)
 
@@ -318,7 +319,9 @@ class JaggedTensorsTest(unittest.TestCase):
 
         if test_backward:
             real_values.backward(dout)
+            # pyrefly: ignore [missing-attribute]
             real_d_a = values_a.grad.clone()
+            # pyrefly: ignore [missing-attribute]
             real_d_b = values_b.grad.clone()
             torch.testing.assert_close(ref_d_a, real_d_a)
             torch.testing.assert_close(ref_d_b, real_d_b)
@@ -414,6 +417,7 @@ class JaggedTensorsTest(unittest.TestCase):
         d_l2_x = d_l2_x.detach().clone()
         real_prefix_x.backward(d_prefix_x, retain_graph=True)
         real_l2_x.backward(d_l2_x)
+        # pyrefly: ignore [missing-attribute]
         real_d_x = x.grad.clone()
         torch.testing.assert_close(ref_d_x, real_d_x)
 
@@ -533,7 +537,9 @@ class JaggedTensorsTest(unittest.TestCase):
         torch.testing.assert_close(ref_x, real_x)
         dout = dout.detach().clone()
         real_x.backward(dout)
+        # pyrefly: ignore [missing-attribute]
         real_d_prefix_x = prefix_x.grad.clone()
+        # pyrefly: ignore [missing-attribute]
         real_d_l2_x = l2_x.grad.clone()
         torch.testing.assert_close(ref_d_prefix_x, real_d_prefix_x)
         torch.testing.assert_close(ref_d_l2_x, real_d_l2_x)
@@ -678,7 +684,9 @@ class JaggedTensorsTest(unittest.TestCase):
             ref_out.backward(dout)
             # pyre-ignore
             ref_d_jagged, jagged.grad = jagged.grad.clone(), None
+            # pyrefly: ignore [missing-attribute]
             ref_d_dense, dense.grad = dense.grad.clone(), None
+            # pyrefly: ignore [missing-attribute]
             ref_d_bias, bias.grad = bias.grad.clone(), None
 
         jagged = jagged.detach().clone().requires_grad_()
@@ -700,8 +708,11 @@ class JaggedTensorsTest(unittest.TestCase):
         )
         if test_backward:
             real_out.backward(dout)  # pyre-ignore
+            # pyrefly: ignore [missing-attribute]
             real_d_jagged = jagged.grad.clone()
+            # pyrefly: ignore [missing-attribute]
             real_d_dense = dense.grad.clone()
+            # pyrefly: ignore [missing-attribute]
             real_d_bias = bias.grad.clone()
             torch.testing.assert_close(
                 ref_d_jagged,  # pyre-ignore
@@ -845,7 +856,9 @@ class JaggedTensorsTest(unittest.TestCase):
         torch.testing.assert_close(ref_values, real_values)
         if test_backward:
             real_values.backward(dout)
+            # pyrefly: ignore [missing-attribute]
             real_d_a = values_a.grad.clone()
+            # pyrefly: ignore [missing-attribute]
             real_d_b = values_b.grad.clone()
             torch.testing.assert_close(ref_d_a, real_d_a)
             torch.testing.assert_close(ref_d_b, real_d_b)
@@ -959,5 +972,6 @@ class JaggedTensorsTest(unittest.TestCase):
         if test_backward:
             real_values_a.backward(d_values_a, retain_graph=True)
             real_values_b.backward(d_values_b)
+            # pyrefly: ignore [missing-attribute]
             real_d_values = values.grad.clone()
             torch.testing.assert_close(ref_d_values, real_d_values)

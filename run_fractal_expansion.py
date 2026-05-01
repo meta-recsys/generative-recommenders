@@ -532,6 +532,7 @@ def main(
     write_dataset: bool,
     visualize_num_samples: int,
 ):
+    # pyrefly: ignore [bad-argument-type]
     np.random.seed(random_seed)
 
     logger.info(f"Loading and preprocessing MovieLens-20m from {input_csv_file}")

@@ -214,7 +214,9 @@ def delta_hstu_mha(
             v=v,
             seq_offsets=seq_offsets,
             num_targets=num_targets,
+            # pyrefly: ignore [unexpected-keyword]
             is_delta_q=True,
+            # pyrefly: ignore [unexpected-keyword]
             delta_size=DeltaSize,
         )
     else:

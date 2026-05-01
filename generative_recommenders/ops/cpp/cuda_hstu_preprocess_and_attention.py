@@ -130,6 +130,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                     x=normed_x,
                     x_fp8=normed_x_fp8,
                     w=u_weight,
+                    # pyrefly: ignore [bad-argument-type]
                     y=u_bias,
                     x_scale=x_scale,
                     custom_kernel=False,
@@ -139,6 +140,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                     x=normed_x,
                     x_fp8=normed_x_fp8,
                     w=vqk_weight,
+                    # pyrefly: ignore [bad-argument-type]
                     y=vqk_bias,
                     x_scale=x_scale,
                     custom_kernel=False,
@@ -407,6 +409,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 )
                 vqk_bias = None
                 if ctx.has_uvqk_bias:
+                    # pyrefly: ignore [missing-attribute]
                     _, vqk_bias = uvqk_bias.split(
                         [
                             ctx.hidden_dim * ctx.num_heads,
@@ -422,6 +425,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                         x=normed_x,
                         x_fp8=normed_x_fp8,
                         w=vqk_weight,
+                        # pyrefly: ignore [bad-argument-type]
                         y=vqk_bias,
                         x_scale=x_scale,
                         custom_kernel=False,
@@ -450,6 +454,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                         x=normed_x,
                         x_fp8=normed_x_fp8,
                         w=uvqk_weight,
+                        # pyrefly: ignore [bad-argument-type]
                         y=uvqk_bias,
                         x_scale=x_scale,
                         custom_kernel=False,
@@ -526,14 +531,18 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 x=q,
                 N=ctx.max_seq_len,
                 seq_offsets=seq_offsets,
+                # pyrefly: ignore [bad-argument-type]
                 cos_rope=q_cos_weights,
+                # pyrefly: ignore [bad-argument-type]
                 sin_rope=q_sin_weights,
             )
             k = triton_apply_rope_fwd(
                 x=k,
                 N=ctx.max_seq_len,
                 seq_offsets=seq_offsets,
+                # pyrefly: ignore [bad-argument-type]
                 cos_rope=k_cos_weights,
+                # pyrefly: ignore [bad-argument-type]
                 sin_rope=k_sin_weights,
             )
         dq = dq.view(-1, ctx.num_heads, ctx.attn_dim)
@@ -604,14 +613,18 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 grad=_dq,
                 N=ctx.max_seq_len,
                 seq_offsets=seq_offsets,
+                # pyrefly: ignore [bad-argument-type]
                 cos_rope=q_cos_weights,
+                # pyrefly: ignore [bad-argument-type]
                 sin_rope=q_sin_weights,
             )
             _dk = triton_apply_rope_bwd(
                 grad=_dk,
                 N=ctx.max_seq_len,
                 seq_offsets=seq_offsets,
+                # pyrefly: ignore [bad-argument-type]
                 cos_rope=k_cos_weights,
+                # pyrefly: ignore [bad-argument-type]
                 sin_rope=k_sin_weights,
             )
         copy_if_different_ptr(dq, _dq)

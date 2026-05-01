@@ -140,9 +140,12 @@ class TimestampLayerNormPostprocessor(OutputPostprocessor):
         units_per_period = self._units_per_period
 
         timestamps = timestamps.unsqueeze(-1)
+        # pyrefly: ignore [bad-argument-type]
         period_units = _unsqueeze_if_needed(period_units, combined_embeddings)
         units_per_period = _unsqueeze_if_needed(
-            units_per_period, combined_embeddings
+            # pyrefly: ignore [bad-argument-type]
+            units_per_period,
+            combined_embeddings,
         ).float()
         # Compute time features in float32 to avoid bf16 precision loss through
         # discontinuous floor/remainder ops, matching Inductor fusion behavior.
@@ -174,6 +177,7 @@ class TimestampLayerNormPostprocessor(OutputPostprocessor):
         seq_payloads: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
         user_embeddings = self._time_feature_combiner(
+            # pyrefly: ignore [no-matching-overload]
             self._concat_time_features(seq_embeddings, timestamps=seq_timestamps).to(
                 self._time_feature_combiner.weight.dtype  # pyre-fixme[6]: For 1st argument expected `dtype` but got `Union[dtype,
                 #  Tensor, Module]`.

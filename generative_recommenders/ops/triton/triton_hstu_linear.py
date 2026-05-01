@@ -1128,13 +1128,21 @@ def _triton_layer_norm_mul_dropout_fwd_impl(
             x.stride(0),
             u.stride(0),
             y.stride(0),
+            # pyrefly: ignore [bad-argument-type]
             SILU_U=silu_u,
+            # pyrefly: ignore [bad-argument-type]
             BLOCK_D=BLOCK_D,
+            # pyrefly: ignore [bad-argument-type]
             TRAINING=training,
+            # pyrefly: ignore [bad-argument-type]
             CONCAT_U=concat_u,
+            # pyrefly: ignore [bad-argument-type]
             CONCAT_X=concat_x,
+            # pyrefly: ignore [bad-argument-type]
             MUL_U_ACTIVATION_TYPE=mul_u_activation_type,
+            # pyrefly: ignore [bad-argument-type]
             FAST_DROPOUT=COMPUTE_OUTPUT_LN_FAST_DROPOUT,
+            # pyrefly: ignore [unexpected-keyword]
             num_warps=num_warps,
         )
     return y, mean, rstd, random_mask
@@ -1358,13 +1366,21 @@ def _triton_layer_norm_mul_dropout_bwd_impl(
             eps,
             dropout_ratio,
             N=N,
+            # pyrefly: ignore [bad-argument-type]
             SILU_U=silu_u,
+            # pyrefly: ignore [bad-argument-type]
             BLOCK_D=BLOCK_D,
+            # pyrefly: ignore [bad-argument-type]
             TRAINING=training,
+            # pyrefly: ignore [bad-argument-type]
             CONCAT_U=concat_u,
+            # pyrefly: ignore [bad-argument-type]
             CONCAT_X=concat_x,
+            # pyrefly: ignore [bad-argument-type]
             MUL_U_ACTIVATION_TYPE=mul_u_activation_type,
+            # pyrefly: ignore [bad-argument-type]
             COMPUTE_Y=compute_y,
+            # pyrefly: ignore [unexpected-keyword]
             num_warps=num_warps,
         )
 
@@ -1394,14 +1410,23 @@ def _triton_layer_norm_mul_dropout_bwd_impl(
             seed,
             dropout_ratio,
             N=N,
+            # pyrefly: ignore [bad-argument-type]
             SILU_U=silu_u,
+            # pyrefly: ignore [bad-argument-type]
             BLOCK_D=BLOCK_D,
+            # pyrefly: ignore [bad-argument-type]
             TRAINING=training,
+            # pyrefly: ignore [bad-argument-type]
             CONCAT_U=concat_u,
+            # pyrefly: ignore [bad-argument-type]
             CONCAT_X=concat_x,
+            # pyrefly: ignore [bad-argument-type]
             MUL_U_ACTIVATION_TYPE=mul_u_activation_type,
+            # pyrefly: ignore [bad-argument-type]
             COMPUTE_Y=compute_y,
+            # pyrefly: ignore [bad-argument-type]
             FAST_DROPOUT=COMPUTE_OUTPUT_LN_FAST_DROPOUT,
+            # pyrefly: ignore [unexpected-keyword]
             num_warps=num_warps,
         )
 
@@ -1927,6 +1952,7 @@ def triton_group_norm_mul_dropout_fwd(
         )
 
     if seed is None:
+        # pyrefly: ignore [bad-assignment]
         seed = torch.randint(low=0, high=2**62, size=(1,), dtype=torch.int64).item()
     num_warps: int = min(max(BLOCK_D * BLOCK_H // 256, 1), 8)
     # pyre-ignore[28]
@@ -1946,11 +1972,17 @@ def triton_group_norm_mul_dropout_fwd(
         x.stride(0),
         u.stride(0),
         y.stride(0),
+        # pyrefly: ignore [bad-argument-type]
         SILU_U=silu_u,
+        # pyrefly: ignore [bad-argument-type]
         BLOCK_D=BLOCK_D,
+        # pyrefly: ignore [bad-argument-type]
         BLOCK_H=BLOCK_H,
+        # pyrefly: ignore [bad-argument-type]
         TRAINING=training,
+        # pyrefly: ignore [bad-argument-type]
         CONCAT_UX=concat_ux,
+        # pyrefly: ignore [unexpected-keyword]
         num_warps=num_warps,
     )
     return y, mean, rstd, BLOCK_D, BLOCK_H, num_warps, seed  # pyre-ignore [7]
@@ -2036,13 +2068,21 @@ def triton_group_norm_mul_dropout_bwd(
         eps,
         seed,
         dropout_ratio,
+        # pyrefly: ignore [bad-argument-type]
         SILU_U=silu_u,
+        # pyrefly: ignore [bad-argument-type]
         GROUP_N=GROUP_N,
+        # pyrefly: ignore [bad-argument-type]
         BLOCK_D=BLOCK_D,
+        # pyrefly: ignore [bad-argument-type]
         BLOCK_H=BLOCK_H,
+        # pyrefly: ignore [bad-argument-type]
         TRAINING=training,
+        # pyrefly: ignore [bad-argument-type]
         CONCAT_UX=concat_ux,
+        # pyrefly: ignore [bad-argument-type]
         COMPUTE_Y=compute_y,
+        # pyrefly: ignore [unexpected-keyword]
         num_warps=num_warps,
     )
     _group_norm_bwd_dwdb[(num_heads,)](
@@ -2385,6 +2425,7 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
             )
         if not ctx.recompute_y_in_backward:
             y = saved_y
+        # pyrefly: ignore [missing-attribute]
         d_output_weight = torch.mm(y.t(), dout)
         return (
             dattn,
@@ -2506,7 +2547,9 @@ def _helion_ln_mul_dropout_fwd(
 
     # Store outputs
     if CONCAT_UX:
+        # pyrefly: ignore [unbound-name]
         tl.store(y + cols, u_output.to(y.dtype.element_ty), mask=mask)
+        # pyrefly: ignore [unbound-name]
         tl.store(y + D + cols, x_output.to(y.dtype.element_ty), mask=mask)
         tl.store(y + 2 * D + cols, y_output.to(y.dtype.element_ty), mask=mask)
     else:
@@ -2534,6 +2577,7 @@ def helion_layer_norm_mul_dropout_fwd(
     N, D = x.shape
 
     if seed is None:
+        # pyrefly: ignore [bad-assignment]
         seed = torch.randint(low=0, high=2**62, size=(1,), dtype=torch.int64).item()
 
     if concat_ux:
@@ -2556,14 +2600,22 @@ def helion_layer_norm_mul_dropout_fwd(
         eps,
         seed,
         dropout_ratio,
+        # pyrefly: ignore [bad-argument-type]
         D,
+        # pyrefly: ignore [bad-argument-type]
         x.stride(0),
+        # pyrefly: ignore [bad-argument-type]
         u.stride(0),
+        # pyrefly: ignore [bad-argument-type]
         y.stride(0),
         BLOCK_D,
+        # pyrefly: ignore [bad-argument-type]
         CONCAT_UX=concat_ux,
+        # pyrefly: ignore [bad-argument-type]
         SILU_U=silu_u,
+        # pyrefly: ignore [bad-argument-type]
         TRAINING=training,
+        # pyrefly: ignore [unexpected-keyword]
         num_warps=1,
     )
 
@@ -2825,16 +2877,23 @@ def helion_layer_norm_mul_dropout_bwd(
         x.stride(0),
         u.stride(0),
         y.stride(0) if compute_y else 0,  # pyre-ignore [16]
+        # pyrefly: ignore [bad-argument-type]
         D,
         eps,
         seed,
         dropout_ratio,
         N=N,
+        # pyrefly: ignore [bad-argument-type]
         SILU_U=silu_u,
+        # pyrefly: ignore [bad-argument-type]
         BLOCK_D=BLOCK_D,
+        # pyrefly: ignore [bad-argument-type]
         TRAINING=training,
+        # pyrefly: ignore [bad-argument-type]
         CONCAT_UX=concat_ux,
+        # pyrefly: ignore [bad-argument-type]
         COMPUTE_Y=compute_y,
+        # pyrefly: ignore [unexpected-keyword]
         num_warps=num_warps,
     )
 
