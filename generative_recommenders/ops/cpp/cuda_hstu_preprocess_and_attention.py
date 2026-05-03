@@ -50,7 +50,7 @@ try:
     torch.ops.load_library(
         "//generative_recommenders/ops/cpp/hstu_attention:hstu_flash_attention"
     )
-except ImportError as ex:
+except Exception as ex:
     print(f"Library importing error when importing library: {ex}")
 
 
