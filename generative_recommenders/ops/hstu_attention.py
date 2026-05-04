@@ -47,6 +47,57 @@ torch.fx.wrap("triton_hstu_mha")
 torch.fx.wrap("triton_cached_hstu_mha")
 
 
+@torch.fx.wrap
+def hstu_mha_cuda(
+    max_seq_len: int,
+    alpha: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    num_targets: Optional[torch.Tensor] = None,
+    max_attn_len: int = 0,
+    contextual_seq_len: int = 0,
+) -> torch.Tensor:
+    """TorchScript-friendly inference forwarder onto ``torch.ops.hstu.hstu_mha``.
+
+    Bypasses the ``HammerKernel`` enum dispatch in :func:`hstu_mha` so the
+    scripted graph has a single concrete C++ op to call. Mirrors the
+    inference-only path of
+    :func:`generative_recommenders.ops.cpp.cuda_hstu_attention.cuda_hstu_mha_inference_wrapper`
+    with the subset of arguments :class:`STULayer` actually uses.
+    """
+    return torch.ops.hstu.hstu_mha(
+        max_seq_len,
+        alpha,
+        q,
+        k,
+        v,
+        seq_offsets,
+        True,  # causal
+        num_targets,
+        None,  # attn_scale
+        max_attn_len,
+        0,  # min_full_attn_seq_len
+        contextual_seq_len,
+        None,  # q_descale
+        None,  # k_descale
+        None,  # v_descale
+        False,  # sort_by_length
+        False,  # deterministic
+        0,  # sm_margin
+        0,  # max_q_len
+        None,  # seq_offsets_q
+        0,  # num_softmax_heads
+        False,  # training
+        None,  # max_seq_len_tensor
+        None,  # contextual_seq_len_tensor
+        None,  # max_attn_len_tensor
+        None,  # min_full_attn_seq_len_tensor
+        1,  # num_groups
+    )
+
+
 def hstu_mha(
     max_seq_len: int,
     alpha: float,
