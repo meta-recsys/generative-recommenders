@@ -39,7 +39,7 @@ except ImportError:
     triton_cc_group_norm_mul_dropout_wrapper = None
     triton_cc_layer_norm_mul_dropout_wrapper = None
 from generative_recommenders.common import HammerKernel
-from generative_recommenders.ops.hstu_attention import hstu_mha
+from generative_recommenders.ops.hstu_attention import hstu_mha, hstu_mha_cuda
 from generative_recommenders.ops.triton.triton_hstu_linear import (
     triton_hstu_compute_output,
 )
@@ -63,19 +63,30 @@ def hstu_compute_uqvk(
     uvqk_bias: torch.Tensor,
     kernel: HammerKernel = HammerKernel.PYTORCH,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    normed_x = layer_norm(
-        x,
-        weight=norm_weight,
-        bias=norm_bias,
-        eps=norm_eps,
-        kernel=kernel,
-    )
-    # NOTE: for AMD training, we go with torch.addmm instead of the triton
-    # version before Triton on AMD achieves on-par perf with NV GPU.
-    if torch.version.hip and kernel == HammerKernel.TRITON:
+    if torch.jit.is_scripting():
+        # Script-mode fast path: pure PyTorch, no HammerKernel dispatch.
+        normed_x = F.layer_norm(
+            x,
+            normalized_shape=(x.shape[-1],),
+            weight=norm_weight,
+            bias=norm_bias,
+            eps=norm_eps,
+        )
         uvqk = torch.addmm(uvqk_bias, normed_x, uvqk_weight)
     else:
-        uvqk = addmm(uvqk_bias, normed_x, uvqk_weight, kernel)
+        normed_x = layer_norm(
+            x,
+            weight=norm_weight,
+            bias=norm_bias,
+            eps=norm_eps,
+            kernel=kernel,
+        )
+        # NOTE: for AMD training, we go with torch.addmm instead of the triton
+        # version before Triton on AMD achieves on-par perf with NV GPU.
+        if torch.version.hip and kernel == HammerKernel.TRITON:
+            uvqk = torch.addmm(uvqk_bias, normed_x, uvqk_weight)
+        else:
+            uvqk = addmm(uvqk_bias, normed_x, uvqk_weight, kernel)
     u, v, q, k = torch.split(
         uvqk,
         [
@@ -112,6 +123,24 @@ def hstu_compute_output(
     recompute_y_in_backward: bool,
     kernel: HammerKernel = HammerKernel.PYTORCH,
 ) -> torch.Tensor:
+    if torch.jit.is_scripting():
+        return pytorch_hstu_compute_output(
+            attn=attn,
+            u=u,
+            x=x,
+            norm_weight=norm_weight,
+            norm_bias=norm_bias,
+            output_weight=output_weight,
+            eps=norm_eps,
+            dropout_ratio=dropout_ratio,
+            training=training,
+            concat_u=concat_u,
+            concat_x=concat_x,
+            mul_u_activation_type=mul_u_activation_type,
+            group_norm=group_norm,
+            num_heads=num_heads,
+            linear_dim=linear_dim,
+        )
     if kernel == HammerKernel.TRITON:
         return triton_hstu_compute_output(
             attn=attn,
@@ -206,6 +235,7 @@ def hstu_preprocess_and_attention(
     sort_by_length: bool,
     prefill: bool = False,
     kernel: HammerKernel = HammerKernel.PYTORCH,
+    enable_tma: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     if not is_fx_tracing():
         torch._assert(max_seq_len > 0, "max_seq_len must be larger than 0")
@@ -219,6 +249,34 @@ def hstu_preprocess_and_attention(
             "uvqk_weight.shape[1] must equal 2 * num_heads * (hidden_dim + attn_dim)",
         )
         torch._assert(causal is True, "only causal attention is supported.")
+    if torch.jit.is_scripting():
+        # Script-mode: compute uvqk via PyTorch fallback then call the
+        # libtorch-callable CUDA HSTU MHA op directly. Avoids both the
+        # HammerKernel enum dispatch and the Triton-only fused path.
+        u, q, k, v = hstu_compute_uqvk(
+            x=x,
+            norm_weight=norm_weight,
+            norm_bias=norm_bias,
+            norm_eps=norm_eps,
+            num_heads=num_heads,
+            attn_dim=attn_dim,
+            hidden_dim=hidden_dim,
+            uvqk_weight=uvqk_weight,
+            uvqk_bias=uvqk_bias,
+            kernel=HammerKernel.PYTORCH,
+        )
+        attn_output = hstu_mha_cuda(
+            max_seq_len=max_seq_len,
+            alpha=attn_alpha,
+            q=q,
+            k=k,
+            v=v,
+            seq_offsets=seq_offsets,
+            num_targets=num_targets,
+            max_attn_len=max_attn_len,
+            contextual_seq_len=contextual_seq_len,
+        ).view(-1, hidden_dim * num_heads)
+        return u, attn_output, k, v
     if kernel == HammerKernel.TRITON and prefill is False:
         u, attn_output = triton_hstu_preprocess_and_attention(
             x=x,
@@ -239,6 +297,7 @@ def hstu_preprocess_and_attention(
             recompute_uvqk_in_backward=recompute_uvqk_in_backward,
             recompute_normed_x_in_backward=recompute_normed_x_in_backward,
             sort_by_length=sort_by_length,
+            enable_tma=enable_tma,
         )
         attn_output = attn_output.view(-1, hidden_dim * num_heads)
         k = None

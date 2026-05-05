@@ -217,6 +217,35 @@ class DefaultMultitaskModule(MultitaskModule):
             encoded_user_embeddings = encoded_user_embeddings.to(self._training_dtype)
             item_embeddings = item_embeddings.to(self._training_dtype)
 
+        if torch.jit.is_scripting():
+            # Script-mode fast path: skip torch.autocast (unsupported in TS)
+            # and inline _compute_pred_and_logits to avoid its
+            # `torch.nn.Module` parameter annotation (TS only knows
+            # concrete module types). The dense module is already in bf16
+            # at this point, so autocast is a no-op for the predictor path.
+            mt_logits = self._prediction_module(
+                encoded_user_embeddings * item_embeddings
+            ).transpose(0, 1)
+            mt_preds_list: List[torch.Tensor] = []
+            # MultitaskTaskType is an IntEnum (BINARY_CLASSIFICATION=0,
+            # REGRESSION=1) but TorchScript treats it as an opaque Enum.
+            # Iterate by the integer task indices directly.
+            for task_type in range(len(self._task_offsets) - 1):
+                start = self._task_offsets[task_type]
+                end = self._task_offsets[task_type + 1]
+                logits = mt_logits[start:end, :]
+                if end - start > 0:
+                    # 1 == MultitaskTaskType.REGRESSION
+                    if task_type == 1:
+                        mt_preds_list.append(logits)
+                    else:
+                        mt_preds_list.append(F.sigmoid(logits))
+            if self._has_multiple_task_types:
+                mt_preds: torch.Tensor = torch.concat(mt_preds_list, dim=0)
+            else:
+                mt_preds: torch.Tensor = mt_preds_list[0]
+            return mt_preds, None, None, None
+
         with torch.autocast(
             "cuda",
             dtype=torch.bfloat16,

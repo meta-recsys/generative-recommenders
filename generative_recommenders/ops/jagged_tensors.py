@@ -62,6 +62,15 @@ def concat_2D_jagged(
     offsets_right: Optional[torch.Tensor] = None,
     kernel: HammerKernel = HammerKernel.PYTORCH,
 ) -> torch.Tensor:
+    if torch.jit.is_scripting():
+        return pytorch_concat_2D_jagged(
+            values_left=values_left,
+            values_right=values_right,
+            max_len_left=max_len_left,
+            max_len_right=max_len_right,
+            offsets_left=offsets_left,
+            offsets_right=offsets_right,
+        )
     if not is_fx_tracing():
         torch._assert(values_left.dim() == 2, "values_left must be 2D")
         torch._assert(values_right.dim() == 2, "values_right must be 2D")
@@ -101,6 +110,15 @@ def split_2D_jagged(
     offsets_right: Optional[torch.Tensor] = None,
     kernel: HammerKernel = HammerKernel.PYTORCH,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if torch.jit.is_scripting():
+        return pytorch_split_2D_jagged(
+            max_seq_len=max_seq_len,
+            values=values,
+            max_len_left=max_len_left,
+            max_len_right=max_len_right,
+            offsets_left=offsets_left,
+            offsets_right=offsets_right,
+        )
     if not is_fx_tracing():
         torch._assert(values.dim() == 2, "values must be 2D")
         torch._assert(

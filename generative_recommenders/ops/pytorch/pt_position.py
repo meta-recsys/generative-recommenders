@@ -83,7 +83,7 @@ def pytorch_add_timestamp_positional_embeddings(
     interleave_targets: bool,
     time_bucket_fn: str,
 ) -> torch.Tensor:
-    max_pos_ind = pos_embeddings.size(0)
+    max_pos_ind = int(pos_embeddings.size(0))
     # position encoding
     pos_inds = _get_col_indices(
         max_seq_len=max_seq_len,
