@@ -23,6 +23,7 @@ including sparse inference modules and utilities for moving tensors between devi
 from typing import Dict, Optional, Tuple
 
 import torch
+import torchrec
 from generative_recommenders.modules.dlrm_hstu import (
     DlrmHSTU,
     DlrmHSTUConfig,
@@ -32,10 +33,51 @@ from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
     EmbeddingCollection,
 )
-from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
+from torchrec.sparse.tensor_dict import maybe_td_to_kjt
 
 
 IS_INFERENCE: bool = True
+
+
+class _NoCopyEmbeddingCollection(torchrec.EmbeddingCollection):
+    """
+    EmbeddingCollection variant that skips the dtype-cast copy in
+    ``EmbeddingCollection.forward`` and clamps indices into the hash-size
+    range. This is the script-mode replacement for the
+    ``functools.partial`` monkey-patch in
+    :func:`generative_recommenders.dlrm_v3.inference.model_family.ec_patched_forward_wo_embedding_copy`.
+
+    The body mirrors that helper exactly so that the eager and scripted paths
+    produce the same embeddings.
+    """
+
+    def forward(
+        self,
+        features: KeyedJaggedTensor,
+    ) -> Dict[str, JaggedTensor]:
+        features = maybe_td_to_kjt(features, None)
+        feature_embeddings: Dict[str, JaggedTensor] = {}
+        jt_dict: Dict[str, JaggedTensor] = features.to_dict()
+        # Inline HASH_SIZE_1B - 1 as a literal so TorchScript can see it; the
+        # imported module-level constant is treated as an opaque "closed-over
+        # global" by jit.script and would fail with
+        # "python value of type 'int' cannot be used as a value".
+        max_index: int = 999_999_999  # HASH_SIZE_1B - 1
+        for i, emb_module in enumerate(self.embeddings.values()):
+            feature_names = self._feature_names[i]
+            embedding_names = self._embedding_names_by_table[i]
+            for j, embedding_name in enumerate(embedding_names):
+                feature_name = feature_names[j]
+                f = jt_dict[feature_name]
+                indices = torch.clamp(f.values(), min=0, max=max_index)
+                lookup = emb_module(input=indices)
+                feature_embeddings[embedding_name] = JaggedTensor(
+                    values=lookup,
+                    lengths=f.lengths(),
+                    weights=f.values() if self._need_indices else None,
+                )
+        return feature_embeddings
 
 
 def set_is_inference(is_inference: bool = False) -> None:
@@ -88,6 +130,12 @@ def get_hstu_model(
             module, EmbeddingCollection
         ):
             module.to_empty(device=table_device)
+            # to_empty leaves parameters uninitialized; fill with small random
+            # values so downstream bf16 ops don't produce NaN from
+            # uninitialized memory.
+            for p in module.parameters():
+                if not p.is_meta:
+                    torch.nn.init.uniform_(p, -0.01, 0.01)
     return model
 
 
