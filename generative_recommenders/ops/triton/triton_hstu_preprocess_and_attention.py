@@ -25,6 +25,7 @@ from generative_recommenders.ops.triton.triton_addmm import (
     triton_addmm_fwd,
 )
 from generative_recommenders.ops.triton.triton_hstu_attention import (
+    _should_enable_tma,
     triton_hstu_attention_bwd,
     triton_hstu_attention_fwd,
 )
@@ -310,8 +311,14 @@ def triton_hstu_preprocess_and_attention(
     recompute_uvqk_in_backward: bool = False,
     recompute_normed_x_in_backward: bool = False,
     sort_by_length: bool = False,
-    enable_tma: bool = False,
+    enable_tma: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    # When the caller does not specify enable_tma, auto-detect whether the
+    # TMA / TLX fast path is safe on this device. Resolving here (vs inside
+    # the autograd Function.forward) keeps a concrete bool flowing through
+    # ctx.save_for_backward / ctx attributes.
+    if enable_tma is None:
+        enable_tma = _should_enable_tma()
     return _HSTUPreprocessAndAttentionFunction.apply(
         x,
         norm_weight,
