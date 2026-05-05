@@ -54,6 +54,16 @@ def layer_norm(
     eps: float = 1e-5,
     kernel: HammerKernel = HammerKernel.PYTORCH,
 ) -> torch.Tensor:
+    if torch.jit.is_scripting():
+        # Script-mode fast path: bypass the HammerKernel ladder (which would
+        # drag in is_fx_tracing()'s closed-over global bool).
+        return torch.nn.functional.layer_norm(
+            x,
+            normalized_shape=(x.shape[-1],),
+            weight=weight,
+            bias=bias,
+            eps=eps,
+        )
     if kernel == HammerKernel.TRITON:
         if not is_fx_tracing():
             torch._assert(not x.is_cpu, "x must be device tensor")
@@ -91,6 +101,14 @@ def rms_norm(
     kernel: HammerKernel = HammerKernel.PYTORCH,
     silu: bool = False,
 ) -> torch.Tensor:
+    if torch.jit.is_scripting():
+        # Script-mode fast path: bypass the HammerKernel ladder.
+        x_f = x.float()
+        norm = torch.rsqrt(x_f.pow(2).mean(-1, keepdim=True) + eps)
+        out = (x_f * norm * weight.float()).to(x.dtype)
+        if silu:
+            out = torch.nn.functional.silu(out)
+        return out
     if kernel == HammerKernel.TRITON:
         if not is_fx_tracing():
             torch._assert(not x.is_cpu, "x must be device tensor")
@@ -126,6 +144,17 @@ def swish_layer_norm(
     eps: float = 1e-5,
     kernel: HammerKernel = HammerKernel.PYTORCH,
 ) -> torch.Tensor:
+    if torch.jit.is_scripting():
+        # Script-mode fast path: bypass the HammerKernel ladder (which
+        # otherwise drags in is_fx_tracing(), Triton/Triton_CC closures,
+        # etc.) and call pure PyTorch directly.
+        return pytorch_swish_layer_norm(
+            x,
+            [x.shape[-1]],
+            weight,
+            bias,
+            eps,
+        )
     if kernel == HammerKernel.TRITON:
         if not is_fx_tracing():
             torch._assert(not x.is_cpu, "x must be device tensor")

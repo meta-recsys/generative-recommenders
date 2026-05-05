@@ -32,6 +32,8 @@ def addmm(
     mat2: torch.Tensor,
     kernel: HammerKernel = HammerKernel.PYTORCH,
 ) -> torch.Tensor:
+    if torch.jit.is_scripting():
+        return torch.addmm(input, mat1, mat2)
     if kernel == HammerKernel.TRITON:
         return triton_addmm(input, mat1, mat2)
     elif kernel == HammerKernel.TRITON_CC:

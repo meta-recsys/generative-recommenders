@@ -52,6 +52,22 @@ def add_timestamp_positional_embeddings(
     time_bucket_fn: str = "sqrt",
     kernel: HammerKernel = HammerKernel.PYTORCH,
 ) -> torch.Tensor:
+    if torch.jit.is_scripting():
+        # Script-mode fast path: bypass the HammerKernel ladder.
+        seq_embeddings = seq_embeddings * alpha
+        return pytorch_add_timestamp_positional_embeddings(
+            seq_embeddings=seq_embeddings,
+            seq_offsets=seq_offsets,
+            pos_embeddings=position_embeddings_weight,
+            ts_embeddings=timestamp_embeddings_weight,
+            timestamps=timestamps,
+            max_seq_len=max_seq_len,
+            max_contextual_seq_len=max_contextual_seq_len,
+            seq_lengths=seq_lengths,
+            num_targets=num_targets,
+            interleave_targets=interleave_targets,
+            time_bucket_fn=time_bucket_fn,
+        )
     assert time_bucket_fn in ["sqrt", "log"]
     seq_embeddings = seq_embeddings * alpha
     if kernel == HammerKernel.TRITON:

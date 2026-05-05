@@ -283,6 +283,22 @@ class DlrmHSTU(HammerModule):
         else:
             # Dummy, offsets are unused
             contextual_offsets = torch.empty((0, 0))
+        if torch.jit.is_scripting():
+            # Explicit loops are TS-clean (avoid the dict-merge / dict-comp
+            # idioms below, which TorchScript cannot script).
+            out: Dict[str, torch.Tensor] = {}
+            for k, v in payload_features.items():
+                out[k] = v
+            for x in self._hstu_configs.contextual_feature_to_max_length.keys():
+                out[x] = seq_embeddings[x].embedding
+            i = 0
+            for x in self._hstu_configs.contextual_feature_to_max_length.keys():
+                # pyre-ignore[6]
+                out[x + "_offsets"] = contextual_offsets[i]
+                i += 1
+            for x in self._additional_embedding_features:
+                out[x] = seq_embeddings[x].embedding
+            return out
         return {
             **payload_features,
             **{
@@ -333,11 +349,11 @@ class DlrmHSTU(HammerModule):
         dtype = embedding.dtype
         if (not self.is_inference) and self._bf16_training:
             embedding = embedding.to(torch.bfloat16)
-        with torch.autocast(
-            "cuda",
-            dtype=torch.bfloat16,
-            enabled=(not self.is_inference) and self._bf16_training,
-        ):
+        if torch.jit.is_scripting():
+            # TorchScript does not support ``with torch.autocast(...)``.
+            # In script-mode inference the dense path is already in bf16
+            # (move_sparse_output_to_device upcasts on the C++ side), so
+            # autocast is a no-op for the path the predictor exercises.
             candidates_user_embeddings, _ = self._hstu_transducer(
                 max_uih_len=max_uih_len,
                 max_targets=max_candidates,
@@ -352,6 +368,26 @@ class DlrmHSTU(HammerModule):
                 ),
                 num_targets=num_candidates,
             )
+        else:
+            with torch.autocast(
+                "cuda",
+                dtype=torch.bfloat16,
+                enabled=(not self.is_inference) and self._bf16_training,
+            ):
+                candidates_user_embeddings, _ = self._hstu_transducer(
+                    max_uih_len=max_uih_len,
+                    max_targets=max_candidates,
+                    total_uih_len=source_timestamps.numel() - total_targets,
+                    total_targets=total_targets,
+                    seq_embeddings=embedding,
+                    seq_lengths=source_lengths,
+                    seq_timestamps=source_timestamps,
+                    seq_payloads=self._construct_payload(
+                        payload_features=payload_features,
+                        seq_embeddings=seq_embeddings,
+                    ),
+                    num_targets=num_candidates,
+                )
         candidates_user_embeddings = candidates_user_embeddings.to(dtype)
 
         return candidates_user_embeddings
