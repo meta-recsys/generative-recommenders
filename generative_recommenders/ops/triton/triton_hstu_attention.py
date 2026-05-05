@@ -82,6 +82,60 @@ def _host_descriptor_pre_hook(nargs):
     nargs["K"].block_shape = [BLOCK_N, BLOCK_D_Q]
 
 
+# pyre-ignore[2]
+def _early_config_prune(
+    configs: List[triton.Config],
+    named_args,
+    **kwargs,
+) -> List[triton.Config]:
+    """Filter autotune configs that are incompatible with the current call.
+
+    The TLX (warp-specialized) variant of ``_hstu_attn_fwd`` calls
+    ``tlx.async_descriptor_load(Q, ...)`` which requires Q/K/V to be real TMA
+    tensor descriptors (``tl.tensor_descriptor_base``). They are only
+    constructed by the host wrapper when ``ENABLE_TMA=True`` AND the host
+    ``TensorDescriptor`` API is importable. If the kernel is invoked without
+    those preconditions, raw tensors flow into the TLX path and the
+    ``isinstance(desc, tl.tensor_descriptor_base)`` assert in
+    ``triton/language/extra/tlx/mem_ops.py`` fires at compile time.
+
+    We make autotuning robust to that mismatch by dropping any config with
+    ``USE_TLX=True`` whenever ENABLE_TMA is not set or TMA host descriptors
+    are unavailable. This is purely defensive: if the caller threads
+    ``enable_tma=True`` (see ``_should_enable_tma`` below) the TLX configs
+    remain eligible.
+    """
+    enable_tma = kwargs.get("ENABLE_TMA", None)
+    if enable_tma is None:
+        enable_tma = named_args.get("ENABLE_TMA", False)
+    if enable_tma and tensor_descriptor_tma:
+        return configs
+    pruned = [c for c in configs if not c.kwargs.get("USE_TLX", False)]
+    # Safety: never return an empty config list.
+    return pruned if pruned else configs
+
+
+def _should_enable_tma() -> bool:
+    """Return True iff the TMA / TLX fast path can be safely enabled.
+
+    Conditions:
+      * The host ``triton.tools.tensor_descriptor.TensorDescriptor`` API is
+        importable (``tensor_descriptor_tma``).
+      * CUDA is available and the device is Hopper (compute capability 9),
+        which is the only architecture for which TLX configs are emitted in
+        ``_get_fw_configs``.
+    """
+    if not tensor_descriptor_tma:
+        return False
+    if not torch.cuda.is_available():
+        return False
+    try:
+        device_capability = torch.cuda.get_device_capability()[0]
+    except (RuntimeError, AssertionError):
+        return False
+    return device_capability == 9
+
+
 def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
     configs = []
     if torch.version.hip:
@@ -1513,6 +1567,7 @@ def _hstu_attn_fwd_compute_tlx(  # noqa C901
         "DeltaSize",
         "IS_DELTA_Q",
     ],
+    prune_configs_by={"early_config_prune": _early_config_prune},
 )
 @triton.jit
 def _hstu_attn_fwd(  # noqa C901
@@ -1656,6 +1711,7 @@ def _hstu_attn_fwd(  # noqa C901
         "DeltaSize",
         "IS_DELTA_Q",
     ],
+    prune_configs_by={"early_config_prune": _early_config_prune},
 )
 @triton.jit
 def _hstu_attn_fwd_persistent(  # noqa C901
