@@ -84,6 +84,9 @@ def get_weighted_loss(
     weights: Dict[str, float],
 ) -> torch.Tensor:
     weighted_loss = main_loss
+    # NOTE: `weights` keys must exist in `aux_losses`. If a key is missing, this will
+    # raise a KeyError at runtime. This is easy to trigger via gin config if the
+    # chosen similarity module does not emit the expected aux loss names.
     for key, weight in weights.items():
         cur_weighted_loss = aux_losses[key] * weight
         weighted_loss = weighted_loss + cur_weighted_loss
@@ -107,6 +110,9 @@ def train_fn(
     user_embedding_norm: str = "l2_norm",
     sampling_strategy: str = "in-batch",
     loss_module: str = "SampledSoftmaxLoss",
+    # NOTE: Avoid using a mutable default (e.g., `{}`) for function arguments.
+    # This dict is created once at function definition time and then reused across
+    # calls, which can cause surprising cross-run coupling if it is ever mutated.
     loss_weights: Optional[Dict[str, float]] = {},
     num_negatives: int = 1,
     loss_activation_checkpoint: bool = False,
@@ -350,6 +356,11 @@ def train_fn(
 
             # TODO: consider separating this out?
             B, N = seq_features.past_ids.shape
+            # Insert the current target item id into `past_ids` at position `past_lengths`.
+            # NOTE: This does NOT update `past_payloads` (e.g., ratings/timestamps) at
+            # the same position. This is fine only if downstream modules ignore these
+            # payload features. If using rated/combined input preprocessors (which read
+            # `past_payloads["ratings"]`), this can lead to item/payload misalignment.
             seq_features.past_ids.scatter_(
                 dim=1,
                 index=seq_features.past_lengths.view(-1, 1),
