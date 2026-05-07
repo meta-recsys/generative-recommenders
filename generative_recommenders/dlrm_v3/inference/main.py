@@ -296,12 +296,12 @@ def add_results(
     """
     Aggregate and log benchmark results.
 
-    Computes percentile statistics and QPS metrics from timing data.
+    Computes aggregate latency and throughput statistics from batch results.
 
     Args:
         final_results: Dictionary to populate with aggregated results.
         result_timing: List of timing dictionaries for each batch.
-        result_batches: List of batch sizes processed.
+        result_batches: List of per-batch query counts (`len(qitem.query_ids)`).
     """
     percentiles: list[float] = [50.0, 80.0, 90.0, 95.0, 99.0, 99.9]
     buckets_dict: Dict[str, List[float]] = {}
@@ -315,26 +315,33 @@ def add_results(
         )
         buckets_dict[key] = buckets
         buckets_str_dict[key] = buckets_str
-    total_batches = sum(result_batches)
+    # `result_batches` stores the number of query ids processed in each batch.
+    total_queries = sum(result_batches)
+    total_batches = len(total_timing)
 
-    final_results["good"] = len(total_timing)
-    final_results["avg_time"] = np.mean(total_timing)
+    final_results["good"] = total_batches
+    final_results["avg_batch_time"] = float(np.mean(total_timing))
     final_results["percentiles"] = {
         str(k): v for k, v in zip(percentiles, buckets_dict["total"])
     }
-    final_results["qps"] = total_batches / final_results["took"]
-    final_results["count"] = total_batches
+    final_results["qps"] = total_queries / final_results["took"]
+    final_results["queries"] = total_queries
+    final_results["batches"] = total_batches
 
     for i, timing in enumerate(result_timing):
         logger.warning(f"timing of {i}: {timing}")
 
     logger.warning(
-        "{} qps={:.2f}, avg_query_time={:.4f}, time={:.3f}, queries={}, tiles={}".format(
+        (
+            "{} qps={:.2f}, avg_batch_time={:.4f}, time={:.3f}, "
+            "queries={}, batches={}, percentiles={}"
+        ).format(
             final_results["scenario"],
             final_results["qps"],
-            final_results["avg_time"],
+            final_results["avg_batch_time"],
             final_results["took"],
-            len(result_timing),
+            final_results["queries"],
+            final_results["batches"],
             buckets_str_dict["total"],
         )
     )
