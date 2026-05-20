@@ -32,7 +32,6 @@ from generative_recommenders.common import (
 )
 from generative_recommenders.ops.triton.triton_addmm import maybe_triton_addmm_fwd
 from generative_recommenders.ops.utils import maybe_register_custom_op
-from torch.fx.experimental.symbolic_shapes import guard_or_false
 
 
 def _get_layer_norm_mul_dropout_fwd_multirow_configs() -> List[triton.Config]:
@@ -1218,7 +1217,7 @@ def triton_layer_norm_mul_dropout_fwd(
     assert weight.numel() == D
     assert bias.numel() == D
 
-    if guard_or_false(N == 0):
+    if N == 0:
         D = x.shape[1]
         if concat_u and concat_x:
             y = torch.empty((0, 3 * D), dtype=x.dtype, device=x.device)
