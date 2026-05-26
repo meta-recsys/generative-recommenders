@@ -324,6 +324,8 @@ class DlrmHSTU(HammerModule):
         seq_embeddings: Dict[str, SequenceEmbedding],
         payload_features: Dict[str, torch.Tensor],
         num_candidates: torch.Tensor,
+        total_uih_len: Optional[int] = None,
+        total_targets: Optional[int] = None,
     ) -> torch.Tensor:
         source_lengths = seq_embeddings[
             self._hstu_configs.uih_post_id_feature_name
@@ -342,7 +344,10 @@ class DlrmHSTU(HammerModule):
             ].unsqueeze(-1),
             kernel=self.hammer_kernel(),
         ).squeeze(-1)
-        total_targets = int(num_candidates.sum().item())
+        if total_targets is None:
+            total_targets = int(num_candidates.sum().item())
+        if total_uih_len is None:
+            total_uih_len = source_timestamps.numel() - total_targets
         embedding = seq_embeddings[
             self._hstu_configs.uih_post_id_feature_name
         ].embedding
@@ -357,7 +362,7 @@ class DlrmHSTU(HammerModule):
             candidates_user_embeddings, _ = self._hstu_transducer(
                 max_uih_len=max_uih_len,
                 max_targets=max_candidates,
-                total_uih_len=source_timestamps.numel() - total_targets,
+                total_uih_len=total_uih_len,
                 total_targets=total_targets,
                 seq_embeddings=embedding,
                 seq_lengths=source_lengths,
@@ -377,7 +382,7 @@ class DlrmHSTU(HammerModule):
                 candidates_user_embeddings, _ = self._hstu_transducer(
                     max_uih_len=max_uih_len,
                     max_targets=max_candidates,
-                    total_uih_len=source_timestamps.numel() - total_targets,
+                    total_uih_len=total_uih_len,
                     total_targets=total_targets,
                     seq_embeddings=embedding,
                     seq_lengths=source_lengths,
@@ -502,6 +507,8 @@ class DlrmHSTU(HammerModule):
         uih_seq_lengths: torch.Tensor,
         max_num_candidates: int,
         num_candidates: torch.Tensor,
+        total_uih_len: Optional[int] = None,
+        total_targets: Optional[int] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -545,6 +552,8 @@ class DlrmHSTU(HammerModule):
                 seq_embeddings=seq_embeddings,
                 payload_features=payload_features,
                 num_candidates=num_candidates,
+                total_uih_len=total_uih_len,
+                total_targets=total_targets,
             )
         with record_function("## multitask_module ##"):
             supervision_labels, supervision_weights = (

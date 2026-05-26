@@ -30,6 +30,31 @@ from generative_recommenders.ops.triton.triton_hstu_attention import (
 )
 
 try:
+    # @manual=//generative_recommenders/ops/triton_aot:triton_ragged_hstu_attention
+    from generative_recommenders.ops.triton_aot.triton_ragged_hstu_attention import (  # pyre-ignore[21]
+        aot_triton_kernel_wrapper_cached_hstu_mha,
+        aot_triton_kernel_wrapper_ragged_hstu_mha,
+    )
+except ImportError:
+
+    def aot_triton_kernel_wrapper_cached_hstu_mha(
+        *args: object,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        raise ImportError(
+            "AOT-T is required for the TRITON_INFERENCE cached_hstu_mha kernel."
+        )
+
+    def aot_triton_kernel_wrapper_ragged_hstu_mha(
+        *args: object,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        raise ImportError(
+            "AOT-T is required for the TRITON_INFERENCE ragged_hstu_mha kernel."
+        )
+
+
+try:
     from hammer.ops.triton.cc.hstu_attention.triton_cc_hstu_attention import (
         triton_cc_hstu_mha,
     )
@@ -127,7 +152,12 @@ def hstu_mha(
         torch._assert(v.shape[1] == H, "wrong v shape[1]")
         torch._assert(causal, "only support causal attention")
 
-    if kernel in [HammerKernel.TRITON, HammerKernel.TLX, HammerKernel.TRITON_CC]:
+    if kernel in [
+        HammerKernel.TRITON,
+        HammerKernel.TLX,
+        HammerKernel.TRITON_CC,
+        HammerKernel.TRITON_INFERENCE,
+    ]:
         if not is_fx_tracing() and kernel == HammerKernel.TRITON:
             torch._assert(q.is_cuda, "q must be CUDA tensor")
             torch._assert(k.is_cuda, "k must be CUDA tensor")
@@ -170,7 +200,7 @@ def hstu_mha(
             k=k,
             v=v,
             seq_offsets=seq_offsets,
-            attn_scale=torch.tensor(1.0 / max_seq_len).to(q.device),
+            attn_scale=torch.tensor(1.0 / max_seq_len, device=q.device),
             num_targets=num_targets,
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
@@ -187,6 +217,22 @@ def hstu_mha(
             num_targets=num_targets,
             max_attn_len=max_attn_len,
             contextual_seq_len=contextual_seq_len,
+        )
+    elif kernel == HammerKernel.TRITON_INFERENCE:
+        return aot_triton_kernel_wrapper_ragged_hstu_mha(
+            N=max_seq_len,
+            alpha=alpha,
+            q=q,
+            k=k,
+            v=v,
+            seq_offsets=seq_offsets,
+            invalid_attn_mask_type="causal",
+            num_targets=num_targets,
+            attn_scale=attn_scale,
+            max_attn_len=max_attn_len,
+            contextual_seq_len=contextual_seq_len,
+            full_attn_size=min_full_attn_seq_len,
+            num_softmax_heads=0,
         )
     else:
         return pytorch_hstu_mha(
@@ -232,7 +278,11 @@ def delta_hstu_mha(
         torch._assert(k.shape[2] == D, "wrong k shape[2]")
         torch._assert(v.dim() == 3, "v must be 3-D")
         torch._assert(v.shape[1] == H, "wrong v shape[1]")
-    if kernel in [HammerKernel.TRITON, HammerKernel.TRITON_CC]:
+    if kernel in [
+        HammerKernel.TRITON,
+        HammerKernel.TRITON_CC,
+        HammerKernel.TRITON_INFERENCE,
+    ]:
         if not is_fx_tracing() and kernel == HammerKernel.TRITON:
             torch._assert(delta_q.is_cuda, "q must be CUDA tensor")
             torch._assert(seq_offsets.is_cuda, "seq_offsets must be CUDA tensor")
@@ -267,6 +317,27 @@ def delta_hstu_mha(
             num_targets=num_targets,
             is_delta_q=True,
             delta_size=DeltaSize,
+        )
+    elif kernel == HammerKernel.TRITON_INFERENCE:
+        delta_x_offsets = torch.arange(
+            0,
+            L + 1,
+            DeltaSize,
+            device=delta_q.device,
+            dtype=seq_offsets.dtype,
+        )
+        return aot_triton_kernel_wrapper_cached_hstu_mha(
+            N=max_seq_len,
+            alpha=alpha,
+            delta_q=delta_q,
+            k=k,
+            v=v,
+            delta_x_offsets=delta_x_offsets,
+            seq_offsets=seq_offsets,
+            num_targets=num_targets,
+            attn_scale=None,
+            max_attn_len=max_attn_len,
+            full_attn_size=0,
         )
     else:
         return pytorch_cached_hstu_mha(
