@@ -36,6 +36,35 @@ from generative_recommenders.ops.triton.triton_jagged_tensors import (
 )
 from torch.fx._symbolic_trace import is_fx_tracing
 
+try:
+    # @manual=//generative_recommenders/ops/triton_aot:triton_concat_2d_jagged
+    from generative_recommenders.ops.triton_aot.triton_concat_2d_jagged import (  # pyre-ignore[21]
+        aot_triton_kernel_wrapper_concat_2D_jagged,
+    )
+
+    # @manual=//generative_recommenders/ops/triton_aot:triton_split_2d_jagged
+    from generative_recommenders.ops.triton_aot.triton_split_2d_jagged import (  # pyre-ignore[21]
+        aot_triton_kernel_wrapper_split_2D_jagged,
+    )
+except ImportError:
+
+    def aot_triton_kernel_wrapper_concat_2D_jagged(
+        *args: object,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        raise ImportError(
+            "AOT-T is required for the TRITON_INFERENCE concat_2D_jagged kernel."
+        )
+
+    def aot_triton_kernel_wrapper_split_2D_jagged(
+        *args: object,
+        **kwargs: object,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        raise ImportError(
+            "AOT-T is required for the TRITON_INFERENCE split_2D_jagged kernel."
+        )
+
+
 torch.fx.wrap("triton_jagged_dense_bmm_add")
 
 try:
@@ -87,6 +116,30 @@ def concat_2D_jagged(
             max_len_right=max_len_right,
             offsets_left=offsets_left,
             offsets_right=offsets_right,
+        )
+    elif kernel == HammerKernel.TRITON_INFERENCE:
+        aott_values_left = values_left
+        aott_values_right = values_right
+        if offsets_left is None:
+            assert max_len_left is not None
+            aott_values_left = values_left.reshape(
+                -1,
+                max_len_left,
+                values_left.shape[-1],
+            )
+        if offsets_right is None:
+            assert max_len_right is not None
+            aott_values_right = values_right.reshape(
+                -1,
+                max_len_right,
+                values_right.shape[-1],
+            )
+        return aot_triton_kernel_wrapper_concat_2D_jagged(
+            max_seq_len=max_seq_len,
+            values_a=aott_values_left,
+            values_b=aott_values_right,
+            offsets_a=offsets_left,
+            offsets_b=offsets_right,
         )
     else:
         return pytorch_concat_2D_jagged(
@@ -151,6 +204,24 @@ def split_2D_jagged(
             offsets_left=offsets_left,
             offsets_right=offsets_right,
         )
+    elif kernel == HammerKernel.TRITON_INFERENCE:
+        dense_size = 0
+        if offsets_left is None and max_len_left is not None:
+            dense_size = max_len_left
+        elif offsets_right is None and max_len_right is not None:
+            dense_size = max_len_right
+        split_left, split_right = aot_triton_kernel_wrapper_split_2D_jagged(
+            values=values,
+            max_seq_len=max_seq_len,
+            offsets_a=offsets_left,
+            offsets_b=offsets_right,
+            dense_size=dense_size,
+        )
+        if offsets_left is None:
+            split_left = split_left.reshape(-1, split_left.shape[-1])
+        if offsets_right is None:
+            split_right = split_right.reshape(-1, split_right.shape[-1])
+        return split_left, split_right
     else:
         return pytorch_split_2D_jagged(
             max_seq_len=max_seq_len,
