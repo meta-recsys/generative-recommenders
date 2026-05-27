@@ -31,6 +31,12 @@ from generative_recommenders.ops.utils import is_sm100_plus, maybe_register_cust
 
 try:
     # @manual=//triton:triton
+    from triton.language.extra.subtile_ops import _split_n_2D
+except ImportError:
+    _split_n_2D = None
+
+try:
+    # @manual=//triton:triton
     import triton.language.extra.tlx as tlx  # type: ignore
 
     HAS_TLX = True
@@ -96,12 +102,19 @@ def _check_tma_alignment(
 def _prune_persistent_autows_configs(configs, named_args, **kwargs):  # noqa
     if not _use_meta_ws():
         return configs
+    BROADCAST_Y = kwargs.get("BROADCAST_Y", False)
     pruned = []
     for c in configs:
         BLOCK_M = c.kwargs.get("BLOCK_M", 0)
+        BLOCK_N = c.kwargs.get("BLOCK_N", 0)
+        EPILOGUE_SUBTILE = c.kwargs.get("EPILOGUE_SUBTILE", 1)
         DP = c.kwargs.get("DATA_PARTITION_FACTOR", 1)
         # DATA_PARTITION_FACTOR=2 is only supported with BLOCK_M=256
         if DP == 2 and BLOCK_M != 256:
+            continue
+        if (BLOCK_N // EPILOGUE_SUBTILE) < 32:
+            continue
+        if BROADCAST_Y and (BLOCK_N // EPILOGUE_SUBTILE) < 64:
             continue
         pruned.append(c)
     return pruned
@@ -120,7 +133,6 @@ def _prune_configs_for_tlx_persistent_addmm(configs, named_args, **kwargs):  # n
         NUM_MMA_GROUPS = c.kwargs.get("NUM_MMA_GROUPS", 1)
         BLOCK_M_SPLIT = BLOCK_M // NUM_MMA_GROUPS
         NUM_SMEM_BUFFERS = c.kwargs.get("NUM_SMEM_BUFFERS", 1)
-        EPILOGUE_SUBTILE = c.kwargs.get("EPILOGUE_SUBTILE", 1)
 
         # Hardware constraint: Always make MMA tile 128.
         if BLOCK_M_SPLIT != 128:
@@ -459,7 +471,7 @@ def get_triton_persistent_configs(pre_hook=None) -> List[triton.Config]:
         for block_n in [64, 128, 256]
         for block_k in [64, 128, 256]
         for num_stages in [2, 3, 4]
-        for subtile in [1, 2, 4]
+        for subtile in [1, 2, 4, 8]
         for DP in [1, 2]
     ]
 
@@ -619,65 +631,19 @@ def _addmm_persistent_tile_body(
 
     # Epilogue subtiling breaks the store into multiple pieces to reduce
     # shared memory consumption and allow higher stage counts.
-    if EPILOGUE_SUBTILE == 1:
+    tl.static_assert(
+        EPILOGUE_SUBTILE <= 8,
+        "EPILOGUE_SUBTILE > 8 is not supported",
+    )
+    acc_subtiles = _split_n_2D(accumulator, EPILOGUE_SUBTILE)  # pyre-ignore[16]
+    slice_size: tl.constexpr = BLOCK_N // EPILOGUE_SUBTILE
+    for i in tl.static_range(EPILOGUE_SUBTILE):
         if BROADCAST_Y:
-            y = y_desc.load([0, offs_wn])
+            y_i = y_desc.load([0, offs_wn + i * slice_size])
         else:
-            y = y_desc.load([offs_xm, offs_wn])
-        z = (accumulator + y.to(tl.float32)).to(z_desc.dtype)
-        z_desc.store([offs_xm, offs_wn], z)
-    elif EPILOGUE_SUBTILE == 2:
-        acc = tl.reshape(accumulator, (BLOCK_M, 2, BLOCK_N // 2))
-        acc = tl.permute(acc, (0, 2, 1))
-        acc0, acc1 = tl.split(acc)
-        if BROADCAST_Y:
-            y0 = y_desc.load([0, offs_wn])
-        else:
-            y0 = y_desc.load([offs_xm, offs_wn])
-        z0 = (acc0 + y0.to(tl.float32)).to(z_desc.dtype)
-        z_desc.store([offs_xm, offs_wn], z0)
-        if BROADCAST_Y:
-            y1 = y_desc.load([0, offs_wn + BLOCK_N // 2])
-        else:
-            y1 = y_desc.load([offs_xm, offs_wn + BLOCK_N // 2])
-        z1 = (acc1 + y1.to(tl.float32)).to(z_desc.dtype)
-        z_desc.store([offs_xm, offs_wn + BLOCK_N // 2], z1)
-    elif EPILOGUE_SUBTILE == 4:
-        acc = tl.reshape(accumulator, (BLOCK_M, 2, BLOCK_N // 2))
-        acc = tl.permute(acc, (0, 2, 1))
-        acc_lo, acc_hi = tl.split(acc)
-        acc_lo = tl.reshape(acc_lo, (BLOCK_M, 2, BLOCK_N // 4))
-        acc_lo = tl.permute(acc_lo, (0, 2, 1))
-        acc0, acc1 = tl.split(acc_lo)
-        acc_hi = tl.reshape(acc_hi, (BLOCK_M, 2, BLOCK_N // 4))
-        acc_hi = tl.permute(acc_hi, (0, 2, 1))
-        acc2, acc3 = tl.split(acc_hi)
-        if BROADCAST_Y:
-            y0 = y_desc.load([0, offs_wn])
-        else:
-            y0 = y_desc.load([offs_xm, offs_wn])
-        z0 = (acc0 + y0.to(tl.float32)).to(z_desc.dtype)
-        z_desc.store([offs_xm, offs_wn], z0)
-        if BROADCAST_Y:
-            y1 = y_desc.load([0, offs_wn + BLOCK_N // 4])
-        else:
-            y1 = y_desc.load([offs_xm, offs_wn + BLOCK_N // 4])
-        z1 = (acc1 + y1.to(tl.float32)).to(z_desc.dtype)
-        z_desc.store([offs_xm, offs_wn + BLOCK_N // 4], z1)
-        if BROADCAST_Y:
-            y2 = y_desc.load([0, offs_wn + 2 * BLOCK_N // 4])
-        else:
-            y2 = y_desc.load([offs_xm, offs_wn + 2 * BLOCK_N // 4])
-        z2 = (acc2 + y2.to(tl.float32)).to(z_desc.dtype)
-        z_desc.store([offs_xm, offs_wn + 2 * BLOCK_N // 4], z2)
-        if BROADCAST_Y:
-            y3 = y_desc.load([0, offs_wn + 3 * BLOCK_N // 4])
-        else:
-            y3 = y_desc.load([offs_xm, offs_wn + 3 * BLOCK_N // 4])
-        z3 = (acc3 + y3.to(tl.float32)).to(z_desc.dtype)
-        z_desc.store([offs_xm, offs_wn + 3 * BLOCK_N // 4], z3)
-    else:
-        tl.static_assert(False, "Unsupported EPILOGUE_SUBTILE value")
+            y_i = y_desc.load([offs_xm, offs_wn + i * slice_size])
+        z_i = (acc_subtiles[i] + y_i.to(tl.float32)).to(z_desc.dtype)
+        z_desc.store([offs_xm, offs_wn + i * slice_size], z_i)
 
 
 @triton_autotune(
