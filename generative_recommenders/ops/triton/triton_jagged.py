@@ -1063,32 +1063,45 @@ def concat_2D_jagged_w_prefix(
         out_seq_b_start = seq_len_a + n_prefix_from_B
 
     out_ptrs = Out + out_seq_start.to(tl.int64) * stride_od + offs_d
-    if off_n < out_seq_b_start and off_n >= n_prefix_from_B:
-        off_a = off_n - n_prefix_from_B
-        if IS_DENSE_A:
-            in_ptrs = (
-                ValuesA
-                + off_a.to(tl.int64) * stride_ad
-                + off_z.to(tl.int64) * stride_dense_batch
-                + offs_d
-            )
-        else:
-            in_ptrs = ValuesA + (off_a + seq_start_a).to(tl.int64) * stride_ad + offs_d
+    d_mask = offs_d < D
+
+    # Determine whether this position reads from A or B.
+    # Using mask-based loads avoids a pointer phi node (ValuesA vs ValuesB),
+    # which fails on AMD when the inductor applies tt.pointer_range asymmetrically.
+    use_a = (off_n < out_seq_b_start) & (off_n >= n_prefix_from_B)
+
+    # Compute A pointers and load
+    off_a = off_n - n_prefix_from_B
+    if IS_DENSE_A:
+        in_a_ptrs = (
+            ValuesA
+            + off_a.to(tl.int64) * stride_ad
+            + off_z.to(tl.int64) * stride_dense_batch
+            + offs_d
+        )
     else:
-        off_b = off_n - out_seq_b_start + n_prefix_from_B
-        if off_n < n_prefix_from_B:
-            off_b += out_seq_b_start - n_prefix_from_B
-        if IS_DENSE_B:
-            in_ptrs = (
-                ValuesB
-                + off_b.to(tl.int64) * stride_bd
-                + off_z.to(tl.int64) * stride_dense_batch
-                + offs_d
-            )
-        else:
-            in_ptrs = ValuesB + (off_b + seq_start_b).to(tl.int64) * stride_bd + offs_d
-    v = tl.load(in_ptrs, mask=offs_d < D)
-    tl.store(out_ptrs, v, mask=offs_d < D)
+        in_a_ptrs = ValuesA + (off_a + seq_start_a).to(tl.int64) * stride_ad + offs_d
+    v_a = tl.load(in_a_ptrs, mask=use_a & d_mask, other=0.0)
+
+    # Compute B pointers and load
+    off_b = off_n - out_seq_b_start + n_prefix_from_B
+    off_b = tl.where(
+        off_n < n_prefix_from_B, off_b + out_seq_b_start - n_prefix_from_B, off_b
+    )
+    if IS_DENSE_B:
+        in_b_ptrs = (
+            ValuesB
+            + off_b.to(tl.int64) * stride_bd
+            + off_z.to(tl.int64) * stride_dense_batch
+            + offs_d
+        )
+    else:
+        in_b_ptrs = ValuesB + (off_b + seq_start_b).to(tl.int64) * stride_bd + offs_d
+    v_b = tl.load(in_b_ptrs, mask=~use_a & d_mask, other=0.0)
+
+    # Exactly one of v_a, v_b is non-zero due to mutually exclusive masks
+    v = v_a + v_b
+    tl.store(out_ptrs, v, mask=d_mask)
 
 
 @triton.jit
@@ -1217,17 +1230,27 @@ def split_2D_jagged_w_prefix(
         out_seq_b_start = seq_len_a + n_prefix_to_B
 
     offs_d = tl.arange(0, BLOCK_D)
+    d_mask = offs_d < D
     in_ptrs = JaggedIn + (seq_start + off_n).to(tl.int64) * stride_id + offs_d
-    if off_n < out_seq_b_start and off_n >= n_prefix_to_B:
-        off_a = off_n - n_prefix_to_B
-        out_ptrs = OutA + (off_a + seq_start_a).to(tl.int64) * stride_ad + offs_d
-    else:
-        off_b = off_n - out_seq_b_start + n_prefix_to_B
-        if off_n < n_prefix_to_B:
-            off_b += out_seq_b_start - n_prefix_to_B
-        out_ptrs = OutB + (off_b + seq_start_b).to(tl.int64) * stride_bd + offs_d
-    v = tl.load(in_ptrs, mask=offs_d < D)
-    tl.store(out_ptrs, v, mask=offs_d < D)
+    v = tl.load(in_ptrs, mask=d_mask)
+
+    # Determine whether this position writes to A or B.
+    # Using mask-based stores avoids a pointer phi node (OutA vs OutB),
+    # which fails on AMD when the inductor applies tt.pointer_range asymmetrically.
+    use_a = (off_n < out_seq_b_start) & (off_n >= n_prefix_to_B)
+
+    # Store to A
+    off_a = off_n - n_prefix_to_B
+    out_a_ptrs = OutA + (off_a + seq_start_a).to(tl.int64) * stride_ad + offs_d
+    tl.store(out_a_ptrs, v, mask=use_a & d_mask)
+
+    # Store to B
+    off_b = off_n - out_seq_b_start + n_prefix_to_B
+    off_b = tl.where(
+        off_n < n_prefix_to_B, off_b + out_seq_b_start - n_prefix_to_B, off_b
+    )
+    out_b_ptrs = OutB + (off_b + seq_start_b).to(tl.int64) * stride_bd + offs_d
+    tl.store(out_b_ptrs, v, mask=~use_a & d_mask)
 
 
 @triton.jit
