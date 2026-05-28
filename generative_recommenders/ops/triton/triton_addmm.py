@@ -690,6 +690,7 @@ def _addmm_fwd_tma_persistent(
             flatten=False,
             warp_specialize=WARP_SPECIALIZE,
             data_partition_factor=DATA_PARTITION_FACTOR,
+            separate_epilogue_store=True,
             smem_alloc_algo=1,
         ):
             _addmm_persistent_tile_body(
