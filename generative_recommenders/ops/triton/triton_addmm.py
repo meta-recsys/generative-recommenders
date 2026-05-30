@@ -465,7 +465,6 @@ def get_triton_persistent_configs(pre_hook=None) -> List[triton.Config]:
             num_warps=4,
             pre_hook=pre_hook,
             early_tma_store_lowering=1,
-            maxRegAutoWS=255,
         )
         for block_m in [64, 128, 256]
         for block_n in [64, 128, 256]
