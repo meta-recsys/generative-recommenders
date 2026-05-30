@@ -42,38 +42,6 @@ from generative_recommenders.ops.triton.triton_layer_norm import (
 )
 from torch.fx._symbolic_trace import is_fx_tracing
 
-try:
-    # @manual=//generative_recommenders/ops/triton_aot:triton_layer_norm
-    from generative_recommenders.ops.triton_aot.triton_layer_norm import (  # pyre-ignore[21]
-        aot_triton_kernel_wrapper_swish_layer_norm,
-    )
-
-    # @manual=//generative_recommenders/ops/triton_aot:triton_rms_norm
-    from generative_recommenders.ops.triton_aot.triton_rms_norm import (  # pyre-ignore[21]
-        aot_triton_kernel_wrapper_rms_norm,
-    )
-except ImportError:
-
-    def aot_triton_kernel_wrapper_swish_layer_norm(
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        bias: torch.Tensor,
-        eps: float,
-        is_swish: bool,
-    ) -> torch.Tensor:
-        raise ImportError(
-            "AOT-T is required for the TRITON_INFERENCE swish_layer_norm kernel."
-        )
-
-    def aot_triton_kernel_wrapper_rms_norm(
-        x: torch.Tensor,
-        weight: torch.Tensor,
-        eps: float,
-        silu: bool,
-    ) -> torch.Tensor:
-        raise ImportError("AOT-T is required for the TRITON_INFERENCE rms_norm kernel.")
-
-
 torch.fx.wrap("triton_layer_norm")
 torch.fx.wrap("triton_swish_layer_norm")
 torch.fx.wrap("triton_rms_norm")
@@ -102,14 +70,6 @@ def layer_norm(
             torch._assert(not weight.is_cpu, "weight must be device tensor")
             torch._assert(not bias.is_cpu, "bias must be device tensor")
         return triton_layer_norm(x, weight, bias, eps)
-    elif kernel == HammerKernel.TRITON_INFERENCE:
-        return aot_triton_kernel_wrapper_swish_layer_norm(
-            x,
-            weight,
-            bias,
-            eps,
-            is_swish=False,
-        )
     elif kernel == HammerKernel.TRITON_CC:
         if triton_cc_swish_layer_norm is None:
             raise ImportError(
@@ -154,8 +114,6 @@ def rms_norm(
             torch._assert(not x.is_cpu, "x must be device tensor")
             torch._assert(not weight.is_cpu, "weight must be device tensor")
         return triton_rms_norm(x, weight, eps, silu)
-    elif kernel == HammerKernel.TRITON_INFERENCE:
-        return aot_triton_kernel_wrapper_rms_norm(x, weight, eps, silu)
     elif kernel == HammerKernel.TRITON_CC:
         if triton_cc_rms_norm is None:
             raise ImportError(
@@ -203,14 +161,6 @@ def swish_layer_norm(
             torch._assert(not weight.is_cpu, "weight must be device tensor")
             torch._assert(not bias.is_cpu, "bias must be device tensor")
         return triton_swish_layer_norm(x, [x.shape[-1]], weight, bias, eps)
-    elif kernel == HammerKernel.TRITON_INFERENCE:
-        return aot_triton_kernel_wrapper_swish_layer_norm(
-            x,
-            weight,
-            bias,
-            eps,
-            is_swish=True,
-        )
     elif kernel == HammerKernel.TRITON_CC:
         if triton_cc_swish_layer_norm is None:
             raise ImportError(

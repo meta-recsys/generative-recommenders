@@ -5,8 +5,7 @@
 // :end_to_end_test.
 //
 // CLI:
-//   hstu_runner [--aott_library <lib.so> ...] <sparse.pt> <dense.pt>
-//       <inputs.pt> <output.pt>
+//   hstu_runner <sparse.pt> <dense.pt> <inputs.pt> <output.pt>
 //
 // Where:
 //   sparse.pt   ScriptModule whose forward(uih, candidates) returns
@@ -19,10 +18,7 @@
 //   output.pt   torch::pickle_save destination for the predictions tensor;
 //               readable from Python as ``torch.load(output.pt)``.
 
-#include <dlfcn.h>
-
 #include <fstream>
-#include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -33,56 +29,7 @@
 
 namespace {
 
-struct RunnerArgs {
-  std::vector<std::string> aottLibraryPaths;
-  std::string sparsePath;
-  std::string densePath;
-  std::string inputsPath;
-  std::string outputPath;
-};
-
-RunnerArgs parseArgs(int argc, char** argv) {
-  RunnerArgs args;
-  std::vector<std::string> positional;
-  for (int i = 1; i < argc; ++i) {
-    const std::string arg{argv[i]};
-    if (arg == "--aott_library") {
-      if (++i >= argc) {
-        throw std::runtime_error("--aott_library requires a path");
-      }
-      args.aottLibraryPaths.emplace_back(argv[i]);
-    } else {
-      positional.push_back(arg);
-    }
-  }
-
-  if (positional.size() != 4) {
-    throw std::runtime_error(
-        "Usage: hstu_runner [--aott_library <lib.so> ...] <sparse.pt> "
-        "<dense.pt> <inputs.pt> <output.pt>");
-  }
-  args.sparsePath = positional[0];
-  args.densePath = positional[1];
-  args.inputsPath = positional[2];
-  args.outputPath = positional[3];
-  return args;
-}
-
-void loadAottLibraries(
-    const std::vector<std::string>& libraryPaths,
-    const std::function<void(const std::string&)>& log) {
-  for (const auto& path : libraryPaths) {
-    log("[runner] loading AOT-T library " + path);
-    void* handle = dlopen(path.c_str(), RTLD_GLOBAL | RTLD_NOW);
-    if (handle == nullptr) {
-      throw std::runtime_error(
-          "failed to dlopen AOT-T library " + path + ": " + dlerror());
-    }
-  }
-}
-
 torch::jit::Module loadModule(const std::string& path) {
-  // @patternlint-disable-next-line no-torch-low-level-api
   auto m = torch::jit::load(path);
   m.eval();
   return m;
@@ -118,17 +65,19 @@ void writePickle(const torch::Tensor& t, const std::string& path) {
 } // namespace
 
 int main(int argc, char** argv) {
-  RunnerArgs args;
-  try {
-    args = parseArgs(argc, argv);
-  } catch (const std::exception& e) {
-    std::cerr << e.what() << '\n';
+  if (argc < 5) {
+    std::cerr << "Usage: hstu_runner <sparse.pt> <dense.pt> <inputs.pt> "
+                 "<output.pt>\n";
     return 1;
   }
+  const std::string sparsePath{argv[1]};
+  const std::string densePath{argv[2]};
+  const std::string inputsPath{argv[3]};
+  const std::string outputPath{argv[4]};
 
   // Log to a file next to the output so we can inspect even if
   // buck2 swallows stderr.
-  const std::string logPath = args.outputPath + ".log";
+  const std::string logPath = outputPath + ".log";
   std::ofstream logFile(logPath);
   auto log = [&](const std::string& msg) {
     logFile << msg << std::endl;
@@ -137,19 +86,14 @@ int main(int argc, char** argv) {
   };
 
   try {
-    log("[runner] step 0: loading AOT-T libraries");
-    loadAottLibraries(args.aottLibraryPaths, log);
-    log("[runner] step 0 done: loaded " +
-        std::to_string(args.aottLibraryPaths.size()) + " AOT-T libraries");
+    log("[runner] step 1: loading sparse module from " + sparsePath);
+    auto sparse = loadModule(sparsePath);
 
-    log("[runner] step 1: loading sparse module from " + args.sparsePath);
-    auto sparse = loadModule(args.sparsePath);
+    log("[runner] step 2: loading dense module from " + densePath);
+    auto dense = loadModule(densePath);
 
-    log("[runner] step 2: loading dense module from " + args.densePath);
-    auto dense = loadModule(args.densePath);
-
-    log("[runner] step 3: loading inputs module from " + args.inputsPath);
-    auto inputs = loadModule(args.inputsPath);
+    log("[runner] step 3: loading inputs module from " + inputsPath);
+    auto inputs = loadModule(inputsPath);
 
     log("[runner] step 4: running inputs.forward()");
     auto inputsTuple = inputs.forward({}).toTuple();
@@ -204,8 +148,8 @@ int main(int argc, char** argv) {
     std::cout << "preds sum:   "
               << preds.to(torch::kFloat32).sum().item<float>() << '\n';
 
-    writePickle(preds, args.outputPath);
-    std::cout << "wrote " << args.outputPath << '\n';
+    writePickle(preds, outputPath);
+    std::cout << "wrote " << outputPath << '\n';
     log("[runner] step 10: done, wrote output");
     return 0;
   } catch (const std::exception& e) {
