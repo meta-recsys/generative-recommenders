@@ -27,8 +27,6 @@ import torch
 # @manual=//triton:triton
 import triton
 from generative_recommenders.ops.utils import is_sm100_plus, is_sm90_plus
-from torch.fx._symbolic_trace import is_fx_tracing
-from torch.utils._python_dispatch import _get_current_dispatch_mode_stack
 
 # @manual=//triton:triton
 from triton.runtime.autotuner import Autotuner
@@ -99,7 +97,7 @@ except ImportError:
         DEV_MODE = val
 
     def is_dev_mode() -> bool:
-        global DEV_MODE  # noqa: F824
+        global DEV_MODE
         return DEV_MODE
 
     def set_verbose_level(level: int) -> None:
@@ -107,7 +105,7 @@ except ImportError:
         VERBOSE_LEVEL = level
 
     def get_verbose_level() -> int:
-        global VERBOSE_LEVEL  # noqa: F824
+        global VERBOSE_LEVEL
         return VERBOSE_LEVEL
 
 
@@ -118,7 +116,6 @@ class HammerKernel(Enum):
     PYTORCH = "PYTORCH"
     CUDA = "CUDA"
     TRITON_CC = "TRITON_CC"
-    TRITON_INFERENCE = "TRITON_INFERENCE"
     CUTEDSL = "CUTEDSL"
 
 
@@ -263,33 +260,13 @@ tma_unavailable: Tuple[bool, str] = (
 
 
 def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
-    if torch.jit.is_scripting():
-        if x.stride(-1) == 1:
-            return x
-        return x.contiguous()
-    if torch.compiler.is_compiling():
+    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
         # Tell Dynamo this data-dependent value is in the range (0, 10**9)
         torch._check(x.size(0) > 0)
         torch._check(x.size(0) < 10**9)
-    # FX cannot trace Python control flow over symbolic stride checks
-    # (`x.stride(-1) == 1`). For AOT-T lowering, conservatively emit the
-    # contiguous op instead of branching on a symbolic value.
-    if is_fx_tracing():
-        return x.contiguous()
     if x.stride(-1) == 1:
         return x
     return x.contiguous()
-
-
-def cdiv(x: int, y: int) -> int:
-    return (x + y - 1) // y
-
-
-def backend_allow_tf32() -> bool:
-    return True
-
-
-BACKEND_ALLOW_TF32: bool = backend_allow_tf32()
 
 
 def next_power_of_2(n: int) -> int:
@@ -353,7 +330,7 @@ def set_use_runtime_max_seq_len(use_runtime_max_seq_len: bool) -> None:
 
 
 def autotune_max_seq_len(runtime_max_seq_len: int) -> int:
-    global USE_RUNTIME_MAX_SEQ_LEN  # noqa: F824
+    global USE_RUNTIME_MAX_SEQ_LEN
 
     if USE_RUNTIME_MAX_SEQ_LEN:
         return prev_power_of_2(runtime_max_seq_len)
@@ -367,7 +344,7 @@ def autotune_max_seq_len(runtime_max_seq_len: int) -> int:
 
 
 def fine_grained_autotune_max_seq_len(runtime_max_seq_len: int) -> int:
-    global USE_RUNTIME_MAX_SEQ_LEN  # noqa: F824
+    global USE_RUNTIME_MAX_SEQ_LEN
 
     if USE_RUNTIME_MAX_SEQ_LEN:
         return _fine_grained_bucket_size(runtime_max_seq_len)
@@ -465,19 +442,6 @@ def fx_torch_ones(
 @torch.fx.wrap
 def fx_torch_zeros(shape: List[int], device: torch.device) -> torch.Tensor:
     return torch.zeros(shape, device=device)
-
-
-def _is_in_dispatch_modes(mode_names: List[str]) -> bool:
-    modes = _get_current_dispatch_mode_stack()
-    return any(mode.__class__.__name__ in mode_names for mode in modes)
-
-
-def should_trigger_eager_impl() -> bool:
-    if torch.jit.is_scripting():
-        return True
-    if torch.compiler.is_compiling():
-        return False
-    return _is_in_dispatch_modes(["SplitDispatchMode", "FakeTensorMode"])
 
 
 @torch.fx.wrap
