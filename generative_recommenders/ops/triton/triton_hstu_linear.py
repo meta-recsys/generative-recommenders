@@ -2319,18 +2319,18 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
         None,  # seed
         None,  # recompute_y_in_backward
     ]:
-        attn, u, norm_weight, norm_bias, mean, rstd, output_weight = ctx.saved_tensors[
-            :7
-        ]
+        # Unpack saved tensors once for selective-checkpoint compatibility.
+        _saved = ctx.saved_tensors
+        attn, u, norm_weight, norm_bias, mean, rstd, output_weight = _saved[:7]
         # Extract optional saved tensors based on flags
         next_idx = 7
         if not ctx.recompute_y_in_backward:
-            saved_y = ctx.saved_tensors[next_idx]
+            saved_y = _saved[next_idx]
             next_idx += 1
         else:
             saved_y = None
         if ctx.has_random_mask:
-            random_mask = ctx.saved_tensors[next_idx]
+            random_mask = _saved[next_idx]
         else:
             random_mask = None
         dy = torch.mm(dout, output_weight.t())
