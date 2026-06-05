@@ -95,13 +95,23 @@ def get_concat_2d_jagged_kernel() -> Optional[str]:
     return None
 
 
-def _should_use_multirow() -> bool:
-    """Check if multirow kernel should be used based on current hardware.
+SPLIT_CONCAT_2D_JAGGED_USE_MULTIROW: Optional[bool] = None
 
-    Can be overridden via the JAGGED_USE_MULTIROW_MI350 environment variable:
-      JAGGED_USE_MULTIROW_MI350=1  -> force multirow on
-      JAGGED_USE_MULTIROW_MI350=0  -> force multirow off
-      unset                  -> auto-detect based on hardware (SM100+ or AMD)
+
+def set_split_concat_2d_jagged_multirow_kernel(
+    use_multirow: Optional[bool],
+) -> None:
+    global SPLIT_CONCAT_2D_JAGGED_USE_MULTIROW
+    SPLIT_CONCAT_2D_JAGGED_USE_MULTIROW = use_multirow
+
+
+def _should_use_multirow() -> bool:
+    """Check if multirow kernel should be used.
+
+    Priority order:
+      1. JAGGED_USE_MULTIROW_MI350 env var (MI350-specific, extended autotune configs)
+      2. Module-level global set by set_split_concat_2d_jagged_multirow_kernel
+      3. is_sm100_plus() hardware check
     """
     env = os.environ.get("JAGGED_USE_MULTIROW_MI350")
     if env is not None:
@@ -110,6 +120,8 @@ def _should_use_multirow() -> bool:
     # multiple rows per block due to 64-wide wavefronts) and NVIDIA SM100+.
     if torch.version.hip is not None:
         return True
+    if SPLIT_CONCAT_2D_JAGGED_USE_MULTIROW is not None:
+        return SPLIT_CONCAT_2D_JAGGED_USE_MULTIROW
     return is_sm100_plus()
 
 
