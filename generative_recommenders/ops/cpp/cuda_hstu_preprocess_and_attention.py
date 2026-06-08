@@ -86,6 +86,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         silu_u: bool = True,
         fp8_in_addmm_fwd: bool = False,
         num_softmax_heads: int = 0,
+        skip_u: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         max_attn_len = max_attn_len or 0
         full_attn_size = full_attn_size or 0
@@ -101,7 +102,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         # When silu_u is False and we want to recompute in backward, we split the weight
         # for u and vqk separately during training to compute them independently.
         # This avoids needing to clone u (which would otherwise keep the whole uvqk alive).
-        if not silu_u and recompute_uvqk_in_backward:
+        if not skip_u and not silu_u and recompute_uvqk_in_backward:
             # Split the weights/biases to compute u and vqk separately
             u_weight, vqk_weight = uvqk_weight.split(
                 [
@@ -181,17 +182,28 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 uvqk = maybe_triton_addmm_fwd(
                     normed_x, uvqk_weight, uvqk_bias
                 ).contiguous()
-            u, v, q, k = uvqk.split(
-                [
-                    hidden_dim * num_heads,
-                    hidden_dim * num_heads,
-                    attn_dim * num_heads,
-                    attn_dim * num_heads,
-                ],
-                dim=1,
-            )
-            if silu_u:
-                u = F.silu(u)
+            if skip_u:
+                v, q, k = uvqk.split(
+                    [
+                        hidden_dim * num_heads,
+                        attn_dim * num_heads,
+                        attn_dim * num_heads,
+                    ],
+                    dim=1,
+                )
+                u = None
+            else:
+                u, v, q, k = uvqk.split(
+                    [
+                        hidden_dim * num_heads,
+                        hidden_dim * num_heads,
+                        attn_dim * num_heads,
+                        attn_dim * num_heads,
+                    ],
+                    dim=1,
+                )
+                if silu_u:
+                    u = F.silu(u)
         if rotary_weights is not None:
             q_cos_weights = rotary_weights[0]
             q_sin_weights = rotary_weights[1]
@@ -318,6 +330,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         ctx.contextual_seq_len = contextual_seq_len
         ctx.sort_by_length = sort_by_length
         ctx.silu_u = silu_u
+        ctx.skip_u = skip_u
         ctx.fp8_in_addmm_fwd = fp8_in_addmm_fwd
         ctx.num_softmax_heads = num_softmax_heads
         return u, out
@@ -387,7 +400,42 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         else:
             normed_x = ctx.saved_tensors[idx]
             idx += 1
-        if ctx.recompute_uvqk_in_backward:
+        if ctx.skip_u:
+            if ctx.recompute_uvqk_in_backward:
+                if ctx.has_uvqk_bias:
+                    uvqk_bias = ctx.saved_tensors[idx]
+                    idx += 1
+                else:
+                    uvqk_bias = None
+                if ctx.fp8_in_addmm_fwd:
+                    x_scale, normed_x_fp8 = ctx.saved_tensors[idx : idx + 2]
+                    vqk = fp8_rowwise_quantize_addmm(
+                        x=normed_x,
+                        x_fp8=normed_x_fp8,
+                        w=uvqk_weight,
+                        y=uvqk_bias,
+                        x_scale=x_scale,
+                        custom_kernel=False,
+                        is_inference=False,
+                    )
+                    idx += 2
+                else:
+                    vqk = maybe_triton_addmm_fwd(
+                        normed_x, uvqk_weight, uvqk_bias
+                    ).contiguous()
+            else:
+                vqk = ctx.saved_tensors[idx]
+                idx += 1
+            v, q, k = vqk.split(
+                [
+                    ctx.hidden_dim * ctx.num_heads,
+                    ctx.attn_dim * ctx.num_heads,
+                    ctx.attn_dim * ctx.num_heads,
+                ],
+                dim=1,
+            )
+            u = None
+        elif ctx.recompute_uvqk_in_backward:
             if ctx.has_uvqk_bias:
                 uvqk_bias = ctx.saved_tensors[idx]
                 idx += 1
@@ -496,23 +544,42 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 None,
             )
 
-        duvqk = torch.empty(
-            [
-                x.size(0),
-                ctx.hidden_dim * ctx.num_heads * 2 + ctx.attn_dim * ctx.num_heads * 2,
-            ],
-            device=x.device,
-            dtype=x.dtype,
-        )
-        du, dv, dq, dk = duvqk.split(
-            [
-                ctx.hidden_dim * ctx.num_heads,
-                ctx.hidden_dim * ctx.num_heads,
-                ctx.attn_dim * ctx.num_heads,
-                ctx.attn_dim * ctx.num_heads,
-            ],
-            dim=1,
-        )
+        if ctx.skip_u:
+            duvqk = torch.empty(
+                [
+                    x.size(0),
+                    ctx.hidden_dim * ctx.num_heads + ctx.attn_dim * ctx.num_heads * 2,
+                ],
+                device=x.device,
+                dtype=x.dtype,
+            )
+            dv, dq, dk = duvqk.split(
+                [
+                    ctx.hidden_dim * ctx.num_heads,
+                    ctx.attn_dim * ctx.num_heads,
+                    ctx.attn_dim * ctx.num_heads,
+                ],
+                dim=1,
+            )
+        else:
+            duvqk = torch.empty(
+                [
+                    x.size(0),
+                    ctx.hidden_dim * ctx.num_heads * 2
+                    + ctx.attn_dim * ctx.num_heads * 2,
+                ],
+                device=x.device,
+                dtype=x.dtype,
+            )
+            du, dv, dq, dk = duvqk.split(
+                [
+                    ctx.hidden_dim * ctx.num_heads,
+                    ctx.hidden_dim * ctx.num_heads,
+                    ctx.attn_dim * ctx.num_heads,
+                    ctx.attn_dim * ctx.num_heads,
+                ],
+                dim=1,
+            )
         q = q.view(-1, ctx.num_heads, ctx.attn_dim)
         k = k.view(-1, ctx.num_heads, ctx.attn_dim)
         v = v.view(-1, ctx.num_heads, ctx.hidden_dim)
@@ -617,10 +684,13 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         copy_if_different_ptr(dq, _dq)
         copy_if_different_ptr(dk, _dk)
         copy_if_different_ptr(dv, _dv)
-        if ctx.silu_u:
-            torch.ops.aten.silu_backward(_du, u, grad_input=du)
-        else:
-            copy_if_different_ptr(du, _du)
+        if not ctx.skip_u:
+            if ctx.silu_u:
+                # pyre-ignore[61]: `du` is always defined in the else branch above
+                torch.ops.aten.silu_backward(_du, u, grad_input=du)
+            else:
+                # pyre-ignore[61]: `du` is always defined in the else branch above
+                copy_if_different_ptr(du, _du)
         d_normed_x, d_uvqk_weight, d_uvqk_bias = triton_addmm_bwd(
             x=normed_x,
             w=uvqk_weight,
@@ -665,4 +735,5 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,  # skip_u
         )
