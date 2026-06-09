@@ -44,7 +44,7 @@ except ImportError:
     tlx = None
     HAS_TLX = False
 
-from generative_recommenders.common import triton_autotune, triton_cc
+from generative_recommenders.common import triton_autotune
 
 try:
     # @manual=//triton:triton
@@ -475,21 +475,6 @@ def get_triton_persistent_configs(pre_hook=None) -> List[triton.Config]:
     ]
 
 
-@triton_cc(
-    annotations={
-        "M": "i32",
-        "N": ("i32", 16),
-        "K": ("i32", 16),
-        "stride_xm": ("i32", 16),
-        "stride_xk": ("i32", 1),
-        "stride_wk": ("i32", 16),
-        "stride_wn": ("i32", 1),
-        "stride_ym": ("i32", 16),
-        "stride_yn": ("i32", 1),
-        "stride_zm": ("i32", 16),
-        "stride_zn": ("i32", 1),
-    },
-)
 @triton_autotune(
     configs=get_mm_configs(),
     key=["N", "K"],
