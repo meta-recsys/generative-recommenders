@@ -16,7 +16,7 @@
 
 #!/usr/bin/env python3
 
-
+import inspect
 import math
 from typing import List, Optional, Tuple
 
@@ -57,6 +57,13 @@ except ImportError:
 
 
 ENABLE_FULL_TURNING_SPACE = False
+
+
+def _tl_dot_supports_two_ctas() -> bool:
+    try:
+        return "two_ctas" in inspect.signature(tl.dot).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def _use_meta_ws() -> bool:
@@ -109,6 +116,18 @@ def _prune_persistent_autows_configs(configs, named_args, **kwargs):  # noqa
         BLOCK_N = c.kwargs.get("BLOCK_N", 0)
         EPILOGUE_SUBTILE = c.kwargs.get("EPILOGUE_SUBTILE", 1)
         DP = c.kwargs.get("DATA_PARTITION_FACTOR", 1)
+        SEPARATE_EPILOGUE_STORE = c.kwargs.get("SEPARATE_EPILOGUE_STORE", False)
+        TWO_CTAS = c.kwargs.get("TWO_CTAS", False)
+        # Current 2-CTA lowering only supports the standard 128-row MMA tile.
+        if TWO_CTAS and BLOCK_M != 128:
+            continue
+        # 2-CTA splits W/B across the N dimension. With the current 128-byte
+        # swizzle layout, each CTA needs at least 64 fp16 elements along the
+        # contiguous dimension, so the unsplit BLOCK_N must be at least 128.
+        if TWO_CTAS and BLOCK_N < 128:
+            continue
+        if TWO_CTAS and DP > 1:
+            continue
         # DATA_PARTITION_FACTOR=2 is only supported with BLOCK_M=256
         if DP == 2 and BLOCK_M != 256:
             continue
@@ -449,9 +468,11 @@ def get_triton_persistent_configs(pre_hook=None) -> List[triton.Config]:
         for c in configs:
             c.kwargs["DATA_PARTITION_FACTOR"] = 1
             c.kwargs["EPILOGUE_SUBTILE"] = 1
+            c.kwargs["SEPARATE_EPILOGUE_STORE"] = True
+            c.kwargs["TWO_CTAS"] = False
         return configs
-    # TODO: Prune configs to best configs.
-    return [
+    two_ctas_values = [False, True] if _tl_dot_supports_two_ctas() else [False]
+    configs = [
         triton.Config(  # pyre-ignore[28]
             {
                 "BLOCK_M": block_m,
@@ -460,11 +481,14 @@ def get_triton_persistent_configs(pre_hook=None) -> List[triton.Config]:
                 "GROUP_M": 8,
                 "EPILOGUE_SUBTILE": subtile,
                 "DATA_PARTITION_FACTOR": DP,
+                "SEPARATE_EPILOGUE_STORE": separate_epilogue_store,
+                "TWO_CTAS": two_ctas,
             },
             num_stages=num_stages,
             num_warps=4,
             pre_hook=pre_hook,
             early_tma_store_lowering=1,
+            ctas_per_cga=(2, 1, 1) if two_ctas else None,
         )
         for block_m in [64, 128, 256]
         for block_n in [64, 128, 256]
@@ -472,7 +496,10 @@ def get_triton_persistent_configs(pre_hook=None) -> List[triton.Config]:
         for num_stages in [2, 3, 4]
         for subtile in [1, 2, 4, 8]
         for DP in [1, 2]
+        for two_ctas in two_ctas_values
+        for separate_epilogue_store in [False, True]
     ]
+    return configs
 
 
 @triton_autotune(
@@ -601,17 +628,32 @@ def _addmm_persistent_tile_body(
     NUM_SMS: tl.constexpr,
     EPILOGUE_SUBTILE: tl.constexpr,
     INNER_WARP_SPECIALIZE: tl.constexpr,
+    TWO_CTAS: tl.constexpr,
 ):
     pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_M, NUM_SMS)
     offs_xm = pid_m * BLOCK_M
     offs_wn = pid_n * BLOCK_N
-
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in tl.range(0, k_tiles, warp_specialize=INNER_WARP_SPECIALIZE):
         offs_k = k * BLOCK_K
         x = x_desc.load([offs_xm, offs_k])
         w = w_desc.load([offs_k, offs_wn])
-        accumulator = tl.dot(x, w, accumulator, allow_tf32=ALLOW_TF32)
+        if TWO_CTAS:
+            # pyre-ignore[28]: two_ctas is only available in beta Triton.
+            accumulator = tl.dot(
+                x,
+                w,
+                accumulator,
+                allow_tf32=ALLOW_TF32,
+                two_ctas=True,
+            )
+        else:
+            accumulator = tl.dot(
+                x,
+                w,
+                accumulator,
+                allow_tf32=ALLOW_TF32,
+            )
 
     # Epilogue subtiling breaks the store into multiple pieces to reduce
     # shared memory consumption and allow higher stage counts.
@@ -655,6 +697,8 @@ def _addmm_fwd_tma_persistent(
     EPILOGUE_SUBTILE: tl.constexpr,
     DATA_PARTITION_FACTOR: tl.constexpr,
     USE_META_WS: tl.constexpr,
+    TWO_CTAS: tl.constexpr,
+    SEPARATE_EPILOGUE_STORE: tl.constexpr,
 ):
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -674,7 +718,7 @@ def _addmm_fwd_tma_persistent(
             flatten=False,
             warp_specialize=WARP_SPECIALIZE,
             data_partition_factor=DATA_PARTITION_FACTOR,
-            separate_epilogue_store=True,
+            separate_epilogue_store=SEPARATE_EPILOGUE_STORE,
             smem_alloc_algo=1,
         ):
             _addmm_persistent_tile_body(
@@ -695,6 +739,7 @@ def _addmm_fwd_tma_persistent(
                 NUM_SMS=NUM_SMS,
                 EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
                 INNER_WARP_SPECIALIZE=tl.constexpr(False),
+                TWO_CTAS=TWO_CTAS,
             )
     else:
         # Pure OAI Triton version.
@@ -719,6 +764,7 @@ def _addmm_fwd_tma_persistent(
                 NUM_SMS=NUM_SMS,
                 EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
                 INNER_WARP_SPECIALIZE=WARP_SPECIALIZE,
+                TWO_CTAS=TWO_CTAS,
             )
 
 
