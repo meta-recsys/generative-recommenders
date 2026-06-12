@@ -72,7 +72,7 @@ def _use_meta_ws() -> bool:
         is_sm100_plus()
         and hasattr(triton, "knobs")
         and hasattr(triton.knobs, "nvidia")
-        and triton.knobs.nvidia.use_meta_ws
+        and getattr(triton.knobs.nvidia, "use_meta_ws", False)
     )
 
 
@@ -116,7 +116,6 @@ def _prune_persistent_autows_configs(configs, named_args, **kwargs):  # noqa
         BLOCK_N = c.kwargs.get("BLOCK_N", 0)
         EPILOGUE_SUBTILE = c.kwargs.get("EPILOGUE_SUBTILE", 1)
         DP = c.kwargs.get("DATA_PARTITION_FACTOR", 1)
-        SEPARATE_EPILOGUE_STORE = c.kwargs.get("SEPARATE_EPILOGUE_STORE", False)
         TWO_CTAS = c.kwargs.get("TWO_CTAS", False)
         # Current 2-CTA lowering only supports the standard 128-row MMA tile.
         if TWO_CTAS and BLOCK_M != 128:
@@ -529,6 +528,7 @@ def _addmm_fwd(
     GROUP_M: tl.constexpr,
     ALLOW_TF32: tl.constexpr,
     BROADCAST_Y: tl.constexpr,
+    ADD_IN_BIAS_DTYPE: tl.constexpr,
 ):
     pid_0, pid_1 = tl.program_id(axis=0), tl.program_id(axis=1)
     pid = pid_0 * tl.num_programs(axis=1) + pid_1
@@ -571,7 +571,10 @@ def _addmm_fwd(
         y_ptr += pid_n.to(tl.int64) * BLOCK_N * stride_yn
         y_ptrs = y_ptr + stride_ym * offs_m[:, None] + stride_yn * offs_n[None, :]
         y = tl.load(y_ptrs, mask=z_mask)
-    z = (accumulator + y.to(tl.float32)).to(z_ptr.dtype.element_ty)
+    if ADD_IN_BIAS_DTYPE:
+        z = (accumulator.to(z_ptr.dtype.element_ty) + y).to(z_ptr.dtype.element_ty)
+    else:
+        z = (accumulator + y.to(tl.float32)).to(z_ptr.dtype.element_ty)
     z_ptr += pid_m.to(tl.int64) * BLOCK_M * stride_zm
     z_ptr += pid_n.to(tl.int64) * BLOCK_N * stride_zn
     z_ptrs = z_ptr + stride_zm * offs_m[:, None] + stride_zn * offs_n[None, :]
@@ -629,6 +632,7 @@ def _addmm_persistent_tile_body(
     EPILOGUE_SUBTILE: tl.constexpr,
     INNER_WARP_SPECIALIZE: tl.constexpr,
     TWO_CTAS: tl.constexpr,
+    ADD_IN_BIAS_DTYPE: tl.constexpr,
 ):
     pid_m, pid_n = _compute_pid(tile_id, num_pid_in_group, num_pid_m, GROUP_M, NUM_SMS)
     offs_xm = pid_m * BLOCK_M
@@ -668,7 +672,10 @@ def _addmm_persistent_tile_body(
             y_i = y_desc.load([0, offs_wn + i * slice_size])
         else:
             y_i = y_desc.load([offs_xm, offs_wn + i * slice_size])
-        z_i = (acc_subtiles[i] + y_i.to(tl.float32)).to(z_desc.dtype)
+        if ADD_IN_BIAS_DTYPE:
+            z_i = (acc_subtiles[i].to(z_desc.dtype) + y_i).to(z_desc.dtype)
+        else:
+            z_i = (acc_subtiles[i] + y_i.to(tl.float32)).to(z_desc.dtype)
         z_desc.store([offs_xm, offs_wn + i * slice_size], z_i)
 
 
@@ -699,6 +706,7 @@ def _addmm_fwd_tma_persistent(
     USE_META_WS: tl.constexpr,
     TWO_CTAS: tl.constexpr,
     SEPARATE_EPILOGUE_STORE: tl.constexpr,
+    ADD_IN_BIAS_DTYPE: tl.constexpr,
 ):
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -740,6 +748,7 @@ def _addmm_fwd_tma_persistent(
                 EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
                 INNER_WARP_SPECIALIZE=tl.constexpr(False),
                 TWO_CTAS=TWO_CTAS,
+                ADD_IN_BIAS_DTYPE=ADD_IN_BIAS_DTYPE,
             )
     else:
         # Pure OAI Triton version.
@@ -765,6 +774,7 @@ def _addmm_fwd_tma_persistent(
                 EPILOGUE_SUBTILE=EPILOGUE_SUBTILE,
                 INNER_WARP_SPECIALIZE=WARP_SPECIALIZE,
                 TWO_CTAS=TWO_CTAS,
+                ADD_IN_BIAS_DTYPE=ADD_IN_BIAS_DTYPE,
             )
 
 
@@ -914,7 +924,7 @@ def _addmm_fwd_tma_ws(
     prune_configs_by={"early_config_prune": _prune_configs_for_tlx_persistent_addmm},
 )
 @triton.jit
-def _addmm_fwd_tma_ws_persistent(
+def _addmm_fwd_tma_ws_persistent(  # noqa: C901
     x_desc,
     w_desc,
     y_desc,
@@ -1415,6 +1425,7 @@ def triton_addmm_fwd_tma_persistent(
     w: torch.Tensor,
     y: torch.Tensor,
     warp_specialize: bool | None = None,
+    add_in_bias_dtype: bool = False,
 ) -> torch.Tensor:
     _meta_ws = _use_meta_ws()
     if warp_specialize is None:
@@ -1470,6 +1481,7 @@ def triton_addmm_fwd_tma_persistent(
         WARP_SPECIALIZE=warp_specialize,
         NUM_SMS=NUM_SMS,
         USE_META_WS=_meta_ws,
+        ADD_IN_BIAS_DTYPE=add_in_bias_dtype,
     )
     return z
 
@@ -1637,6 +1649,7 @@ def triton_addmm_fwd(
         z.stride(1),
         ALLOW_TF32=torch.backends.cuda.matmul.allow_tf32,
         BROADCAST_Y=is_y_1d,
+        ADD_IN_BIAS_DTYPE=False,
     )
     return z
 
@@ -1711,7 +1724,7 @@ class _AddMmFunction(torch.autograd.Function):
         ctx.save_for_backward(x, w)
         ctx.is_y_1d = y.dim() == 1
         if is_sm100_plus() and TMA_AVAILABLE and _check_tma_alignment(x, w, y):
-            if x.dtype == torch.float32 or HAS_TLX == False:
+            if x.dtype == torch.float32 or not HAS_TLX:
                 return triton_addmm_fwd_tma_persistent(x, w, y, warp_specialize=True)
             else:
                 return triton_addmm_fwd_tma_ws_persistent_tlx(
