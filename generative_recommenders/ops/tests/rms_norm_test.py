@@ -34,7 +34,7 @@ class LayerNormTest(unittest.TestCase):
         D=st.sampled_from([512]),
         dtype=st.sampled_from(
             [torch.bfloat16]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
             else [torch.float32]
         ),
         silu=st.booleans(),
@@ -61,7 +61,7 @@ class LayerNormTest(unittest.TestCase):
         D=st.integers(min_value=32, max_value=512),
         dtype=st.sampled_from(
             [torch.bfloat16, torch.float32]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
             else [torch.float32]
         ),
         silu=st.booleans(),
@@ -161,7 +161,7 @@ class LayerNormTest(unittest.TestCase):
         D=st.integers(min_value=32, max_value=512),
         dtype=st.sampled_from(
             [torch.bfloat16, torch.float32]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
             else [torch.float32]
         ),
     )

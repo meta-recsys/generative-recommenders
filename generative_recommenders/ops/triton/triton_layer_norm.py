@@ -946,9 +946,8 @@ def _weighted_rms_norm_bwd_dx(
 
 
 @triton_autotune(
-    configs=_get_norm_bwd_configs(),
+    configs=_get_layer_norm_fwd_configs(),
     key=["BLOCK_D", "SILU"],
-    reset_to_zero=["DW"],
 )
 @triton.jit
 def _weighted_rms_norm_bwd(
@@ -967,7 +966,6 @@ def _weighted_rms_norm_bwd(
     SILU: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    SHARDS_PER_SM: tl.constexpr,
 ):
     pid = tl.program_id(0)
     tile_num = tl.num_programs(0)
@@ -1052,14 +1050,15 @@ def _weighted_rms_norm_bwd(
         tl.store(DX_block_ptr, dx.to(DX.dtype.element_ty), boundary_check=(0, 1))
 
         # Accumulate partial sums for dw
-        # Compute dw for all rows, then sum locally before atomic operation
+        # Compute dw for all rows, then sum locally before storing per pid
         partial_dw_block = dy_block * xhat
         # Local reduction: sum across all rows in this block
         partial_dw = tl.sum(partial_dw_block, axis=0)
         acc_dw += partial_dw
 
-    DW_ptr = DW + cols
-    tl.atomic_add(DW_ptr, acc_dw, col_mask)
+    # Store accumulated sums back to global memory per pid for 2-phase reduction
+    dw_ptrs = DW + pid.to(tl.int64) * D + cols
+    tl.store(dw_ptrs, acc_dw, mask=col_mask)
 
 
 @triton_autotune(
@@ -1148,21 +1147,19 @@ class RMSNormFunction(torch.autograd.Function):
         x, weight, rstd = ctx.saved_tensors
         N, D = x.shape
         dx = torch.empty_like(x)
-        dweight = torch.zeros((D,), dtype=weight.dtype, device=x.device)
+        dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
         if N == 0:
             dweight.zero_()
             return dx, dweight, None, None
 
         sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+        tile_num = max(1, min(sms * 8, N // 4, 1024))
+        _dweight = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
 
-        # pyre-ignore[28]
-        grid = lambda meta: (  # noqa E731
-            max(1, min(sms * meta["SHARDS_PER_SM"], N // 4)),
-        )
-        _weighted_rms_norm_bwd[grid](
+        _weighted_rms_norm_bwd[(tile_num,)](
             dx,
             dy,
-            dweight,
+            _dweight,
             x,
             weight,
             rstd,
@@ -1174,6 +1171,20 @@ class RMSNormFunction(torch.autograd.Function):
             N=N,
             SILU=ctx.silu,
             BLOCK_D=ctx.BLOCK_D,
+        )
+
+        def grid(META):
+            return (triton.cdiv(D, META["BLOCK_D"]),)
+
+        blocks = triton.next_power_of_2(sms * 4)
+        BLOCK_D = triton.next_power_of_2(triton.cdiv(D, blocks))
+        BLOCK_D = min(max(BLOCK_D, 4), 128)
+        _rms_norm_bwd_dwdb[grid](
+            _dweight,
+            dweight,
+            tile_num,
+            D,
+            BLOCK_D=BLOCK_D,
         )
 
         return dx, dweight, None, None
