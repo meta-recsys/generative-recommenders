@@ -117,15 +117,14 @@ def _prune_persistent_autows_configs(configs, named_args, **kwargs):  # noqa
         EPILOGUE_SUBTILE = c.kwargs.get("EPILOGUE_SUBTILE", 1)
         DP = c.kwargs.get("DATA_PARTITION_FACTOR", 1)
         TWO_CTAS = c.kwargs.get("TWO_CTAS", False)
-        # Current 2-CTA lowering only supports the standard 128-row MMA tile.
-        if TWO_CTAS and BLOCK_M != 128:
+        # Current 2-CTA lowering only supports 128-row MMA tiles. DP=2 splits
+        # a 256-row output tile into two independent 128-row MMA partitions.
+        if TWO_CTAS and BLOCK_M // DP != 128:
             continue
         # 2-CTA splits W/B across the N dimension. With the current 128-byte
         # swizzle layout, each CTA needs at least 64 fp16 elements along the
         # contiguous dimension, so the unsplit BLOCK_N must be at least 128.
         if TWO_CTAS and BLOCK_N < 128:
-            continue
-        if TWO_CTAS and DP > 1:
             continue
         # DATA_PARTITION_FACTOR=2 is only supported with BLOCK_M=256
         if DP == 2 and BLOCK_M != 256:
