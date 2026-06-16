@@ -710,6 +710,8 @@ def _addmm_fwd_tma_persistent(
 ):
     start_pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
+    if TWO_CTAS:
+        num_pid_m = (num_pid_m + 1) // 2 * 2
     num_pid_n = tl.cdiv(N, BLOCK_N)
     k_tiles = tl.cdiv(K, BLOCK_K)
     num_tiles = num_pid_m * num_pid_n
@@ -1461,12 +1463,16 @@ def triton_addmm_fwd_tma_persistent(
     def grid(meta):
         BLOCK_M = meta["BLOCK_M"]
         BLOCK_N = meta["BLOCK_N"]
-        return (
-            min(
-                NUM_SMS,
-                triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N),
-            ),
-        )
+        num_pid_m = triton.cdiv(M, BLOCK_M)
+        if meta.get("TWO_CTAS", False):
+            num_pid_m = (num_pid_m + 1) // 2 * 2
+        num_tiles = num_pid_m * triton.cdiv(N, BLOCK_N)
+        grid_size = min(NUM_SMS, num_tiles)
+        if meta.get("TWO_CTAS", False) and grid_size % 2 == 1:
+            grid_size = min(grid_size + 1, NUM_SMS)
+            if grid_size % 2 == 1:
+                grid_size -= 1
+        return (grid_size,)
 
     _addmm_fwd_tma_persistent[grid](
         x_desc,
