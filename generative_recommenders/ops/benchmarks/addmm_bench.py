@@ -15,6 +15,8 @@ from generative_recommenders.ops.triton.triton_addmm import (
     triton_addmm_fwd_tma_ws_persistent_tlx,
     triton_addmm_fwd_tma_ws_tlx,
 )
+
+# pyre-fixme[21]: Could not find name `is_sm100` in `generative_recommenders.ops.utils`.
 from generative_recommenders.ops.utils import is_sm100
 
 try:
@@ -84,6 +86,7 @@ def main(
         ("orange", "-"),
         ("purple", "-"),
     ]
+    # pyre-fixme[16]: Module `utils` has no attribute `is_sm100`.
     if is_sm100() and HAS_TLX:  # tmem is only supported on Blackwell
         line_vals.append("triton_tma_ws_tlx")
         line_names.append("Triton TMA WS TLX")

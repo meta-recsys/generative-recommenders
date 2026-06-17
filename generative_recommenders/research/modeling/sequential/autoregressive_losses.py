@@ -387,6 +387,8 @@ class BCELossWithRatings(AutoregressiveLoss):
         self._temperature: float = temperature
         self._model = model
 
+    # pyre-fixme[14]: `jagged_forward` overrides method defined in
+    #  `AutoregressiveLoss` inconsistently.
     def jagged_forward(
         self,
         output_embeddings: torch.Tensor,
@@ -420,6 +422,8 @@ class BCELossWithRatings(AutoregressiveLoss):
         ) * supervision_weights
         return weighted_losses.sum() / supervision_weights.sum()
 
+    # pyre-fixme[14]: `forward` overrides method defined in `AutoregressiveLoss`
+    #  inconsistently.
     def forward(
         self,
         lengths: torch.Tensor,
