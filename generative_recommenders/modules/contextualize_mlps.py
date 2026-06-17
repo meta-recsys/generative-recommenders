@@ -66,6 +66,7 @@ class SimpleContextualizedMLP(ContextualizedMLP):
             LayerNorm(sequential_output_dim),
         ).apply(init_mlp_weights_optional_bias)
 
+    # pyrefly: ignore [bad-param-name-override]
     def forward(
         self,
         seq_embeddings: torch.Tensor,
@@ -118,6 +119,7 @@ class ParameterizedContextualizedMLP(ContextualizedMLP):
             ),
         ).apply(init_mlp_weights_optional_bias)
 
+    # pyrefly: ignore [bad-param-name-override]
     def forward(
         self,
         seq_embeddings: torch.Tensor,

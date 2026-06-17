@@ -209,6 +209,7 @@ def _swiglu_fwd_tma_ws_persistent(
                 # Load gate and up results from TMEM
                 # pyre-ignore[16]
                 gate_tmem = tmem_gate_buffers[cur_tmem_buf]
+                # pyrefly: ignore [bad-index]
                 up_tmem = tmem_up_buffers[cur_tmem_buf]
 
                 if EPILOGUE_SUBTILE > 1:
@@ -276,6 +277,7 @@ def _swiglu_fwd_tma_ws_persistent(
                 tmem_write_phase = (processed_tiles // int(NUM_TMEM_BUFFERS)) & 1
 
                 # Wait for epilogue to finish
+                # pyrefly: ignore [bad-index]
                 tlx.barrier_wait(tmem_empty_bars[cur_tmem_buf], tmem_write_phase ^ 1)
 
                 # Perform K-dimension reduction for both GEMMs
@@ -286,34 +288,44 @@ def _swiglu_fwd_tma_ws_persistent(
                     dot_phase = (total_iters // int(NUM_SMEM_BUFFERS)) & 1
 
                     # Wait for x and w_gate to be loaded, then start GEMM1
+                    # pyrefly: ignore [bad-index]
                     tlx.barrier_wait(smem_full_bars_x_gate[buf], dot_phase)
 
                     # Transpose weight buffer for MMA
+                    # pyrefly: ignore [bad-index]
                     w_gate_trans = tlx.local_trans(w_gate_buffers[buf])
 
                     # GEMM 1: gate = X @ W_gate.T
                     tlx.async_dot(
+                        # pyrefly: ignore [bad-index]
                         x_buffers[buf],
                         w_gate_trans,
+                        # pyrefly: ignore [bad-index]
                         tmem_gate_buffers[cur_tmem_buf],
                         # pyre-ignore[6]
                         use_acc=(k > 0),
+                        # pyrefly: ignore [bad-index]
                         mBarriers=[smem_empty_bars[buf]],
                         out_dtype=tl.float32,
                     )
 
                     # Wait for w_up to be loaded before starting GEMM2
+                    # pyrefly: ignore [bad-index]
                     tlx.barrier_wait(smem_full_bars_up[buf], dot_phase)
 
+                    # pyrefly: ignore [bad-index]
                     w_up_trans = tlx.local_trans(w_up_buffers[buf])
 
                     # GEMM 2: up = X @ W_up.T
                     tlx.async_dot(
+                        # pyrefly: ignore [bad-index]
                         x_buffers[buf],
                         w_up_trans,
+                        # pyrefly: ignore [bad-index]
                         tmem_up_buffers[cur_tmem_buf],
                         # pyre-ignore[6]
                         use_acc=(k > 0),
+                        # pyrefly: ignore [bad-index]
                         mBarriers=[smem_empty_bars[buf]],
                         out_dtype=tl.float32,
                     )
@@ -322,6 +334,7 @@ def _swiglu_fwd_tma_ws_persistent(
                 last_buf = (processed_k_iters + k_tiles - 1) % int(NUM_SMEM_BUFFERS)
                 last_total_iters = processed_k_iters + k_tiles - 1
                 last_dot_phase = (last_total_iters // int(NUM_SMEM_BUFFERS)) & 1
+                # pyrefly: ignore [bad-index]
                 tlx.barrier_wait(smem_empty_bars[last_buf], last_dot_phase)
 
                 # Signal epilogue that results are ready
@@ -357,12 +370,14 @@ def _swiglu_fwd_tma_ws_persistent(
                     load_phase = (total_iters // int(NUM_SMEM_BUFFERS)) & 1
 
                     # Wait for buffer to be free
+                    # pyrefly: ignore [bad-index]
                     tlx.barrier_wait(smem_empty_bars[buf], load_phase ^ 1)
 
                     offs_k = k * BLOCK_K
 
                     # Set expected bytes for x+w_gate barrier
                     tlx.barrier_expect_bytes(
+                        # pyrefly: ignore [bad-index]
                         smem_full_bars_x_gate[buf],
                         # pyre-ignore[6]
                         2 * (BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N),
@@ -370,6 +385,7 @@ def _swiglu_fwd_tma_ws_persistent(
 
                     # Set expected bytes for w_up barrier
                     tlx.barrier_expect_bytes(
+                        # pyrefly: ignore [bad-index]
                         smem_full_bars_up[buf],
                         # pyre-ignore[6]
                         2 * (BLOCK_K * BLOCK_N),
@@ -378,24 +394,30 @@ def _swiglu_fwd_tma_ws_persistent(
                     # Load x and w_gate first, signal smem_full_bars_x_gate
                     tlx.async_descriptor_load(
                         x_desc,
+                        # pyrefly: ignore [bad-index]
                         x_buffers[buf],
                         [offs_m, offs_k],
+                        # pyrefly: ignore [bad-index]
                         smem_full_bars_x_gate[buf],
                     )
 
                     # Weights are in [N, K] layout, load with [offs_n, offs_k]
                     tlx.async_descriptor_load(
                         w_gate_desc,
+                        # pyrefly: ignore [bad-index]
                         w_gate_buffers[buf],
                         [offs_n, offs_k],
+                        # pyrefly: ignore [bad-index]
                         smem_full_bars_x_gate[buf],
                     )
 
                     # Load w_up separately, signal smem_full_bars_up
                     tlx.async_descriptor_load(
                         w_up_desc,
+                        # pyrefly: ignore [bad-index]
                         w_up_buffers[buf],
                         [offs_n, offs_k],
+                        # pyrefly: ignore [bad-index]
                         smem_full_bars_up[buf],
                     )
 

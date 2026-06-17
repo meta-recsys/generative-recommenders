@@ -178,11 +178,13 @@ class MoLGatingFn(torch.nn.Module):
 
         if self._combination_type == "glu_silu":
             gating_inputs = (
+                # pyrefly: ignore [unsupported-operation]
                 query_partial_inputs * item_partial_inputs + qi_partial_inputs
             )
             gating_weights = gating_inputs * F.sigmoid(gating_inputs)
         elif self._combination_type == "glu_silu_ln":
             gating_inputs = (
+                # pyrefly: ignore [unsupported-operation]
                 query_partial_inputs * item_partial_inputs + qi_partial_inputs
             )
             gating_weights = gating_inputs * F.sigmoid(
@@ -252,6 +254,7 @@ class MoLSimilarity(SimilarityModule):
         )
         self._query_embeddings_fn: MoLEmbeddingsFn = query_embeddings_fn
         self._item_embeddings_fn: MoLEmbeddingsFn = (  # pyre-ignore [8]
+            # pyrefly: ignore [bad-assignment]
             item_embeddings_fn
         )
         self._apply_query_embeddings_fn: bool = apply_query_embeddings_fn

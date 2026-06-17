@@ -46,6 +46,7 @@ def json_loads(
         y = json.loads(x)
     else:
         y = x
+    # pyrefly: ignore [no-matching-overload]
     y_list = [y] if type(y) == int else list(y)
     return y_list
 
@@ -73,6 +74,7 @@ def separate_uih_candidates(
         y = json.loads(x)
     else:
         y = x
+    # pyrefly: ignore [no-matching-overload]
     y_list = [y] if type(y) == int else list(y)
     candidates, uih = (
         y_list[-candidates_max_seq_len:],

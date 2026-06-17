@@ -375,8 +375,10 @@ class AmazonDataProcessor(DataProcessor):
 
         # categorize user id and item id
         ratings["item_id"] = pd.Categorical(ratings["item_id"])
+        # pyrefly: ignore [missing-attribute]
         ratings["item_id"] = ratings["item_id"].cat.codes
         ratings["user_id"] = pd.Categorical(ratings["user_id"])
+        # pyrefly: ignore [missing-attribute]
         ratings["user_id"] = ratings["user_id"].cat.codes
         print(
             f"{self._prefix} #user after filter: {len(set(ratings['user_id'].values))}"

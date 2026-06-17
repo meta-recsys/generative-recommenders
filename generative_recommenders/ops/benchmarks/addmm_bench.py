@@ -15,6 +15,8 @@ from generative_recommenders.ops.triton.triton_addmm import (
     triton_addmm_fwd_tma_ws_persistent_tlx,
     triton_addmm_fwd_tma_ws_tlx,
 )
+
+# pyrefly: ignore [missing-module-attribute]
 from generative_recommenders.ops.utils import is_sm100
 
 try:

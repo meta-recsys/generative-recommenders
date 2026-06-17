@@ -327,24 +327,40 @@ def train_fn(
                     device=device,
                     float_dtype=torch.bfloat16 if main_module_bf16 else None,
                 )
+                # pyrefly: ignore [bad-specialization]
                 eval_dict = eval_metrics_v2_from_tensors(
                     eval_state,
+                    # pyrefly: ignore [bad-argument-count]
                     model.module,
                     seq_features,
+                    # pyrefly: ignore [unexpected-keyword]
                     target_ids=target_ids,
+                    # pyrefly: ignore [unexpected-keyword]
                     target_ratings=target_ratings,
+                    # pyrefly: ignore [unexpected-keyword]
                     user_max_batch_size=eval_user_max_batch_size,
+                    # pyrefly: ignore [unexpected-keyword]
                     dtype=torch.bfloat16 if main_module_bf16 else None,
                 )
                 add_to_summary_writer(
-                    writer, batch_id, eval_dict, prefix="eval", world_size=world_size
+                    # pyrefly: ignore [bad-argument-type]
+                    writer,
+                    batch_id,
+                    # pyrefly: ignore [bad-argument-type]
+                    eval_dict,
+                    prefix="eval",
+                    world_size=world_size,
                 )
                 logging.info(
                     f"rank {rank}:  batch-stat (eval): iter {batch_id} (epoch {epoch}): "
+                    # pyrefly: ignore [bad-index]
                     + f"NDCG@10 {_avg(eval_dict['ndcg@10'], world_size):.4f}, "
+                    # pyrefly: ignore [bad-index]
                     f"HR@10 {_avg(eval_dict['hr@10'], world_size):.4f}, "
+                    # pyrefly: ignore [bad-index]
                     f"HR@50 {_avg(eval_dict['hr@50'], world_size):.4f}, "
-                    + f"MRR {_avg(eval_dict['mrr'], world_size):.4f} "
+                    # pyrefly: ignore [bad-index]
+                     + f"MRR {_avg(eval_dict['mrr'], world_size):.4f} "
                 )
                 model.train()
 
@@ -449,21 +465,29 @@ def train_fn(
             seq_features, target_ids, target_ratings = movielens_seq_features_from_row(
                 row, device=device, max_output_length=gr_output_length + 1
             )
+            # pyrefly: ignore [bad-specialization]
             eval_dict = eval_metrics_v2_from_tensors(
                 eval_state,
+                # pyrefly: ignore [bad-argument-count]
                 model.module,
                 seq_features,
+                # pyrefly: ignore [unexpected-keyword]
                 target_ids=target_ids,
+                # pyrefly: ignore [unexpected-keyword]
                 target_ratings=target_ratings,
+                # pyrefly: ignore [unexpected-keyword]
                 user_max_batch_size=eval_user_max_batch_size,
+                # pyrefly: ignore [unexpected-keyword]
                 dtype=torch.bfloat16 if main_module_bf16 else None,
             )
 
             if eval_dict_all is None:
                 eval_dict_all = {}
+                # pyrefly: ignore [missing-attribute]
                 for k, v in eval_dict.items():
                     eval_dict_all[k] = []
 
+            # pyrefly: ignore [missing-attribute]
             for k, v in eval_dict.items():
                 eval_dict_all[k] = eval_dict_all[k] + [v]
             del eval_dict
@@ -476,17 +500,24 @@ def train_fn(
 
         assert eval_dict_all is not None
         for k, v in eval_dict_all.items():
+            # pyrefly: ignore [unsupported-operation]
             eval_dict_all[k] = torch.cat(v, dim=-1)
 
+        # pyrefly: ignore [bad-argument-type]
         ndcg_10 = _avg(eval_dict_all["ndcg@10"], world_size=world_size)
+        # pyrefly: ignore [bad-argument-type]
         ndcg_50 = _avg(eval_dict_all["ndcg@50"], world_size=world_size)
+        # pyrefly: ignore [bad-argument-type]
         hr_10 = _avg(eval_dict_all["hr@10"], world_size=world_size)
+        # pyrefly: ignore [bad-argument-type]
         hr_50 = _avg(eval_dict_all["hr@50"], world_size=world_size)
+        # pyrefly: ignore [bad-argument-type]
         mrr = _avg(eval_dict_all["mrr"], world_size=world_size)
 
         add_to_summary_writer(
             writer,
             batch_id=epoch,
+            # pyrefly: ignore [bad-argument-type]
             metrics=eval_dict_all,
             prefix="eval_epoch",
             world_size=world_size,
@@ -495,6 +526,7 @@ def train_fn(
             add_to_summary_writer(
                 writer,
                 batch_id=epoch,
+                # pyrefly: ignore [bad-argument-type]
                 metrics=eval_dict_all,
                 prefix="eval_epoch_full",
                 world_size=world_size,

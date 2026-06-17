@@ -124,7 +124,9 @@ class LayerNormTest(unittest.TestCase):
             return
         # pyre-ignore[16]
         ref_dx, x.grad = x.grad.detach().clone(), None
+        # pyrefly: ignore [missing-attribute]
         ref_dw, weight.grad = weight.grad.detach().clone(), None
+        # pyrefly: ignore [missing-attribute]
         ref_db, bias.grad = bias.grad.detach().clone(), None
         # opt
         x = x.detach().clone().requires_grad_()
@@ -133,8 +135,11 @@ class LayerNormTest(unittest.TestCase):
         opt_out = layer_norm_func(x, weight, bias, eps=1e-6, kernel=real_kernel)
         dout = dout.detach().clone()
         opt_out.backward(dout)
+        # pyrefly: ignore [missing-attribute]
         opt_dx, x.grad = x.grad.detach().clone(), None
+        # pyrefly: ignore [missing-attribute]
         opt_dw, weight.grad = weight.grad.detach().clone(), None
+        # pyrefly: ignore [missing-attribute]
         opt_db, bias.grad = bias.grad.detach().clone(), None
         torch.testing.assert_close(ref_out, opt_out)
         torch.testing.assert_close(ref_dx, opt_dx)
@@ -206,15 +211,20 @@ class LayerNormTest(unittest.TestCase):
             return
         # pyre-ignore[16]
         ref_dx, x.grad = x.grad.detach().clone(), None
+        # pyrefly: ignore [missing-attribute]
         ref_dw = ref_layer.weight.grad.detach().clone()
+        # pyrefly: ignore [missing-attribute]
         ref_db = ref_layer.bias.grad.detach().clone()
         # opt
         x = x.detach().clone().requires_grad_()
         opt_out = opt_layer(x)
         dout = dout.detach().clone()
         opt_out.backward(dout)
+        # pyrefly: ignore [missing-attribute]
         opt_dx, x.grad = x.grad.detach().clone(), None
+        # pyrefly: ignore [missing-attribute]
         opt_dw = opt_layer.weight.grad.detach().clone()
+        # pyrefly: ignore [missing-attribute]
         opt_db = opt_layer.bias.grad.detach().clone()
         torch.testing.assert_close(ref_out, opt_out)
         torch.testing.assert_close(

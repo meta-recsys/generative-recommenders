@@ -119,6 +119,7 @@ class DLRMv3MovieLensDataset(DLRMv3RandomDataset):
         uih_kjt_lengths: List[torch.Tensor] = []
         for name, length in self._contextual_feature_to_max_length.items():
             uih_kjt_values.append(data[name])
+            # pyrefly: ignore [bad-argument-type]
             uih_kjt_lengths.append(length)
 
         uih_seq_len = len(movie_history_uih)
@@ -127,6 +128,7 @@ class DLRMv3MovieLensDataset(DLRMv3RandomDataset):
             self.action_weights[int(rating) - 1] for rating in movie_history_ratings_uih
         ]
         uih_kjt_values.extend(
+            # pyrefly: ignore [bad-argument-type]
             movie_history_uih
             + movie_history_ratings_uih
             + movie_timestamps_uih
@@ -134,6 +136,7 @@ class DLRMv3MovieLensDataset(DLRMv3RandomDataset):
             + movie_dummy_watch_times_uih
         )
         uih_kjt_lengths.extend(
+            # pyrefly: ignore [bad-argument-type]
             [
                 uih_seq_len
                 for _ in range(
@@ -145,7 +148,9 @@ class DLRMv3MovieLensDataset(DLRMv3RandomDataset):
         dummy_query_time = (
             0 if movie_timestamps_uih == [] else max(movie_timestamps_uih)
         )
+        # pyrefly: ignore [bad-argument-type]
         uih_kjt_values.append(dummy_query_time)
+        # pyrefly: ignore [bad-argument-type]
         uih_kjt_lengths.append(1)
         uih_features_kjt = KeyedJaggedTensor(
             keys=self._uih_keys + ["dummy_query_time"],

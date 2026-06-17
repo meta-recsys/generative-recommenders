@@ -181,6 +181,7 @@ class Runner:
         except Exception as ex:  # pylint: disable=broad-except
             logger.error("thread: failed, %s", ex)
         finally:
+            # pyrefly: ignore [unbound-name]
             candidate_size = mt_target_preds.size(1) // len(qitem.query_ids)
             if not self.compute_eval:
                 for i, query_id in enumerate(qitem.query_ids):
@@ -325,6 +326,7 @@ def add_results(
     final_results["qps"] = total_batches / final_results["took"]
     final_results["count"] = total_batches
 
+    # pyrefly: ignore [bad-assignment]
     for i, timing in enumerate(result_timing):
         logger.warning(f"timing of {i}: {timing}")
 
@@ -609,6 +611,7 @@ def run(
     if scenario_name not in SCENARIO_MAP:
         raise NotImplementedError("valid scanarios:" + str(list(SCENARIO_MAP.keys())))
     scenario = SCENARIO_MAP[scenario_name]
+    # pyrefly: ignore [bad-argument-type]
     np.random.seed(numpy_rand_seed)
     random.seed(numpy_rand_seed)
 
@@ -716,6 +719,7 @@ def run(
     if scenario == lg.TestScenario.Server:
         # inference benchmark warmup
         if is_streaming:
+            # pyrefly: ignore [missing-attribute]
             ds.init_sut()
             warmup_count: int = sum(
                 ds.get_num_unique_requests(  # pyre-ignore [16]
@@ -748,6 +752,7 @@ def run(
 
     # official run
     if is_streaming:
+        # pyrefly: ignore [missing-attribute]
         ds.init_sut()
     final_results = {
         "runtime": model_family.name(),
@@ -778,6 +783,7 @@ def run(
         )
         lg.StartTest(sut, qsl, settings)
         runner.finish()
+        # pyrefly: ignore [bad-typed-dict-key]
         final_results["took"] = time.time() - ds.last_loaded
         lg.DestroyQSL(qsl)
         lg.DestroySUT(sut)

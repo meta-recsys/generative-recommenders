@@ -56,6 +56,7 @@ class DatasetV2(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return len(self.ratings_frame)
 
+    # pyrefly: ignore [bad-param-name-override]
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         if idx in self._cache.keys():
             return self._cache[idx]
@@ -187,6 +188,7 @@ class DatasetV2(torch.utils.data.Dataset):
             "target_ratings": target_ratings,
             "target_timestamps": target_timestamps,
         }
+        # pyrefly: ignore [bad-return]
         return ret
 
 
@@ -233,6 +235,7 @@ class MultiFileDatasetV2(DatasetV2, torch.utils.data.Dataset):
             }
         )
 
+    # pyrefly: ignore [bad-param-name-override]
     def __getitem__(self, idx) -> Dict[str, torch.Tensor]:
         assert idx < self.users_cumsum[-1]
         file_idx: int = 0

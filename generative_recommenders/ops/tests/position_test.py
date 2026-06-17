@@ -187,10 +187,12 @@ class PositionEmbeddingsTest(unittest.TestCase):
         # pyre-ignore
         ref_d_seq_embeddings, seq_embeddings.grad = seq_embeddings.grad.clone(), None
         ref_d_position_embeddings_weight, position_embeddings_weight.grad = (
+            # pyrefly: ignore [missing-attribute]
             position_embeddings_weight.grad.clone(),
             None,
         )
         ref_d_timestamp_embeddings_weight, timestamp_embeddings_weight.grad = (
+            # pyrefly: ignore [missing-attribute]
             timestamp_embeddings_weight.grad.clone(),
             None,
         )
@@ -214,9 +216,12 @@ class PositionEmbeddingsTest(unittest.TestCase):
         torch.testing.assert_close(ref_out, real_out)
         if test_backward:
             real_out.backward(dout)
+            # pyrefly: ignore [missing-attribute]
             real_d_seq_embeddings = seq_embeddings.grad.clone()
+            # pyrefly: ignore [missing-attribute]
             real_d_position_embeddings_weight = position_embeddings_weight.grad.clone()
             real_d_timestamp_embeddings_weight = (
+                # pyrefly: ignore [missing-attribute]
                 timestamp_embeddings_weight.grad.clone()
             )
             torch.testing.assert_close(ref_d_seq_embeddings, real_d_seq_embeddings)

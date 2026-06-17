@@ -88,7 +88,10 @@ class ActionEncoder(HammerModule):
                 )
         exploded_actions = (
             torch.bitwise_and(
-                seq_actions.unsqueeze(-1), self._combined_action_weights.unsqueeze(0)
+                # pyrefly: ignore [not-callable]
+                seq_actions.unsqueeze(-1),
+                # pyrefly: ignore [not-callable]
+                self._combined_action_weights.unsqueeze(0),
             )
             > 0
         )
