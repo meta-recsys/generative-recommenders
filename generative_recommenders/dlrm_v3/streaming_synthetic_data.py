@@ -84,6 +84,7 @@ class StreamingSyntheticDataGenerator:
         self.total_cnt = 0
         self.rank = rank
         logger.warning(f"rank {self.rank}: start generating item rating")
+        # pyrefly: ignore [bad-argument-type]
         np.random.seed(1001)
         self.item_rating = np.random.choice(  # pyre-ignore [4]
             [5.0, 4.0, 3.0, 2.0, 1.0], size=num_items, p=[0.2, 0.25, 0.25, 0.2, 0.1]
@@ -408,6 +409,7 @@ class StreamingSyntheticDataGenerator:
         num_users_per_file = self.num_users // num_files
         user_id: int = num_users_per_file * file_idx
         random.seed(seed + file_idx)
+        # pyrefly: ignore [bad-argument-type]
         np.random.seed(seed + file_idx)
         # Buffer timestamp data in memory to avoid excessive file I/O
         ts_buffers: Dict[int, List[int]] = {}

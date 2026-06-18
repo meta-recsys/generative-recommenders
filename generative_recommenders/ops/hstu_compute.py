@@ -180,6 +180,7 @@ def hstu_compute_output(
                 linear_dim=linear_dim,
             )
         else:
+            # pyrefly: ignore [not-callable]
             y = triton_cc_layer_norm_mul_dropout_wrapper(
                 x=attn,
                 u=u,

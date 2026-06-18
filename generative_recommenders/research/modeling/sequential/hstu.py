@@ -336,6 +336,7 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
             raise ValueError(f"Unknown self._linear_config {self._linear_config}")
 
         if delta_x_offsets is not None:
+            # pyrefly: ignore [unbound-name]
             v = cached_v.index_copy_(dim=0, index=delta_x_offsets[0], source=v)
 
         B: int = x_offsets.size(0) - 1
@@ -433,6 +434,7 @@ class SequentialTransductionUnitJagged(torch.nn.Module):
         )
 
         if delta_x_offsets is not None:
+            # pyrefly: ignore [unbound-name]
             new_outputs = cached_outputs.index_copy_(
                 dim=0, index=delta_x_offsets[0], source=new_outputs
             )

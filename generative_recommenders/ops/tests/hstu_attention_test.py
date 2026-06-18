@@ -124,7 +124,9 @@ def test_attn(
 
     # pyre-ignore
     ref_dv, v.grad = v.grad.clone(), None
+    # pyrefly: ignore [missing-attribute]
     ref_dk, k.grad = k.grad.clone(), None
+    # pyrefly: ignore [missing-attribute]
     ref_dq, q.grad = q.grad.clone(), None
 
     # triton implementation
@@ -156,6 +158,7 @@ def test_attn(
     )
     if test_backward:
         real_out.backward(dout)
+        # pyrefly: ignore [missing-attribute]
         real_dq, real_dk, real_dv = q.grad.clone(), k.grad.clone(), v.grad.clone()
         torch.testing.assert_close(ref_dv, real_dv, atol=atol, rtol=rtol)
         torch.testing.assert_close(ref_dk, real_dk, atol=atol, rtol=rtol)
