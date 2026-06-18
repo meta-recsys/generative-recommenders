@@ -102,6 +102,7 @@ class InputsBundle(torch.nn.Module):
     def forward(
         self,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # pyrefly: ignore [bad-return]
         return (
             self.uih_lengths,
             self.uih_values,

@@ -686,7 +686,9 @@ def _triton_weighted_layer_norm_bwd_impl(
             x.stride(0),
             D,
             eps,
+            # pyrefly: ignore [bad-argument-type]
             BLOCK_D=BLOCK_D,
+            # pyrefly: ignore [unexpected-keyword]
             num_warps=num_warps,
         )
         return dx, dweight, dbias

@@ -100,6 +100,7 @@ class CategoricalEmbeddingModule(EmbeddingModule):
                 print(f"Skipping initializing params {name} - not configured")
 
     def get_item_embeddings(self, item_ids: torch.Tensor) -> torch.Tensor:
+        # pyrefly: ignore [bad-index]
         item_ids = self._item_id_to_category_id[(item_ids - 1).clamp(min=0)] + 1
         return self._item_emb(item_ids)
 

@@ -177,6 +177,7 @@ class Dataset:
             Collated Samples object containing the batch.
         """
         list_samples = [self.get_sample(ix) for ix in id_list]
+        # pyrefly: ignore [bad-argument-type]
         return collate_fn(list_samples)
 
 
@@ -258,6 +259,7 @@ def get_random_data(
         + [uih_seq_len for _ in uih_seq_feature_keys]
     )
     # logging.info(f"uih_lengths: {uih_lengths}")
+    # pyrefly: ignore [no-matching-overload]
     uih_values = torch.randint(
         1,
         value_bound,
@@ -275,6 +277,7 @@ def get_random_data(
         (1,),
     ).item()
     candidates_lengths = num_candidates * torch.ones(len(hstu_candidates_keys))
+    # pyrefly: ignore [no-matching-overload]
     candidates_values = torch.randint(
         1,
         value_bound,

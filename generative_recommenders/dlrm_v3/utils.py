@@ -316,6 +316,7 @@ class MetricsLogger:
         logger.info(
             f"{mode} - Step {self.global_step[mode]} metrics: {all_computed_metrics}"
         )
+        # pyrefly: ignore [bad-return]
         return all_computed_metrics
 
     def compute_and_log(

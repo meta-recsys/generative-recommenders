@@ -134,7 +134,9 @@ class MMlTest(unittest.TestCase):
         ref_z.backward(dz)
         # pyre-ignore[16]
         ref_dx, x.grad = x.grad.detach().clone(), None
+        # pyrefly: ignore [missing-attribute]
         ref_dw, w.grad = w.grad.detach().clone(), None
+        # pyrefly: ignore [missing-attribute]
         ref_dy, y.grad = y.grad.detach().clone(), None
 
         x = x.detach().clone().requires_grad_(True)
@@ -147,8 +149,11 @@ class MMlTest(unittest.TestCase):
         # triton cc doesn't support backward
         if kernel_type != HammerKernel.TRITON_CC:
             real_z.backward(dz)
+            # pyrefly: ignore [missing-attribute]
             real_dx, x.grad = x.grad.detach().clone(), None
+            # pyrefly: ignore [missing-attribute]
             real_dw, w.grad = w.grad.detach().clone(), None
+            # pyrefly: ignore [missing-attribute]
             real_dy, y.grad = y.grad.detach().clone(), None
 
             torch.testing.assert_close(ref_dx, real_dx, atol=atol, rtol=rtol)
