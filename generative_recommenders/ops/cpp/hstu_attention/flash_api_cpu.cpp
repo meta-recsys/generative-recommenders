@@ -168,7 +168,7 @@ TORCH_LIBRARY_FRAGMENT(hstu, m) {
 
   m.def(
       "hstu_mha_bwd("
-      "int max_seq_len, "
+      "SymInt max_seq_len, "
       "float alpha, "
       "Tensor dout, "
       "Tensor q, "
@@ -251,6 +251,10 @@ TORCH_LIBRARY_FRAGMENT(hstu, m) {
       "hstu_mha_bwd",
       torch::dispatch(
           c10::DispatchKey::CPU, TORCH_FN(hstu::hstu_mha_bwd_dummy)));
+  m.impl(
+      "hstu_mha_bwd",
+      torch::dispatch(
+          c10::DispatchKey::Meta, TORCH_FN(hstu::hstu_mha_bwd_dummy)));
 }
 
 } // namespace hstu

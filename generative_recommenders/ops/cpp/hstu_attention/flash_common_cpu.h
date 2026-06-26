@@ -53,7 +53,7 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd_dummy(
     int64_t num_groups = 1);
 
 std::vector<at::Tensor> hstu_mha_bwd_dummy(
-    int64_t max_seq_len,
+    const at::SymInt max_seq_len,
     double alpha,
     at::Tensor& dout,
     at::Tensor& q,
