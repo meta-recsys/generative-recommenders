@@ -32,6 +32,7 @@ from generative_recommenders.common import (
 )
 from generative_recommenders.ops.triton.triton_addmm import maybe_triton_addmm_fwd
 from generative_recommenders.ops.utils import maybe_register_custom_op
+from torch.fx.experimental.symbolic_shapes import guard_or_false
 
 
 def _get_layer_norm_mul_dropout_fwd_multirow_configs() -> List[triton.Config]:
@@ -1054,7 +1055,7 @@ def _triton_layer_norm_mul_dropout_fwd_impl(
         y = torch.empty_like(x)
     mean = torch.empty((N,), dtype=torch.float32, device=x.device)
     rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
-    if N == 0:
+    if guard_or_false(N == 0):
         return y, mean, rstd, torch.empty(0, dtype=x.dtype, device=x.device)
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()
@@ -1225,7 +1226,7 @@ def triton_layer_norm_mul_dropout_fwd(
     assert weight.numel() == D
     assert bias.numel() == D
 
-    if N == 0:
+    if guard_or_false(N == 0):
         D = x.shape[1]
         if concat_u and concat_x:
             y = torch.empty((0, 3 * D), dtype=x.dtype, device=x.device)
@@ -1320,7 +1321,7 @@ def _triton_layer_norm_mul_dropout_bwd_impl(
     else:
         y = torch.empty(0, dtype=x.dtype, device=x.device)
 
-    if N == 0:
+    if guard_or_false(N == 0):
         return (
             torch.zeros_like(x),
             torch.zeros_like(u),
@@ -1940,7 +1941,7 @@ def triton_group_norm_mul_dropout_fwd(
         y = torch.empty((N, num_heads * linear_dim), dtype=x.dtype, device=x.device)
     mean = torch.empty((N * num_heads,), dtype=torch.float32, device=x.device)
     rstd = torch.empty((N * num_heads,), dtype=torch.float32, device=x.device)
-    if N == 0:
+    if guard_or_false(N == 0):
         return y, mean, rstd, 0, 0, 0, 0
     # Less than 64KB per feature: enqueue fused kernel
     MAX_FUSED_SIZE = 65536 // x.element_size()
@@ -2020,7 +2021,7 @@ def triton_group_norm_mul_dropout_bwd(
             )
         else:
             y = torch.empty((N, num_heads * linear_dim), dtype=x.dtype, device=x.device)
-    if N == 0:
+    if guard_or_false(N == 0):
         return (
             torch.zeros_like(x),
             torch.zeros_like(u),
@@ -2840,7 +2841,7 @@ def helion_layer_norm_mul_dropout_bwd(
             y = torch.empty((N, 3 * D), dtype=x.dtype, device=x.device)
         else:
             y = torch.empty_like(x)
-    if N == 0:
+    if guard_or_false(N == 0):
         return (
             torch.zeros_like(x),
             torch.zeros_like(u),
