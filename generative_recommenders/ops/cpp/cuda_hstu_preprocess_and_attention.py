@@ -18,6 +18,7 @@
 
 from typing import Optional, Tuple
 
+import generative_recommenders.ops.cpp.cuda_hstu_attention as _cuda_hstu_attn_mod
 import torch
 from generative_recommenders.ops.triton.triton_addmm import (
     maybe_triton_addmm_fwd,
@@ -231,7 +232,12 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         k = k.view(-1, num_heads, attn_dim)
         v = v.view(-1, num_heads, hidden_dim)
         if is_sm100_plus():
-            out, softmax_lse = torch.ops.bw_hstu.bw_hstu_mha_fwd(
+            _bw_hstu_fwd_op = (
+                torch.ops.bw_hstu_gwatch.bw_hstu_mha_fwd
+                if _cuda_hstu_attn_mod._use_gwatch_hstu
+                else torch.ops.bw_hstu.bw_hstu_mha_fwd
+            )
+            out, softmax_lse = _bw_hstu_fwd_op(
                 max_seq_len,
                 alpha,
                 q,
@@ -620,7 +626,12 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         dv = dv.view(-1, ctx.num_heads, ctx.hidden_dim)
         # Note: the two operations below update duvqk in place
         if is_sm100_plus():
-            _dq, _dk, _dv = torch.ops.bw_hstu.bw_hstu_mha_bwd(
+            _bw_hstu_bwd_op = (
+                torch.ops.bw_hstu_gwatch.bw_hstu_mha_bwd
+                if _cuda_hstu_attn_mod._use_gwatch_hstu
+                else torch.ops.bw_hstu.bw_hstu_mha_bwd
+            )
+            _dq, _dk, _dv = _bw_hstu_bwd_op(
                 ctx.max_seq_len,
                 ctx.alpha,
                 dout,
