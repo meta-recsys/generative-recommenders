@@ -48,6 +48,35 @@ from generative_recommenders.ops.triton.triton_hstu_preprocess_and_attention imp
 )
 from torch.fx._symbolic_trace import is_fx_tracing
 
+try:
+    # @manual=//generative_recommenders/ops/triton_aot:triton_group_norm_mul_dropout
+    from generative_recommenders.ops.triton_aot.triton_group_norm_mul_dropout import (  # pyre-ignore[21]
+        aot_triton_kernel_wrapper_group_norm_mul_dropout,
+    )
+
+    # @manual=//generative_recommenders/ops/triton_aot:triton_layer_norm_mul_dropout
+    from generative_recommenders.ops.triton_aot.triton_layer_norm_mul_dropout import (  # pyre-ignore[21]
+        aot_triton_kernel_wrapper_layer_norm_mul_dropout,
+    )
+except ImportError:
+
+    def aot_triton_kernel_wrapper_group_norm_mul_dropout(
+        *args: object,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        raise ImportError(
+            "AOT-T is required for the TRITON_INFERENCE group_norm_mul_dropout kernel."
+        )
+
+    def aot_triton_kernel_wrapper_layer_norm_mul_dropout(
+        *args: object,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        raise ImportError(
+            "AOT-T is required for the TRITON_INFERENCE layer_norm_mul_dropout kernel."
+        )
+
+
 torch.fx.wrap("triton_hstu_compute_output")
 
 
@@ -161,6 +190,33 @@ def hstu_compute_output(
             seed=None,
             recompute_y_in_backward=recompute_y_in_backward,
         )
+    elif kernel == HammerKernel.TRITON_INFERENCE:
+        if group_norm:
+            y = aot_triton_kernel_wrapper_group_norm_mul_dropout(
+                x=attn,
+                u=u,
+                weight=norm_weight,
+                bias=norm_bias,
+                eps=norm_eps,
+                silu_u=mul_u_activation_type == "silu",
+                concat_ux=concat_u and concat_x,
+                num_heads=num_heads,
+                linear_dim=linear_dim,
+            )
+        else:
+            y = aot_triton_kernel_wrapper_layer_norm_mul_dropout(
+                x=attn,
+                u=u,
+                weight=norm_weight,
+                bias=norm_bias,
+                eps=norm_eps,
+                dropout_ratio=dropout_ratio,
+                training=training,
+                silu_u=mul_u_activation_type == "silu",
+                concat_ux=concat_u and concat_x,
+                mul_u_activation_type=mul_u_activation_type,
+            )
+        return addmm(x, y, output_weight, kernel)
     elif kernel == HammerKernel.TRITON_CC:
         if triton_cc_group_norm_mul_dropout_wrapper is None or triton_cc_addmm is None:
             raise ImportError(
