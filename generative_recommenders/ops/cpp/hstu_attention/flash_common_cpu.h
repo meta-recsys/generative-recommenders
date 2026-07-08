@@ -82,7 +82,8 @@ std::vector<at::Tensor> hstu_mha_bwd_dummy(
     const std::optional<at::Tensor>& max_attn_len_tensor = std::nullopt,
     const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
         std::nullopt,
-    int64_t num_groups = 1);
+    int64_t num_groups = 1,
+    bool use_bf16_dq_accum = false);
 
 std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd_meta(
     const at::SymInt max_seq_len,

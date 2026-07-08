@@ -40,7 +40,8 @@ template <
     class ArchTag_,
     bool Clear_dQaccum,
     bool Jagged,
-    bool Softmax>
+    bool Softmax,
+    bool Use_bf16_dQaccum = false>
 class FlashAttnBwdPreprocess {
  public:
   // Type Aliases
@@ -85,17 +86,26 @@ class FlashAttnBwdPreprocess {
       Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{})); // Val layout, 8 or 16 vals
                                                      // per load
 
+  // dQ accumulator dtype: must match the mainloop. For kHeadDim < 256 the
+  // accumulator is the (bf16/fp16) output dtype (TMA bulk-reduce-add path); for
+  // kHeadDim == 256 it stays fp32 (atomicAdd path).
+  using ElementdQaccum = std::conditional_t<
+      (kHeadDim < 256) && (ArchTag::kMinComputeCapability >= 90) &&
+          Use_bf16_dQaccum,
+      Element,
+      ElementAccum>;
+
   static constexpr int kGmemElemsPerLoadAccum =
-      sizeof(cute::uint128_t) / sizeof(ElementAccum);
+      sizeof(cute::uint128_t) / sizeof(ElementdQaccum);
   static_assert(
       (kBlockM * kHeadDim / kGmemElemsPerLoadAccum) % MaxThreadsPerBlock == 0,
       "MaxThreadsPerBlock must divide kBlockM * kHeadDim / kGmemElemsPerLoadAccum");
   using GmemLayoutAtomAccum = Layout<Shape<Int<MaxThreadsPerBlock>>>;
   using GmemTiledCopyAccum = decltype(make_tiled_copy(
-      Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
+      Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementdQaccum>{},
       GmemLayoutAtomAccum{},
-      Layout<Shape<Int<kGmemElemsPerLoadAccum>>>{})); // Val layout, 4 vals per
-                                                      // store
+      Layout<Shape<Int<kGmemElemsPerLoadAccum>>>{})); // Val layout, 4/8 vals
+                                                      // per store
 
   using ShapeO =
       cute::Shape<int32_t, int32_t, int32_t, int32_t>; // (seqlen_q, d, head,
@@ -122,7 +132,7 @@ class FlashAttnBwdPreprocess {
     StridedPsum const stride_LSE;
     float* ptr_LSE_log2;
     StridedPsum const stride_LSE_log2;
-    ElementAccum* ptr_dQaccum;
+    ElementdQaccum* ptr_dQaccum;
     ShapedQaccum const shape_dQaccum;
     StridedQaccum const stride_dQaccum;
     int num_batch; // We need this to know the size of dq_semaphore in case of
@@ -148,7 +158,7 @@ class FlashAttnBwdPreprocess {
     StridedPsum const stride_LSE;
     float* ptr_LSE_log2;
     StridedPsum const stride_LSE_log2;
-    ElementAccum* ptr_dQaccum;
+    ElementdQaccum* ptr_dQaccum;
     ShapedQaccum const shape_dQaccum;
     StridedQaccum const stride_dQaccum;
     int num_batch;
@@ -332,7 +342,7 @@ class FlashAttnBwdPreprocess {
       cute::copy(
           Copy_Atom<
               AutoVectorizingCopyWithAssumedAlignment<128>,
-              ElementAccum>{},
+              ElementdQaccum>{},
           zero,
           tdQgdQaccum);
     }

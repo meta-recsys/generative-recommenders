@@ -52,7 +52,8 @@ at::Tensor hstu_mha_cpu(
     const std::optional<at::Tensor>& max_attn_len_tensor = std::nullopt,
     const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
         std::nullopt,
-    int64_t num_groups = 1) {
+    int64_t num_groups = 1,
+    [[maybe_unused]] bool use_bf16_dq_accum = false) {
   auto fwd_out = hstu::hstu_mha_fwd_dummy(
       max_seq_len,
       alpha,
@@ -105,7 +106,8 @@ at::Tensor hstu_mha_meta(
     const std::optional<at::Tensor>& max_attn_len_tensor = std::nullopt,
     const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
         std::nullopt,
-    int64_t num_groups = 1) {
+    int64_t num_groups = 1,
+    [[maybe_unused]] bool use_bf16_dq_accum = false) {
   auto fwd_out = hstu::hstu_mha_fwd_meta(
       max_seq_len,
       alpha,
@@ -196,7 +198,8 @@ TORCH_LIBRARY_FRAGMENT(hstu, m) {
       "Tensor? contextual_seq_len_tensor = None,"
       "Tensor? max_attn_len_tensor = None,"
       "Tensor? min_full_attn_seq_len_tensor = None,"
-      "int num_groups = 1"
+      "int num_groups = 1,"
+      "bool use_bf16_dq_accum = False"
       ") -> Tensor[]");
 
   m.def(
@@ -227,7 +230,8 @@ TORCH_LIBRARY_FRAGMENT(hstu, m) {
       "Tensor? contextual_seq_len_tensor = None,"
       "Tensor? max_attn_len_tensor = None,"
       "Tensor? min_full_attn_seq_len_tensor = None,"
-      "int num_groups = 1"
+      "int num_groups = 1,"
+      "bool use_bf16_dq_accum = False"
       ") -> Tensor");
 
   // Register CPU implementations

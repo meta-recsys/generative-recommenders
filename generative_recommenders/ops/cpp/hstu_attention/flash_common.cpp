@@ -732,73 +732,117 @@ void run_mha_bwd(hstu::Flash_bwd_params& params, cudaStream_t stream) {
   // });
   ARCH_SWITCH(params.arch, Arch, [&] {
     BOOL_SWITCH(params.num_softmax_heads == params.h, Softmax, [&] {
-      if (!params.is_bf16) {
+      BOOL_SWITCH(params.use_bf16_dq_accum, Use_bf16_dQaccum, [&] {
+        if (!params.is_bf16) {
 #ifndef FLASHATTENTION_DISABLE_FP16
 #ifndef FLASHATTENTION_DISABLE_HDIM64
-        if (params.qk_d <= 64) {
-          return hstu::run_mha_bwd_<Arch, cutlass::half_t, 64, Softmax>(
-              params, stream);
-        }
+          if (params.qk_d <= 64) {
+            return hstu::run_mha_bwd_<
+                Arch,
+                cutlass::half_t,
+                64,
+                Softmax,
+                Use_bf16_dQaccum>(params, stream);
+          }
 #endif
 #ifndef FLASHATTENTION_DISABLE_HDIM96
-        if (params.qk_d <= 96) {
-          return hstu::run_mha_bwd_<Arch, cutlass::half_t, 96, Softmax>(
-              params, stream);
-        }
+          if (params.qk_d <= 96) {
+            return hstu::run_mha_bwd_<
+                Arch,
+                cutlass::half_t,
+                96,
+                Softmax,
+                Use_bf16_dQaccum>(params, stream);
+          }
 #endif
 #ifndef FLASHATTENTION_DISABLE_HDIM128
-        if (params.qk_d <= 128) {
-          return hstu::run_mha_bwd_<Arch, cutlass::half_t, 128, Softmax>(
-              params, stream);
-        }
+          if (params.qk_d <= 128) {
+            return hstu::run_mha_bwd_<
+                Arch,
+                cutlass::half_t,
+                128,
+                Softmax,
+                Use_bf16_dQaccum>(params, stream);
+          }
 #endif
 #ifndef FLASHATTENTION_DISABLE_HDIM192
-        if (params.qk_d <= 192) {
-          return hstu::run_mha_bwd_<Arch, cutlass::half_t, 192, Softmax>(
-              params, stream);
-        }
+          if (params.qk_d <= 192) {
+            return hstu::run_mha_bwd_<
+                Arch,
+                cutlass::half_t,
+                192,
+                Softmax,
+                Use_bf16_dQaccum>(params, stream);
+          }
 #endif
 #ifndef FLASHATTENTION_DISABLE_HDIM256
-        if (params.qk_d <= 256) {
-          return hstu::run_mha_bwd_<Arch, cutlass::half_t, 256, Softmax>(
-              params, stream);
-        }
+          if (params.qk_d <= 256) {
+            // kHeadDim == 256 is always fp32 dQ accum
+            return hstu::run_mha_bwd_<
+                Arch,
+                cutlass::half_t,
+                256,
+                Softmax,
+                /*Use_bf16_dQaccum=*/false>(params, stream);
+          }
 #endif
 #else
                 TORCH_CHECK(false, "This flash attention build does not support FP16.");
 #endif
-      } else {
+        } else {
 #ifndef FLASHATTENTION_DISABLE_HDIM64
-        if (params.qk_d <= 64) {
-          return hstu::run_mha_bwd_<Arch, cutlass::bfloat16_t, 64, Softmax>(
-              params, stream);
-        }
+          if (params.qk_d <= 64) {
+            return hstu::run_mha_bwd_<
+                Arch,
+                cutlass::bfloat16_t,
+                64,
+                Softmax,
+                Use_bf16_dQaccum>(params, stream);
+          }
 #endif
 #ifndef FLASHATTENTION_DISABLE_HDIM96
-        if (params.qk_d <= 96) {
-          return hstu::run_mha_bwd_<Arch, cutlass::bfloat16_t, 96, Softmax>(
-              params, stream);
-        }
+          if (params.qk_d <= 96) {
+            return hstu::run_mha_bwd_<
+                Arch,
+                cutlass::bfloat16_t,
+                96,
+                Softmax,
+                Use_bf16_dQaccum>(params, stream);
+          }
 #endif
 #ifndef FLASHATTENTION_DISABLE_HDIM128
-        if (params.qk_d <= 128) {
-          return hstu::run_mha_bwd_<Arch, cutlass::bfloat16_t, 128, Softmax>(
-              params, stream);
-        }
+          if (params.qk_d <= 128) {
+            return hstu::run_mha_bwd_<
+                Arch,
+                cutlass::bfloat16_t,
+                128,
+                Softmax,
+                Use_bf16_dQaccum>(params, stream);
+          }
 #endif
 #ifndef FLASHATTENTION_DISABLE_HDIM192
-        if (params.qk_d <= 192) {
-          return hstu::run_mha_bwd_<Arch, cutlass::bfloat16_t, 192, Softmax>(
-              params, stream);
-        }
+          if (params.qk_d <= 192) {
+            return hstu::run_mha_bwd_<
+                Arch,
+                cutlass::bfloat16_t,
+                192,
+                Softmax,
+                Use_bf16_dQaccum>(params, stream);
+          }
 #endif
 #ifndef FLASHATTENTION_DISABLE_HDIM256
-        if (params.qk_d <= 256) {
-          return hstu::run_mha_bwd_<Arch, cutlass::bfloat16_t, 256, Softmax>(
-              params, stream);
-        }
+          if (params.qk_d <= 256) {
+            // kHeadDim == 256 is always fp32 dQ accum
+            return hstu::run_mha_bwd_<
+                Arch,
+                cutlass::bfloat16_t,
+                256,
+                Softmax,
+                /*Use_bf16_dQaccum=*/false>(params, stream);
+          }
 #endif
-      }
+        }
+      });
     });
   });
 #endif
@@ -833,7 +877,8 @@ std::vector<at::Tensor> hstu_mha_bwd(
     const std::optional<at::Tensor>& contextual_seq_len_tensor,
     const std::optional<at::Tensor>& max_attn_len_tensor,
     const std::optional<at::Tensor>& min_full_attn_seq_len_tensor,
-    int64_t num_groups) {
+    int64_t num_groups,
+    bool use_bf16_dq_accum) {
 #ifdef FLASHATTENTION_DISABLE_BACKWARD
   TORCH_CHECK(false, "This flash attention build does not support backward.");
 #endif
@@ -1052,15 +1097,18 @@ std::vector<at::Tensor> hstu_mha_bwd(
   at::cuda::CUDAGuard device_guard{(char)q.get_device()};
   auto opts = q.options();
 
+  auto dq_accum_dtype = (qk_head_size_rounded < 256 && use_bf16_dq_accum)
+      ? q.scalar_type()
+      : at::kFloat;
   at::Tensor dq_accum;
   if (!is_jagged) {
     dq_accum = torch::empty(
         {batch_size, num_heads, max_q_len_rounded * qk_head_size_rounded},
-        opts.dtype(at::kFloat));
+        opts.dtype(dq_accum_dtype));
   } else {
     dq_accum = torch::empty(
         {num_heads, total_seq_len_q_padded_rounded * qk_head_size_rounded},
-        opts.dtype(at::kFloat));
+        opts.dtype(dq_accum_dtype));
   }
   at::Tensor softmax_d, softmax_lse_log2;
   if (!is_jagged) {
@@ -1148,6 +1196,7 @@ std::vector<at::Tensor> hstu_mha_bwd(
       {(max_seq_len + kBlockM - 1) / kBlockM, batch_size, num_heads},
       opts.dtype(torch::kInt32));
   params.dq_semaphore = dq_semaphore.data_ptr<int>();
+  params.use_bf16_dq_accum = use_bf16_dq_accum;
 
 #ifdef FLASHATTENTION_DISABLE_LOCAL
   TORCH_CHECK(

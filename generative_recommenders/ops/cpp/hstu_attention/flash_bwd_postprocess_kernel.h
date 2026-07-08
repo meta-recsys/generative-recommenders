@@ -44,7 +44,8 @@ template <
     class TiledMma,
     bool dQ_swapAB,
     bool Jagged,
-    bool Softmax>
+    bool Softmax,
+    bool Use_bf16_dQaccum = false>
 class FlashAttnBwdPostprocessConvertdQ {
  public:
   // Type Aliases
@@ -64,13 +65,20 @@ class FlashAttnBwdPostprocessConvertdQ {
       "kNThreads must be a multiple of NumThreadsPerWarpGroup");
   static constexpr int NumdQWarpGgroups =
       kNThreads / cutlass::NumThreadsPerWarpGroup;
+  using ElementdQaccum = std::conditional_t<
+      (kHeadDim < 256) && IsSm90 && Use_bf16_dQaccum,
+      Element,
+      ElementAccum>;
+  static constexpr int kGmemElemsPerLoadAccum =
+      sizeof(cute::uint128_t) / sizeof(ElementdQaccum);
+
   using R2SLayoutAtomdQaccum = std::conditional_t<
       IsSm90,
       Layout<
           Shape<Int<cutlass::NumThreadsPerWarpGroup>, Int<NumdQWarpGgroups>>>,
       Layout<Shape<Int<kNThreads>>>>;
   using R2STiledCopydQaccum = decltype(make_tiled_copy(
-      Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
+      Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementdQaccum>{},
       R2SLayoutAtomdQaccum{},
       Layout<Shape<Int<IsSm90 ? 4 : 1>>>{})); // Val layout, 1 or 4 vals per
                                               // read
@@ -78,9 +86,10 @@ class FlashAttnBwdPostprocessConvertdQ {
   // UniversalCopy instead of AutoVectorizingCopyWithAssumedAlignment as the
   // latter generates cp.async instructions
   using G2STiledCopydQaccum = decltype(make_tiled_copy(
-      Copy_Atom<UniversalCopy<uint128_t>, ElementAccum>{},
+      Copy_Atom<UniversalCopy<uint128_t>, ElementdQaccum>{},
       G2SLayoutAtomdQaccum{},
-      Layout<Shape<_4>>{})); // Val layout, 4 vals per read
+      Layout<Shape<Int<kGmemElemsPerLoadAccum>>>{})); // Val layout, 4/8 vals
+                                                      // per read
   // We don't do bound checking for the gmem -> smem load so we just assert
   // here.
   static_assert(IsSm90 || (kBlockM * kHeadDim) % (kNThreads * 4) == 0);
@@ -144,7 +153,7 @@ class FlashAttnBwdPostprocessConvertdQ {
                                                      // per load
 
   struct SharedStorage : cute::aligned_struct<128> {
-    cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutdQaccum>>
+    cute::array_aligned<ElementdQaccum, cute::cosize_v<SmemLayoutdQaccum>>
         smem_dqacc;
     cute::array_aligned<Element, cute::cosize_v<SmemLayoutdQ>> smem_dq;
     alignas(16) cutlass::arch::ClusterTransactionBarrier barrier_dQaccum;
@@ -162,7 +171,7 @@ class FlashAttnBwdPostprocessConvertdQ {
 
   // Device side arguments
   struct Arguments {
-    ElementAccum const* ptr_dQaccum;
+    ElementdQaccum const* ptr_dQaccum;
     ShapedQaccum const shape_dQaccum;
     StridedQaccum const stride_dQaccum;
     Element* ptr_dQ;
@@ -173,7 +182,7 @@ class FlashAttnBwdPostprocessConvertdQ {
 
   // Kernel entry point API
   struct Params {
-    ElementAccum const* ptr_dQaccum;
+    ElementdQaccum const* ptr_dQaccum;
     ShapedQaccum const shape_dQaccum;
     StridedQaccum const stride_dQaccum;
     Element* ptr_dQ;
@@ -224,7 +233,7 @@ class FlashAttnBwdPostprocessConvertdQ {
     // Step 1: load dQaccum from gmem to smem
     Tensor mdQaccum = make_tensor(
         make_gmem_ptr(
-            reinterpret_cast<ElementAccum const*>(params.ptr_dQaccum)),
+            reinterpret_cast<ElementdQaccum const*>(params.ptr_dQaccum)),
         params.shape_dQaccum,
         params.stride_dQaccum)(_, bidh, !Jagged ? bidb : 0);
     Tensor gdQaccum = local_tile(
@@ -236,7 +245,7 @@ class FlashAttnBwdPostprocessConvertdQ {
       static constexpr uint32_t TmaTransactionBytesdQaccum =
           static_cast<uint32_t>(
               size(SmemLayoutdQaccumFlat{}) *
-              cute::sizeof_bits_v<ElementAccum> / 8);
+              cute::sizeof_bits_v<ElementdQaccum> / 8);
       auto bulk_copy = Copy_Traits<SM90_BULK_COPY_AUTO>{};
       // if (thread0()) { print(gdQaccum); printf("\n"); print(sdQaccum_flat);
       // printf("\n"); }
@@ -279,11 +288,12 @@ class FlashAttnBwdPostprocessConvertdQ {
     // 0 && threadIdx.x == 1) { print(tdQsdQaccum); } if (blockIdx.x == 0 &&
     // blockIdx.y == 0 && threadIdx.x == 1) { print(taccdQrdQaccum); }
     CUTE_STATIC_ASSERT_V(size(taccdQrdQaccum) == size(tdQsdQaccum));
-    Tensor tdQrdQaccum = s2r_thr_copy_dQaccum.retile_D(taccdQrdQaccum);
+    Tensor taccdQrdQaccum_src =
+        make_tensor_like<ElementdQaccum>(taccdQrdQaccum);
+    Tensor tdQrdQaccum = s2r_thr_copy_dQaccum.retile_D(taccdQrdQaccum_src);
     cute::copy(s2r_tiled_copy_dQaccum, tdQsdQaccum, tdQrdQaccum);
-    // Convert tdQrdQ from fp32 to fp16
-    Tensor rdQ = make_tensor_like<Element>(taccdQrdQaccum);
-    hstu::convert_type_out(taccdQrdQaccum, rdQ);
+    Tensor rdQ = make_tensor_like<Element>(taccdQrdQaccum_src);
+    hstu::convert_type_out(taccdQrdQaccum_src, rdQ);
 
     // Step 3: Copy dQ from register to smem
     auto smem_tiled_copy_dQ = make_tiled_copy_C(SmemCopyAtomdQ{}, tiled_mma_dQ);

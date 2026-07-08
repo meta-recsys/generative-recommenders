@@ -80,7 +80,8 @@ class HSTUFlashAttentionFunctionGPU
       const std::optional<at::Tensor>& max_attn_len_tensor = std::nullopt,
       const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
           std::nullopt,
-      int64_t num_groups = 1) {
+      int64_t num_groups = 1,
+      bool use_bf16_dq_accum = false) {
     ctx->saved_data["max_seq_len"] = max_seq_len;
     ctx->saved_data["alpha"] = alpha;
     ctx->saved_data["causal"] = causal;
@@ -93,6 +94,7 @@ class HSTUFlashAttentionFunctionGPU
     ctx->saved_data["max_q_len"] = max_q_len;
     ctx->saved_data["num_softmax_heads"] = num_softmax_heads;
     ctx->saved_data["num_groups"] = num_groups;
+    ctx->saved_data["use_bf16_dq_accum"] = use_bf16_dq_accum;
     auto fwd_out = hstu::hstu_mha_fwd(
         max_seq_len, // max_seq_len
         alpha, // alpha
@@ -213,7 +215,8 @@ class HSTUFlashAttentionFunctionGPU
         contextual_seq_len_tensor_opt,
         max_attn_len_tensor_opt,
         min_full_attn_seq_len_tensor_opt,
-        saved_data["num_groups"].toInt());
+        saved_data["num_groups"].toInt(),
+        saved_data["use_bf16_dq_accum"].toBool());
 
     return {
         torch::autograd::Variable(), // max_seq_len
@@ -243,6 +246,7 @@ class HSTUFlashAttentionFunctionGPU
         torch::autograd::Variable(), // max_attn_len_tensor
         torch::autograd::Variable(), // min_full_attn_seq_len_tensor
         torch::autograd::Variable(), // num_groups
+        torch::autograd::Variable(), // use_bf16_dq_accum
     };
   }
 };
@@ -275,7 +279,8 @@ at::Tensor cuda_hstu_mha(
     const std::optional<at::Tensor>& max_attn_len_tensor = std::nullopt,
     const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
         std::nullopt,
-    int64_t num_groups = 1) {
+    int64_t num_groups = 1,
+    bool use_bf16_dq_accum = false) {
   return hstu::HSTUFlashAttentionFunctionGPU::apply(
       max_seq_len,
       alpha,
@@ -303,7 +308,8 @@ at::Tensor cuda_hstu_mha(
       contextual_seq_len_tensor,
       max_attn_len_tensor,
       min_full_attn_seq_len_tensor,
-      num_groups);
+      num_groups,
+      use_bf16_dq_accum);
 }
 
 TORCH_LIBRARY_FRAGMENT(hstu, m) {
