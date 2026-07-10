@@ -146,12 +146,19 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
   bool deterministic;
   index_t dq_accum_split_stride;
+
+  bool use_bf16_dq_accum = false;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int Arch, typename T, int Headdim, bool Softmax>
 void run_mha_fwd_(Flash_fwd_params& params, cudaStream_t stream);
-template <int Arch, typename T, int Headdim, bool Softmax>
+template <
+    int Arch,
+    typename T,
+    int Headdim,
+    bool Softmax,
+    bool Use_bf16_dQaccum = false>
 void run_mha_bwd_(Flash_bwd_params& params, cudaStream_t stream);
 } // namespace hstu

@@ -87,6 +87,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         fp8_in_addmm_fwd: bool = False,
         num_softmax_heads: int = 0,
         skip_u: bool = False,
+        use_bf16_dq_accum: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         max_attn_len = max_attn_len or 0
         full_attn_size = full_attn_size or 0
@@ -335,6 +336,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         ctx.skip_u = skip_u
         ctx.fp8_in_addmm_fwd = fp8_in_addmm_fwd
         ctx.num_softmax_heads = num_softmax_heads
+        ctx.use_bf16_dq_accum = use_bf16_dq_accum
         # pyrefly: ignore [bad-return]
         return u, out
 
@@ -677,6 +679,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 None,  # seq_offsets_q,
                 ctx.num_softmax_heads,  # num_softmax_heads,
                 softmax_lse,
+                use_bf16_dq_accum=ctx.use_bf16_dq_accum,
             )
         if ctx.has_rotary_weights:
             _dq = triton_apply_rope_bwd(
@@ -752,4 +755,5 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             None,
             None,
             None,  # skip_u
+            None,  # use_bf16_dq_accum
         )

@@ -26,7 +26,7 @@
 
 namespace hstu {
 #ifndef FLASHATTENTION_DISABLE_HDIM64
-template void run_mha_bwd_<90, cutlass::bfloat16_t, 64, false>(
+template void run_mha_bwd_<90, cutlass::bfloat16_t, 64, true, false>(
     Flash_bwd_params& params,
     cudaStream_t stream);
 #endif

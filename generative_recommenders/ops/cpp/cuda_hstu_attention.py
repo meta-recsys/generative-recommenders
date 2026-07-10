@@ -64,6 +64,7 @@ def cuda_hstu_mha(
     min_full_attn_seq_len_tensor: Optional[torch.Tensor] = None,
     num_groups: int = 1,
     is_inference: bool = False,
+    use_bf16_dq_accum: bool = False,
 ) -> torch.Tensor:
     """
     Arguments:
@@ -127,6 +128,7 @@ def cuda_hstu_mha(
             max_attn_len_tensor,
             min_full_attn_seq_len_tensor,
             num_groups,
+            use_bf16_dq_accum,
         )
 
 
@@ -159,6 +161,7 @@ def cuda_hstu_mha_inference_wrapper(
     max_attn_len_tensor: Optional[torch.Tensor] = None,
     min_full_attn_seq_len_tensor: Optional[torch.Tensor] = None,
     num_groups: int = 1,
+    use_bf16_dq_accum: bool = False,
 ) -> torch.Tensor:
     attn_scale = attn_scale.to(torch.float32) if attn_scale is not None else attn_scale
 
@@ -190,4 +193,5 @@ def cuda_hstu_mha_inference_wrapper(
         max_attn_len_tensor,
         min_full_attn_seq_len_tensor,
         num_groups,
+        use_bf16_dq_accum,
     )

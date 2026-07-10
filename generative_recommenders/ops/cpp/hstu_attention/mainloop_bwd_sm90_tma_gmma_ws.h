@@ -65,7 +65,8 @@ template <
     int AtomLayoutMdQ = 1,
     bool Mma_dP_is_RS = false,
     bool Cross = false,
-    bool Softmax = false>
+    bool Softmax = false,
+    bool Use_bf16_dQaccum = false>
 struct CollectiveMainloopBwdSm90 {
   static constexpr int kStages = Stages;
   static constexpr int kStages_dO = Stages_dO;
@@ -179,7 +180,7 @@ struct CollectiveMainloopBwdSm90 {
                    !dKV_swapAB ? GMMA::Major::MN : PdSt_Major>())>{},
       AtomLayoutdKV{}));
 
-  static constexpr bool dQacc_use_TMA = kHeadDim < 256;
+  static constexpr bool dQacc_use_TMA = kHeadDim < 256 && Use_bf16_dQaccum;
   // For hdim256, we want to slice the dQ MMA (64 x 256 on 2 WGs) into two (64 x
   // 128 on 2 WGs) so that we can do atomic add on one half before doing the
   // other half of the MMA, to reduce register pressure.
@@ -188,6 +189,9 @@ struct CollectiveMainloopBwdSm90 {
   static_assert(
       !(Deterministic && Slice_dQKV_Mma),
       "Deterministic mode not supported with Slice_dQKV_Mma");
+
+  using ElementdQaccum =
+      std::conditional_t<dQacc_use_TMA, Element, ElementAccum>;
 
   static constexpr int TileShapeAtomdQ_BlockM = kBlockM / AtomLayoutMdQ;
   static constexpr int TileShapeAtomdQ_HeadDim =
@@ -338,7 +342,7 @@ struct CollectiveMainloopBwdSm90 {
   using R2SLayoutAtomdQaccum = Layout<
       Shape<Int<cutlass::NumThreadsPerWarpGroup>, Int<NumMmaWarpGroups>>>;
   using R2STiledCopydQaccum = decltype(make_tiled_copy(
-      Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
+      Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementdQaccum>{},
       R2SLayoutAtomdQaccum{},
       Layout<Shape<_4>>{})); // Val layout, 4 vals per store
   using SmemLayoutdQaccum = Layout<
@@ -454,8 +458,8 @@ struct CollectiveMainloopBwdSm90 {
   // line up w smem_k and smem_v due to alignment?
   using SmemdQacc_t = std::conditional_t<
       !dQacc_use_TMA,
-      cute::array<ElementAccum, 0>,
-      cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutdQaccum>>>;
+      cute::array<ElementdQaccum, 0>,
+      cute::array_aligned<ElementdQaccum, cute::cosize_v<SmemLayoutdQaccum>>>;
   using SmemP_t = std::conditional_t<
       Mma_dKV_is_RS,
       cute::array<Element, 0>,
@@ -501,7 +505,7 @@ struct CollectiveMainloopBwdSm90 {
     Element const* const ptr_dO;
     ShapeQKV const shape_dO;
     StrideQKV const stride_dO;
-    ElementAccum* const ptr_dQaccum;
+    ElementdQaccum* const ptr_dQaccum;
     ShapedQaccum const shape_dQaccum;
     StridedQaccum const stride_dQaccum;
     float const* const ptr_LSE_log2;
@@ -536,7 +540,7 @@ struct CollectiveMainloopBwdSm90 {
     ShapeQKV const shape_K;
     ShapeQKV const shape_V;
     ShapeQKV const shape_dO;
-    ElementAccum* const ptr_dQaccum;
+    ElementdQaccum* const ptr_dQaccum;
     ShapedQaccum const shape_dQaccum;
     StridedQaccum stride_dQaccum;
     TMA_QdO tma_load_Q, tma_load_dO;
@@ -1224,10 +1228,10 @@ struct CollectiveMainloopBwdSm90 {
         make_smem_ptr(shared_storage.tensors.mainloop.smem_dqacc.data()),
         SmemLayoutdQaccum{});
     static constexpr int dQ_TMA_num_bytes =
-        CUTE_STATIC_V(size<0>(sdQ)) * sizeof(ElementAccum);
+        CUTE_STATIC_V(size<0>(sdQ)) * sizeof(ElementdQaccum);
 
     Tensor mdQaccum = make_tensor(
-        make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.ptr_dQaccum)),
+        make_gmem_ptr(reinterpret_cast<ElementdQaccum*>(params.ptr_dQaccum)),
         params.shape_dQaccum,
         params.stride_dQaccum)(_, bidh, !Jagged ? bidb : 0);
     Tensor gdQaccum_ = local_tile(
@@ -1554,7 +1558,7 @@ struct CollectiveMainloopBwdSm90 {
     // For the case where we do atomicAdd directly to gdQaccum instead of using
     // TMA
     Tensor mdQaccum = make_tensor(
-        make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.ptr_dQaccum)),
+        make_gmem_ptr(reinterpret_cast<ElementdQaccum*>(params.ptr_dQaccum)),
         params.shape_dQaccum,
         params.stride_dQaccum)(_, bidh, !Jagged ? bidb : 0);
     Tensor gdQaccum_ = local_tile(
@@ -1827,7 +1831,10 @@ struct CollectiveMainloopBwdSm90 {
               cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp,
               static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) +
                   warp_group_idx /*id*/); // sdQ full, to be written to gmem
-          Tensor taccdQrdQ = r2s_thr_copy_dQaccum.retile_S(tdQrdQ);
+          // Convert the fp32 dQ MMA accumulator to the (bf16/fp16) accumulator
+          Tensor rdQ = make_tensor_like<ElementdQaccum>(tdQrdQ);
+          hstu::convert_type_out(tdQrdQ, rdQ);
+          Tensor taccdQrdQ = r2s_thr_copy_dQaccum.retile_S(rdQ);
           cute::copy(r2s_tiled_copy_dQaccum, taccdQrdQ, tdQsdQaccum);
           cutlass::arch::fence_view_async_shared();
           cutlass::arch::NamedBarrier::arrive(
@@ -2466,7 +2473,7 @@ struct CollectiveMainloopBwdSm90 {
     // For the case where we do atomicAdd directly to gdQaccum instead of using
     // TMA
     Tensor mdQaccum = make_tensor(
-        make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.ptr_dQaccum)),
+        make_gmem_ptr(reinterpret_cast<ElementdQaccum*>(params.ptr_dQaccum)),
         params.shape_dQaccum,
         params.stride_dQaccum)(_, bidh, !Jagged ? bidb : 0);
     Tensor gdQaccum_ = local_tile(
@@ -2746,7 +2753,10 @@ struct CollectiveMainloopBwdSm90 {
               cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp,
               static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) +
                   warp_group_idx /*id*/); // sdQ full, to be written to gmem
-          Tensor taccdQrdQ = r2s_thr_copy_dQaccum.retile_S(tdQrdQ);
+          // Convert the fp32 dQ MMA accumulator to the (bf16/fp16) accumulator
+          Tensor rdQ = make_tensor_like<ElementdQaccum>(tdQrdQ);
+          hstu::convert_type_out(tdQrdQ, rdQ);
+          Tensor taccdQrdQ = r2s_thr_copy_dQaccum.retile_S(rdQ);
           cute::copy(r2s_tiled_copy_dQaccum, taccdQrdQ, tdQsdQaccum);
           cutlass::arch::fence_view_async_shared();
           cutlass::arch::NamedBarrier::arrive(

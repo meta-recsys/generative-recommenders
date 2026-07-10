@@ -86,7 +86,7 @@ KERNEL_IMPL_TEMPLATE_BWD_SM90 = """
 
 namespace hstu {{
 #ifndef FLASHATTENTION_DISABLE_HDIM{HEAD_DIM}
-template void run_mha_bwd_<{ARCH}, {DTYPE}, {HEAD_DIM}, {SOFTMAX}>(Flash_bwd_params &params, cudaStream_t stream);
+template void run_mha_bwd_<{ARCH}, {DTYPE}, {HEAD_DIM}, {SOFTMAX}, {USE_BF16_DQ}>(Flash_bwd_params &params, cudaStream_t stream);
 #endif
 }} // namespace hstu
 """
@@ -115,6 +115,7 @@ class Kernel:
     head_dim: int
     softmax: str
     direction: str
+    use_bf16_dq_accum: str = "true"
 
     @property
     def template(self) -> str:
@@ -141,6 +142,7 @@ class Kernel:
                     DTYPE=DTYPE_MAP[self.dtype],
                     HEAD_DIM=self.head_dim,
                     SOFTMAX=self.softmax,
+                    USE_BF16_DQ=self.use_bf16_dq_accum,
                 )
             else:
                 return KERNEL_IMPL_TEMPLATE_BWD_SM8x.format(
@@ -151,7 +153,13 @@ class Kernel:
 
     @property
     def filename(self) -> str:
-        return f"flash_{self.direction}_hdim{self.head_dim}_{self.dtype}_softmax{self.softmax}_sm{self.sm}.cu"
+        # bwd kernels are tagged with the dQ-accumulator dtype: _dqbf16 (accumulate
+        # dQ in the bf16/fp16 output dtype via TMA bulk-reduce-add) or _dqf32
+        # (accumulate dQ in fp32 via atomicAdd). fwd kernels have no such tag.
+        dq_suffix = ""
+        if self.direction == "bwd":
+            dq_suffix = "_dqbf16" if self.use_bf16_dq_accum == "true" else "_dqf32"
+        return f"flash_{self.direction}_hdim{self.head_dim}_{self.dtype}_softmax{self.softmax}{dq_suffix}_sm{self.sm}.cu"
 
 
 def get_all_kernels() -> List[Kernel]:
@@ -174,15 +182,32 @@ def get_all_kernels() -> List[Kernel]:
     for dtype, head_dim, sm, softmax in itertools.product(
         DTYPE_MAP_BWD.keys(), HEAD_DIMENSIONS, SM, SOFTMAX
     ):
-        kernels.append(
-            Kernel(
-                sm=sm,
-                dtype=dtype,
-                head_dim=head_dim,
-                direction="bwd",
-                softmax=softmax,
+        if head_dim < 256:
+            # kHeadDim < 256 has two real dQ-accum variants: bf16 (TMA) and
+            # fp32 (atomicAdd)
+            for use_bf16_dq_accum in ("true", "false"):
+                kernels.append(
+                    Kernel(
+                        sm=sm,
+                        dtype=dtype,
+                        head_dim=head_dim,
+                        direction="bwd",
+                        softmax=softmax,
+                        use_bf16_dq_accum=use_bf16_dq_accum,
+                    )
+                )
+        else:
+            # kHeadDim == 256 is always fp32 (atomicAdd)
+            kernels.append(
+                Kernel(
+                    sm=sm,
+                    dtype=dtype,
+                    head_dim=head_dim,
+                    direction="bwd",
+                    softmax=softmax,
+                    use_bf16_dq_accum="false",
+                )
             )
-        )
     return kernels
 
 

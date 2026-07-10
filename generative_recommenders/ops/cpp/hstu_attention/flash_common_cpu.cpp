@@ -165,7 +165,8 @@ std::vector<at::Tensor> hstu_mha_bwd_dummy(
     const std::optional<at::Tensor>& contextual_seq_len_tensor,
     const std::optional<at::Tensor>& max_attn_len_tensor,
     const std::optional<at::Tensor>& min_full_attn_seq_len_tensor,
-    int64_t num_groups) {
+    int64_t num_groups,
+    [[maybe_unused]] bool use_bf16_dq_accum) {
   return {dq, dk, dv};
 };
 

@@ -63,7 +63,8 @@ template <
     int AtomLayoutMdQ = 1,
     bool V_in_regs = false,
     bool Cross = false,
-    bool Softmax = false>
+    bool Softmax = false,
+    bool Use_bf16_dQaccum = false>
 void run_flash_bwd(hstu::Flash_bwd_params& params, cudaStream_t stream) {
 #ifdef HSTU_FLASH_ATTN_DEBUG_INFO
   std::printf(
@@ -92,6 +93,11 @@ void run_flash_bwd(hstu::Flash_bwd_params& params, cudaStream_t stream) {
   int batch = !Jagged ? params.b : 1;
 
   using TileShape_MK = cute::Shape<Int<kBlockM>, Int<kHeadDim>>;
+  using ElementdQaccum = std::conditional_t<
+      (get<1>(TileShape_MK{}) < 256) && Use_bf16_dQaccum,
+      Element,
+      ElementAccum>;
+
   using PreprocessKernel = hstu::FlashAttnBwdPreprocess<
       TileShape_MK,
       Element,
@@ -99,7 +105,8 @@ void run_flash_bwd(hstu::Flash_bwd_params& params, cudaStream_t stream) {
       ArchTag,
       /*Clear_dQaccum=*/true,
       Jagged,
-      Softmax>;
+      Softmax,
+      Use_bf16_dQaccum>;
   typename PreprocessKernel::Arguments preprocess_args{
       static_cast<Element const*>(params.o_ptr),
       {seqlen_q, params.v_d, params.h, batch}, // shape_O
@@ -128,7 +135,7 @@ void run_flash_bwd(hstu::Flash_bwd_params& params, cudaStream_t stream) {
        seqlen_q_rounded,
        !Jagged ? params.num_softmax_heads * params.max_q_len_rounded
                : 0}, // stride_LSE_log2
-      static_cast<ElementAccum*>(params.dq_accum_ptr),
+      static_cast<ElementdQaccum*>(params.dq_accum_ptr),
       {seqlen_q_rounded * params.qk_d_rounded,
        params.h,
        batch}, // shape_dQaccum
@@ -185,7 +192,8 @@ void run_flash_bwd(hstu::Flash_bwd_params& params, cudaStream_t stream) {
       AtomLayoutMdQ,
       V_in_regs,
       Cross,
-      Softmax>;
+      Softmax,
+      Use_bf16_dQaccum>;
   using CollectiveEpilogue = hstu::CollectiveEpilogueBwd<
       TileShape_MNK,
       Element,
@@ -228,7 +236,7 @@ void run_flash_bwd(hstu::Flash_bwd_params& params, cudaStream_t stream) {
        _1{},
        params.do_head_stride,
        !Jagged ? params.do_batch_stride : 0}, // stride_dO
-      static_cast<ElementAccum*>(params.dq_accum_ptr),
+      static_cast<ElementdQaccum*>(params.dq_accum_ptr),
       {seqlen_q_rounded * params.qk_d_rounded,
        params.h,
        batch}, // shape_dQaccum
@@ -361,9 +369,10 @@ void run_flash_bwd(hstu::Flash_bwd_params& params, cudaStream_t stream) {
       typename AttnKernel::CollectiveMainloop::TiledMmadQ,
       AttnKernel::CollectiveMainloop::dQ_swapAB,
       Jagged,
-      Softmax>;
+      Softmax,
+      Use_bf16_dQaccum>;
   typename PostprocessKernel::Arguments postprocess_args{
-      static_cast<ElementAccum const*>(params.dq_accum_ptr),
+      static_cast<ElementdQaccum const*>(params.dq_accum_ptr),
       {seqlen_q_rounded * params.qk_d_rounded,
        params.h,
        batch}, // shape_dQaccum
@@ -418,7 +427,8 @@ template <
     int AtomLayoutNdKV = 2,
     int AtomLayoutMdQ = 1,
     bool V_in_regs = false,
-    bool Softmax = false>
+    bool Softmax = false,
+    bool Use_bf16_dQaccum = false>
 void run_mha_bwd_dispatch(hstu::Flash_bwd_params& params, cudaStream_t stream) {
   BOOL_SWITCH(params.seq_offsets != nullptr, Jagged, [&] {
     BOOL_SWITCH(params.num_targets != nullptr, Has_targets, [&] {
@@ -447,14 +457,20 @@ void run_mha_bwd_dispatch(hstu::Flash_bwd_params& params, cudaStream_t stream) {
               AtomLayoutMdQ,
               V_in_regs,
               Cross,
-              Softmax>(params, stream);
+              Softmax,
+              Use_bf16_dQaccum>(params, stream);
         });
       });
     });
   });
 }
 
-template <int Arch, typename T, int kHeadDim, bool Softmax>
+template <
+    int Arch,
+    typename T,
+    int kHeadDim,
+    bool Softmax,
+    bool Use_bf16_dQaccum> // default declared in flash.h
 void run_mha_bwd_(hstu::Flash_bwd_params& params, cudaStream_t stream) {
   CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Causal, Local, [&] {
     int const kBlockM = hstu::kBlockM_bwd(Arch, kHeadDim, Causal, Local);
@@ -485,7 +501,8 @@ void run_mha_bwd_(hstu::Flash_bwd_params& params, cudaStream_t stream) {
         std::get<1>(AtomLayout), /*AtomLayoutNdKV*/
         std::get<2>(AtomLayout), /*AtomLayoutMdQ*/
         V_in_regs,
-        Softmax>(params, stream);
+        Softmax,
+        Use_bf16_dQaccum>(params, stream);
   });
 }
 
