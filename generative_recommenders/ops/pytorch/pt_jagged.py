@@ -16,6 +16,7 @@
 
 # pyre-strict
 
+import os
 from typing import Tuple
 
 import torch
@@ -193,8 +194,19 @@ def pytorch_concat_2D_jagged_jagged(
         min=0, max=values_right.shape[0]
     )
 
-    left_values = values_left_safe.index_select(0, left_idx)
-    right_values = values_right_safe.index_select(0, right_idx)
+    # AMD: the clamp above sends ~half the positions to the sentinel padding row,
+    # so this index_select's backward (index_add) is a hot-row bf16 atomic
+    # (~20ms on MI350). Route it to the sorted chunk-split backward when
+    # TORCHREC_SORTED_INDEX_SELECT=1 (forward identical); the hot sentinel row is
+    # split across work-items instead of contending one atomic. Off by default.
+    if os.environ.get("TORCHREC_SORTED_INDEX_SELECT", "0") == "1":
+        from torchrec.modules.sorted_index_select import sorted_index_select
+
+        left_values = sorted_index_select(values_left_safe, left_idx)
+        right_values = sorted_index_select(values_right_safe, right_idx)
+    else:
+        left_values = values_left_safe.index_select(0, left_idx)
+        right_values = values_right_safe.index_select(0, right_idx)
 
     return torch.where(is_left.unsqueeze(-1), left_values, right_values)
 
