@@ -16,9 +16,21 @@
 
 # pyre-strict
 
+import os
 from typing import Tuple
 
 import torch
+from torchrec.modules.sorted_index_select import maybe_sorted_index_select
+
+
+def _use_sorted_index_select() -> bool:
+    # App-layer opt-in, read at call time (the training launcher may set the env
+    # after import). Guarded for TorchScript: os.environ is not scriptable, and
+    # the sorted path is a training-only backward opt, so scripted publish just
+    # uses the native gather.
+    if torch.jit.is_scripting():
+        return False
+    return os.environ.get("TORCHREC_SORTED_INDEX_SELECT", "0") == "1"
 
 
 try:
@@ -193,8 +205,15 @@ def pytorch_concat_2D_jagged_jagged(
         min=0, max=values_right.shape[0]
     )
 
-    left_values = values_left_safe.index_select(0, left_idx)
-    right_values = values_right_safe.index_select(0, right_idx)
+    # AMD: the clamp above sends ~half the positions to the sentinel padding row,
+    # so this index_select's backward (index_add) is a hot-row bf16 atomic
+    # (~20ms on MI350). maybe_sorted_index_select routes to the sorted chunk-split
+    # backward when TORCHREC_SORTED_INDEX_SELECT=1 (forward identical); the hot
+    # sentinel row is split across work-items instead of contending one atomic.
+    # Off by default and bypassed under torch.jit.script (publish/inference).
+    use_sorted = _use_sorted_index_select()
+    left_values = maybe_sorted_index_select(values_left_safe, left_idx, use_sorted)
+    right_values = maybe_sorted_index_select(values_right_safe, right_idx, use_sorted)
 
     return torch.where(is_left.unsqueeze(-1), left_values, right_values)
 
