@@ -102,7 +102,7 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd_meta(
     const std::optional<at::Tensor>& k_descale, // (b, h_k)
     const std::optional<at::Tensor>& v_descale, // (b, h_k)
     const int64_t sm_margin = 0,
-    int64_t max_q_len = 0,
+    at::SymInt max_q_len = 0,
     const std::optional<at::Tensor>& seq_offsets_q = std::nullopt,
     int64_t num_softmax_heads = 0,
     bool training = true,
