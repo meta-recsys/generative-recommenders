@@ -97,7 +97,7 @@ at::Tensor hstu_mha_meta(
     bool sort_by_length,
     bool deterministic,
     const int64_t sm_margin = 0,
-    int64_t max_q_len = 0,
+    at::SymInt max_q_len = 0,
     const std::optional<at::Tensor>& seq_offsets_q = std::nullopt,
     int64_t num_softmax_heads = 0,
     bool training = true,
@@ -157,7 +157,7 @@ TORCH_LIBRARY_FRAGMENT(hstu, m) {
       "Tensor? k_descale, "
       "Tensor? v_descale, "
       "int sm_margin = 0,"
-      "int max_q_len = 0,"
+      "SymInt max_q_len = 0,"
       "Tensor? seq_offsets_q = None,"
       "int num_softmax_heads = 0,"
       "bool training = True,"
@@ -222,7 +222,7 @@ TORCH_LIBRARY_FRAGMENT(hstu, m) {
       "bool sort_by_length, "
       "bool deterministic, "
       "int sm_margin = 0,"
-      "int max_q_len = 0,"
+      "SymInt max_q_len = 0,"
       "Tensor? seq_offsets_q = None,"
       "int num_softmax_heads = 0,"
       "bool training = True,"
