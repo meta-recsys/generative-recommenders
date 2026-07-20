@@ -133,21 +133,17 @@ def pytorch_concat_2D_dense_jagged(
     dense_values: torch.Tensor,
 ) -> torch.Tensor:
     B, dense_size, D = dense_values.size()
-    jagged_dense = torch.ops.fbgemm.jagged_to_padded_dense(
-        values=jagged_values,
-        offsets=[jagged_offsets],
-        max_lengths=[jagged_max_seq_len],
-        padding_value=0.0,
+    # Avoid fbgemm.dense_to_jagged on a dense input whose numel can exceed int32.
+    dense_as_jagged_values = dense_values.reshape(B * dense_size, D)
+    dense_as_jagged_offsets = dense_size * _arange(B + 1, device=jagged_offsets.device)
+    return pytorch_concat_2D_jagged_jagged(
+        max_seq_len_left=dense_size,
+        offsets_left=dense_as_jagged_offsets,
+        values_left=dense_as_jagged_values,
+        max_seq_len_right=jagged_max_seq_len,
+        offsets_right=jagged_offsets,
+        values_right=jagged_values,
     )
-    concatted_dense = torch.cat([dense_values, jagged_dense], dim=1)
-    concatted_offsets = (
-        dense_size * _arange(B + 1, device=jagged_offsets.device) + jagged_offsets
-    )
-    return torch.ops.fbgemm.dense_to_jagged(
-        concatted_dense,
-        [concatted_offsets],
-        total_L=jagged_values.shape[0] + dense_size * B,
-    )[0]
 
 
 def pytorch_concat_2D_jagged_jagged(
