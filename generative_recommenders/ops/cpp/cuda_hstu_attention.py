@@ -19,20 +19,49 @@ from typing import Optional
 import torch
 from generative_recommenders.ops.utils import is_sm100_plus
 
+# When True, route SM100 (Blackwell) HSTU attention through the gwatch CUTLASS
+# fork (bw_hstu_gwatch) instead of the production bw_hstu op. Off by default.
+_use_gwatch_hstu: bool = False
+
+
+def enable_gwatch_hstu(enabled: bool = True) -> None:
+    global _use_gwatch_hstu
+    _use_gwatch_hstu = enabled
+
+
 try:
     # We need to import the CUDA kernels after importing torch
     import hstu._C  # pyre-ignore [21]
-except:
+except Exception:
     pass
+
 try:
     torch.ops.load_library(
         "//generative_recommenders/fb/ultra/ops/blackwell/hstu_attention:hstu_flash_attention"
     )
+except Exception:
+    pass
+
+try:
     torch.ops.load_library(
         "//generative_recommenders/ops/cpp/hstu_attention:hstu_flash_attention"
     )
-except:
+except Exception:
     pass
+
+try:
+    torch.ops.load_library(
+        "//generative_recommenders/fb/gwatch/blackwell_hstu:hstu_flash_attention_gwatch"
+    )
+except Exception:
+    pass
+
+_has_bw_hstu = hasattr(torch.ops, "bw_hstu") and hasattr(
+    torch.ops.bw_hstu, "bw_hstu_mha_fwd"
+)
+_has_bw_hstu_gwatch = hasattr(torch.ops, "bw_hstu_gwatch") and hasattr(
+    torch.ops.bw_hstu_gwatch, "bw_hstu_mha_fwd"
+)
 
 
 def cuda_hstu_mha(
@@ -71,7 +100,12 @@ def cuda_hstu_mha(
         q, k, v: (batch_size, seqlen, nheads, headdim) or (total_seqlen, nheads, headdim)
     """
     if is_sm100_plus() and not is_inference:
-        return torch.ops.bw_hstu.bw_hstu_mha(
+        _bw_hstu_op = (
+            torch.ops.bw_hstu_gwatch.bw_hstu_mha
+            if _use_gwatch_hstu
+            else torch.ops.bw_hstu.bw_hstu_mha
+        )
+        return _bw_hstu_op(
             max_seq_len,
             alpha,
             q,
