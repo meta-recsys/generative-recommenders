@@ -84,6 +84,12 @@ def is_sm90_plus() -> bool:
     return is_sm100_plus() or is_sm90()
 
 
+def is_gfx950() -> bool:
+    if not torch.cuda.is_available() or torch.version.hip is None:
+        return False
+    return torch.cuda.get_device_capability() == (9, 5)
+
+
 def copy_if_different_ptr(dst: torch.Tensor, src: torch.Tensor) -> None:
     if torch.compiler.is_compiling():
         # .data_ptr() will break PT2

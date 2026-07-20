@@ -27,7 +27,11 @@ import triton
 
 # @manual=//triton:triton
 import triton.language as tl
-from generative_recommenders.ops.utils import is_sm100_plus, maybe_register_custom_op
+from generative_recommenders.ops.utils import (
+    is_gfx950,
+    is_sm100_plus,
+    maybe_register_custom_op,
+)
 
 try:
     # @manual=//triton:triton
@@ -203,26 +207,17 @@ def _prune_configs_for_tlx_persistent_addmm(configs, named_args, **kwargs):  # n
 
 def get_mm_configs(pre_hook=None) -> List[triton.Config]:
     if torch.version.hip:
-        if ENABLE_FULL_TURNING_SPACE:
-            block_m_range = [32, 64, 128, 256]
-            block_n_range = [32, 64, 128, 256]
-            block_k_range = [32, 64]
-            group_m_range = [4, 8]
-            matrix_instr_nonkdim_range = [16]
-            waves_per_eu_range = [0]
-            kpack_range = [1, 2]
-            num_warps_range = [4, 8]
-            num_stage_range = [2] if triton.__version__ >= "3.2.0" else [0]
-        else:
-            block_m_range = [256]
-            block_n_range = [256]
-            block_k_range = [32]
-            group_m_range = [8]
-            matrix_instr_nonkdim_range = [16]
-            waves_per_eu_range = [0]
-            kpack_range = [2]
-            num_warps_range = [8]
-            num_stage_range = [2] if triton.__version__ >= "3.2.0" else [0]
+        block_m_range = [64, 128, 256]
+        block_n_range = [64, 128, 256]
+        block_k_range = [64, 128]
+        group_m_range = [4, 8]
+        matrix_instr_nonkdim_range = [16]
+        waves_per_eu_range = [0]
+        kpack_range = (
+            [1, 2] if not is_gfx950() else [1]
+        )  # kpack is deprecated on gfx950
+        num_warps_range = [4, 8]
+        num_stage_range = [2] if triton.__version__ >= "3.2.0" else [0]
 
         return [
             triton.Config(
