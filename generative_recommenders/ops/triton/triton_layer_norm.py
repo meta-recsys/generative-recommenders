@@ -35,6 +35,7 @@ from generative_recommenders.ops.utils import (
     is_sm90,
     maybe_register_custom_op,
 )
+from torch.fx.experimental.symbolic_shapes import guard_or_false
 
 try:
     # @manual=//triton:triton
@@ -513,11 +514,15 @@ def triton_weighted_layer_norm_fwd(
     eps: float,
     mean: Optional[torch.Tensor] = None,
     rstd: Optional[torch.Tensor] = None,
+    is_swish: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert x.dim() == 2, f"x.dim() == {x.dim()}, expected 2"
     x = switch_to_contiguous_if_needed(x)
     N, D = x.shape
     learnable = weight is not None
+    assert not is_swish or learnable, (
+        "is_swish=True requires weight (learnable layer_norm)"
+    )
     if learnable:
         assert bias is not None and weight is not None
         assert weight.dim() == 1
@@ -541,7 +546,7 @@ def triton_weighted_layer_norm_fwd(
     if D > BLOCK_D:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
 
-    if N == 0:
+    if guard_or_false(N == 0):
         return y, out_mean, out_rstd
 
     # pyre-ignore[28]
@@ -559,7 +564,7 @@ def triton_weighted_layer_norm_fwd(
             eps,
             x.stride(0),
             y.stride(0),
-            IS_SWISH=False,
+            IS_SWISH=is_swish,
             TRAINING=True,
             BLOCK_D=BLOCK_D,
             COMPUTE_MEAN_AND_RSTD=compute_mean_and_rstd,
@@ -591,6 +596,7 @@ def _(
     eps: float,
     mean: Optional[torch.Tensor] = None,
     rstd: Optional[torch.Tensor] = None,
+    is_swish: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     N = x.shape[0]
     y = torch.empty_like(x)
@@ -613,7 +619,11 @@ def _triton_weighted_layer_norm_bwd_impl(
     learnable: bool,
     eps: float,
     BLOCK_D: int,
+    is_swish: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert not is_swish or learnable, (
+        "is_swish=True requires weight (learnable layer_norm)"
+    )
     num_warps: int = min(max(BLOCK_D // 256, 1), 8)
     if learnable:
         N, D = x.shape
@@ -624,7 +634,7 @@ def _triton_weighted_layer_norm_bwd_impl(
         _dbias = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
         dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
         dbias = torch.empty((D,), dtype=weight.dtype, device=x.device)
-        if N == 0:
+        if guard_or_false(N == 0):
             dweight.zero_()
             dbias.zero_()
             return dx, dweight, dbias
@@ -644,7 +654,7 @@ def _triton_weighted_layer_norm_bwd_impl(
             x.stride(0),
             D,
             eps,
-            IS_SWISH=False,
+            IS_SWISH=is_swish,
             N=N,
             BLOCK_D=BLOCK_D,
         )
@@ -672,7 +682,7 @@ def _triton_weighted_layer_norm_bwd_impl(
         # Return empty tensors as sentinels for None
         dweight = torch.empty(0, dtype=x.dtype, device=x.device)
         dbias = torch.empty(0, dtype=x.dtype, device=x.device)
-        if N == 0:
+        if guard_or_false(N == 0):
             return dx, dweight, dbias
         # pyre-ignore[28]
         _layer_norm_bwd_dx[(N,)](
@@ -705,6 +715,7 @@ def _(
     learnable: bool,
     eps: float,
     BLOCK_D: int,
+    is_swish: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     dx = torch.empty_like(x)
     if learnable:
@@ -727,6 +738,7 @@ def triton_weighted_layer_norm_bwd(
     learnable: bool,
     eps: float,
     BLOCK_D: int,
+    is_swish: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     # Use sentinel tensors for custom_op compatibility (can't return Optional[Tensor])
     _weight = (
@@ -743,6 +755,7 @@ def triton_weighted_layer_norm_bwd(
         learnable=learnable,
         eps=eps,
         BLOCK_D=BLOCK_D,
+        is_swish=is_swish,
     )
     if not learnable:
         return dx, None, None
@@ -1118,7 +1131,7 @@ class RMSNormFunction(torch.autograd.Function):
 
         ctx.save_for_backward(x, weight, rstd)
         ctx.silu = silu
-        if N == 0:
+        if guard_or_false(N == 0):
             return y
 
         # pyre-ignore[28]
@@ -1150,7 +1163,7 @@ class RMSNormFunction(torch.autograd.Function):
         N, D = x.shape
         dx = torch.empty_like(x)
         dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
-        if N == 0:
+        if guard_or_false(N == 0):
             dweight.zero_()
             return dx, dweight, None, None
 
@@ -1202,50 +1215,17 @@ class SwishLayerNormFunction(torch.autograd.Function):
         bias: torch.Tensor,
         eps: float,
     ) -> torch.Tensor:
-        assert x.dim() == 2, f"x.dim() == {x.dim()}, expected 2"
-        x = switch_to_contiguous_if_needed(x)
-        N, D = x.shape
-
-        assert bias is not None and weight is not None
-        assert weight.dim() == 1
-        assert bias.dim() == 1
-        assert weight.numel() == D
-        assert bias.numel() == D
-
-        y = torch.empty_like(x)
-        mean = torch.empty((N,), dtype=torch.float32, device=x.device)
-        rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
-
-        BLOCK_D = triton.next_power_of_2(D)
-        num_warps = min(max(BLOCK_D // 256, 1), 8)
-
+        y, mean, rstd = triton_weighted_layer_norm_fwd(
+            x=x,
+            weight=weight,
+            bias=bias,
+            eps=eps,
+            is_swish=True,
+        )
+        BLOCK_D = compute_BLOCK_D(x)
         ctx.save_for_backward(x, weight, bias, mean, rstd)
         ctx.BLOCK_D = BLOCK_D
-        ctx.num_warps = num_warps
         ctx.eps = eps
-        if N == 0:
-            return y
-
-        # pyre-ignore[28]
-        grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]),)  # noqa E731
-        _weighted_layer_norm_fwd[grid](
-            x,
-            y,
-            weight,
-            bias,
-            mean,
-            rstd,
-            N,
-            D,
-            eps,
-            x.stride(0),
-            y.stride(0),
-            IS_SWISH=True,
-            TRAINING=True,
-            BLOCK_D=BLOCK_D,
-            COMPUTE_MEAN_AND_RSTD=True,
-        )
-
         return y
 
     @staticmethod
@@ -1254,55 +1234,18 @@ class SwishLayerNormFunction(torch.autograd.Function):
         ctx, dy: torch.Tensor
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], None]:
         x, weight, bias, mean, rstd = ctx.saved_tensors
-        N, D = x.shape
-        dx = torch.empty_like(x)
-        sms = torch.cuda.get_device_properties(x.device).multi_processor_count
-        tile_num = max(1, min(sms * 8, N // 4))
-        _dweight = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
-        _dbias = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
-        dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
-        dbias = torch.empty((D,), dtype=weight.dtype, device=x.device)
-        if N == 0:
-            dweight.zero_()
-            dbias.zero_()
-            return dx, dweight, dbias, None
-        # pyre-ignore[28]
-        _weighted_layer_norm_bwd_dx[(tile_num,)](
-            dx,
-            dy,
-            _dweight,
-            _dbias,
-            x,
-            weight,
-            bias,
-            mean,
-            rstd,
-            dx.stride(0),
-            dy.stride(0),
-            x.stride(0),
-            D,
-            ctx.eps,
-            IS_SWISH=True,
-            N=N,
+        dx, dweight, dbias = triton_weighted_layer_norm_bwd(
+            dy=dy,
+            x=x,
+            weight=weight,
+            bias=bias,
+            mean=mean,
+            rstd=rstd,
+            learnable=True,
+            eps=ctx.eps,
             BLOCK_D=ctx.BLOCK_D,
+            is_swish=True,
         )
-
-        def grid(META):
-            return (triton.cdiv(D, META["BLOCK_D"]),)
-
-        blocks = triton.next_power_of_2(sms * 4)
-        BLOCK_D = triton.next_power_of_2(triton.cdiv(D, blocks))
-        BLOCK_D = min(max(BLOCK_D, 4), 128)
-        _layer_norm_bwd_dwdb[grid](
-            _dweight,
-            _dbias,
-            dweight,
-            dbias,
-            tile_num,
-            D,
-            BLOCK_D=BLOCK_D,
-        )
-
         return dx, dweight, dbias, None
 
 
