@@ -33,7 +33,7 @@ from generative_recommenders.common import (
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
-from generative_recommenders.ops.utils import is_sm100_plus, is_sm90
+from generative_recommenders.ops.utils import is_sm100_plus, is_sm90, is_sm90_plus
 from torch._inductor.runtime import triton_helpers
 
 try:
@@ -117,12 +117,12 @@ def _should_use_multirow() -> bool:
     if env is not None:
         return env == "1"
     # Enable multirow for AMD GPUs (CDNA architecture benefits from processing
-    # multiple rows per block due to 64-wide wavefronts) and NVIDIA SM100+.
+    # multiple rows per block due to 64-wide wavefronts) and NVIDIA SM90+.
     if torch.version.hip is not None:
         return True
     if SPLIT_CONCAT_2D_JAGGED_USE_MULTIROW is not None:
         return SPLIT_CONCAT_2D_JAGGED_USE_MULTIROW
-    return is_sm100_plus()
+    return is_sm90_plus()
 
 
 def set_gln_mul_dropout_kernel(value: Optional[str]) -> None:
