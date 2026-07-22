@@ -59,10 +59,19 @@ The config file is listed in `dlrm_v3/inference/gin/streaming_100b.gin`.
 `WORLD_SIZE` is the number of GPUs used in the inference benchmark.
 
 To load checkpoint from training, modify `run.model_path` inside the inference
-gin config file. (We will relase the checkpoint soon.)
+gin config file. (We will release the checkpoint soon.)
 
-To achieve the best performance, tune `run.target_qps` and `run.batch_size` in
+To achieve the best performance, tune `run.target_qps` and `run.batchsize` in
 the config file.
+
+Benchmark summaries report:
+
+- `qps`: processed queries per second.
+- `avg_batch_time`: average total latency per batch.
+- `time`: total benchmark runtime in seconds.
+- `queries`: total processed queries.
+- `batches`: total completed batches.
+- `percentiles`: batch-level total latency percentiles.
 
 ## Accuracy test
 
