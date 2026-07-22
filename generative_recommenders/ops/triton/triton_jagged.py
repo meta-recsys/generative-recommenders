@@ -33,7 +33,7 @@ from generative_recommenders.common import (
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
-from generative_recommenders.ops.utils import is_sm100_plus, is_sm90, is_sm90_plus
+from generative_recommenders.ops.utils import is_sm90, is_sm90_plus
 from torch._inductor.runtime import triton_helpers
 
 try:
@@ -108,16 +108,22 @@ def set_split_concat_2d_jagged_multirow_kernel(
 def _should_use_multirow() -> bool:
     """Check if multirow kernel should be used.
 
-    Priority order:
+    Priority order (first match wins):
       1. JAGGED_USE_MULTIROW_MI350 env var (MI350-specific, extended autotune configs)
-      2. Module-level global set by set_split_concat_2d_jagged_multirow_kernel
-      3. is_sm100_plus() hardware check
+      2. torch.version.hip: on AMD/HIP this returns True, short-circuiting BEFORE the
+         module-level global, so set_split_concat_2d_jagged_multirow_kernel(False) is
+         silently ignored on AMD.
+      3. Module-level global set by set_split_concat_2d_jagged_multirow_kernel
+      4. is_sm90_plus() hardware check
     """
     env = os.environ.get("JAGGED_USE_MULTIROW_MI350")
     if env is not None:
         return env == "1"
-    # Enable multirow for AMD GPUs (CDNA architecture benefits from processing
-    # multiple rows per block due to 64-wide wavefronts) and NVIDIA SM90+.
+    # Enable multirow for AMD GPUs (CDNA benefits from processing multiple rows
+    # per block due to 64-wide wavefronts) and NVIDIA SM90+ (H100/Blackwell),
+    # where one CTA per BLOCK_N rows amortizes the redundant per-row offset loads
+    # and cuts the single-row kernel's grid-launch/null-CTA overhead (its grid is
+    # max_seq_len x B, most of which early-return on jagged data).
     if torch.version.hip is not None:
         return True
     if SPLIT_CONCAT_2D_JAGGED_USE_MULTIROW is not None:
