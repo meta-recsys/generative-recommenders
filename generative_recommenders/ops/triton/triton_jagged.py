@@ -394,22 +394,24 @@ def jagged_dense_bmm_broadcast_add_kernel(
 
 def _get_bmm_reduce_sum_configs() -> List[triton.Config]:
     configs = []
-    for BLOCK_M in [64, 128]:
+    for BLOCK_M in [32, 64, 128]:
         for BLOCK_N in [64, 128]:
-            for BLOCK_K in [64, 128]:
-                for num_stages in [3, 4]:
+            for BLOCK_K in [32, 64, 128]:
+                for num_stages in [1, 2, 3, 4]:
                     for num_warps in [4, 8]:
-                        configs.append(
-                            triton.Config(
-                                {
-                                    "BLOCK_M": BLOCK_M,
-                                    "BLOCK_N": BLOCK_N,
-                                    "BLOCK_K": BLOCK_K,
-                                },
-                                num_stages=num_stages,
-                                num_warps=num_warps,
+                        for GROUP_M in [4, 1]:
+                            configs.append(
+                                triton.Config(
+                                    {
+                                        "BLOCK_M": BLOCK_M,
+                                        "BLOCK_N": BLOCK_N,
+                                        "BLOCK_K": BLOCK_K,
+                                        "GROUP_M": GROUP_M,
+                                    },
+                                    num_stages=num_stages,
+                                    num_warps=num_warps,
+                                )
                             )
-                        )
     return configs
 
 
@@ -439,15 +441,30 @@ def _jagged_jagged_bmm_reduce_sum(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
 ):
     """
     Computing bmm Out = Jagged x Jagged
     K is the jagged dimension
     JaggedA has shape (sum_B(K_i), M), JaggedB has shape (sum_B(K_i), N), and Out has shape (B, M, N)
+
+    Program IDs use an autotuned grouped tile order. GROUP_M=1 preserves the
+    original tile assignment, while larger groups place tiles that share
+    JaggedA rows closer together in launch order.
     """
 
-    off_m = tl.program_id(0).to(tl.int64)
-    off_n = tl.program_id(1)
+    # Group tiles by off_m so nearby programs can reuse JaggedA through L2.
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid = pid_m * num_pid_n + pid_n
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = tl.minimum(num_pid_m - first_pid_m, GROUP_M)
+    off_m = (first_pid_m + (pid % group_size_m)).to(tl.int64)
+    off_n = (pid % num_pid_in_group) // group_size_m
     off_b = tl.program_id(2)
 
     seq_start = tl.load(seq_offsets + off_b).to(tl.int64)
