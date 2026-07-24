@@ -20,7 +20,20 @@ import os
 from typing import Tuple
 
 import torch
-from torchrec.modules.sorted_index_select import maybe_sorted_index_select
+
+try:
+    from torchrec.modules.sorted_index_select import maybe_sorted_index_select
+except ImportError:
+    # torchrec.modules.sorted_index_select was added after the last PyPI torchrec
+    # release (1.4.*); it only exists in newer/fbsource torchrec builds. When it
+    # is unavailable (e.g. the OSS/PyPI torchrec pinned in the recir TPU bench
+    # image), fall back to the plain native gather. The sorted variant is a
+    # training-only backward optimization whose forward is identical, so dropping
+    # it costs the perf opt only, never correctness.
+    def maybe_sorted_index_select(
+        embeddings: torch.Tensor, indices: torch.Tensor, use_sorted: bool
+    ) -> torch.Tensor:
+        return embeddings.index_select(0, indices)
 
 
 def _use_sorted_index_select() -> bool:
