@@ -66,22 +66,19 @@ inline int round_up_headdim(int head_size) {
 }
 
 inline int get_max_headdim() {
-#ifndef FLASHATTENTION_DISABLE_HDIM256
+#if !defined(FLASHATTENTION_DISABLE_HDIM256)
   return 256;
-#endif
-#ifndef FLASHATTENTION_DISABLE_HDIM192
+#elif !defined(FLASHATTENTION_DISABLE_HDIM192)
   return 192;
-#endif
-#ifndef FLASHATTENTION_DISABLE_HDIM128
+#elif !defined(FLASHATTENTION_DISABLE_HDIM128)
   return 128;
-#endif
-#ifndef FLASHATTENTION_DISABLE_HDIM96
+#elif !defined(FLASHATTENTION_DISABLE_HDIM96)
   return 96;
-#endif
-#ifndef FLASHATTENTION_DISABLE_HDIM64
+#elif !defined(FLASHATTENTION_DISABLE_HDIM64)
   return 64;
-#endif
+#else
   return 0;
+#endif
 }
 
 namespace hstu {
