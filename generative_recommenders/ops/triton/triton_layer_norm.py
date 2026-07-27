@@ -58,6 +58,9 @@ def _get_layer_norm_fwd_configs() -> List[triton.Config]:
     block_ns = [4, 8, 16] if is_sm100_plus() else [1, 2, 4, 8]
     for BLOCK_N in block_ns:
         for num_warps in [1, 2, 4, 8]:
+            if torch.version.hip is not None and BLOCK_N == 1 and num_warps == 8:
+                # This single-row/eight-warp candidate is a persistent AMD outlier.
+                continue
             configs.append(
                 triton.Config(
                     {"BLOCK_N": BLOCK_N},
