@@ -148,7 +148,7 @@ def _add_timestamp_position_embeddings_kernel(
     Out += seq_start.to(tl.int64) * stride_on
     out_offsets = Out + offs_n[:, None] * stride_on + offs_d[None, :]
     for _d in range(0, D, BLOCK_D):
-        mask = (offs_n[:, None] < seq_len) and offs_d[None, :] < D
+        mask = (offs_n[:, None] < seq_len) & (offs_d[None, :] < D)
         seq_emb = tl.load(SeqEmb + seq_emb_offsets, mask=mask)
         pos_emb = tl.load(PosEmb + pos_emb_offsets, mask=mask)
         ts_emb = tl.load(TsEmb + ts_emb_offsets, mask=mask)
