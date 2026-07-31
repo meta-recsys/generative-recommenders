@@ -363,7 +363,7 @@ def _get_fw_configs() -> List[triton.Config]:  # noqa: C901
                             "NUM_MMA_WARPS_PER_GROUP": 4,
                             "NUM_MMA_GROUPS": 2,
                         },
-                        num_stages=0,
+                        num_stages=1,
                         num_warps=4,
                         pre_hook=_host_descriptor_pre_hook,
                     ),
