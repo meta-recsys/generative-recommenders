@@ -2302,6 +2302,7 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
                     silu_u=silu_u,
                     concat_u=concat_u,
                     concat_x=concat_x,
+                    mul_u_activation_type=mul_u_activation_type,
                     seed=seed,
                 )
             )
