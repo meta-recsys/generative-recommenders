@@ -25,6 +25,20 @@ except ImportError:
 from generative_recommenders.common import HammerKernel
 from generative_recommenders.ops.triton.triton_addmm import triton_addmm
 
+try:
+    # @manual=//generative_recommenders/ops/triton_aot:triton_addmm
+    from generative_recommenders.ops.triton_aot.triton_addmm import (  # pyre-ignore[21]
+        aot_triton_kernel_wrapper_addmm,
+    )
+except ImportError:
+
+    def aot_triton_kernel_wrapper_addmm(
+        input: torch.Tensor,
+        mat1: torch.Tensor,
+        mat2: torch.Tensor,
+    ) -> torch.Tensor:
+        raise ImportError("AOT-T is required for the TRITON_INFERENCE addmm kernel.")
+
 
 def addmm(
     input: torch.Tensor,
@@ -36,6 +50,8 @@ def addmm(
         return torch.addmm(input, mat1, mat2)
     if kernel == HammerKernel.TRITON:
         return triton_addmm(input, mat1, mat2)
+    elif kernel == HammerKernel.TRITON_INFERENCE:
+        return aot_triton_kernel_wrapper_addmm(input, mat1, mat2)
     elif kernel == HammerKernel.TRITON_CC:
         if triton_cc_addmm is None:
             raise ImportError("hammer is required for the TRITON_CC kernel in addmm.")

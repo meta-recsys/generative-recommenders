@@ -34,6 +34,20 @@ from generative_recommenders.ops.triton.triton_position import (
     triton_add_timestamp_positional_embeddings,
 )
 
+try:
+    # @manual=//generative_recommenders/ops/triton_aot:triton_position
+    from generative_recommenders.ops.triton_aot.triton_position import (  # pyre-ignore[21]
+        aot_triton_kernel_wrapper_position,
+    )
+except ImportError:
+
+    def aot_triton_kernel_wrapper_position(
+        *args: object,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        raise ImportError("AOT-T is required for the TRITON_INFERENCE position kernel.")
+
+
 torch.fx.wrap("triton_add_timestamp_positional_embeddings")
 
 
@@ -80,6 +94,21 @@ def add_timestamp_positional_embeddings(
             max_seq_len=max_seq_len,
             max_contextual_seq_len=max_contextual_seq_len,
             seq_lengths=seq_lengths,
+            num_targets=num_targets,
+            interleave_targets=interleave_targets,
+            time_bucket_fn=time_bucket_fn,
+        )
+    elif kernel == HammerKernel.TRITON_INFERENCE:
+        return aot_triton_kernel_wrapper_position(
+            alpha=1.0,
+            max_seq_len=max_seq_len,
+            max_contextual_seq_len=max_contextual_seq_len,
+            position_embeddings_weight=position_embeddings_weight.to(torch.float32),
+            timestamp_embeddings_weight=timestamp_embeddings_weight.to(torch.float32),
+            seq_offsets=seq_offsets,
+            seq_lengths=seq_lengths,
+            seq_embeddings=seq_embeddings,
+            timestamps=timestamps,
             num_targets=num_targets,
             interleave_targets=interleave_targets,
             time_bucket_fn=time_bucket_fn,
