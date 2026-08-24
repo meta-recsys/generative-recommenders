@@ -1175,7 +1175,10 @@ def _triton_layer_norm_mul_dropout_fwd_impl_fake(
         y = torch.empty_like(x)
     mean = torch.empty((N,), dtype=torch.float32, device=x.device)
     rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
-    random_mask = torch.empty(0, dtype=x.dtype, device=x.device)
+    if N > 0 and not FUSE_OUTPUT_LN_RNG_BLACKWELL and is_sm100_plus() and training:
+        random_mask = torch.empty((N, D), dtype=torch.int8, device=x.device)
+    else:
+        random_mask = torch.empty(0, dtype=x.dtype, device=x.device)
     return y, mean, rstd, random_mask
 
 
