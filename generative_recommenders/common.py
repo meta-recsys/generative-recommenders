@@ -260,10 +260,12 @@ tma_unavailable: Tuple[bool, str] = (
 
 
 def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
-    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
-        # Tell Dynamo this data-dependent value is in the range (0, 10**9)
-        torch._check(x.size(0) > 0)
-        torch._check(x.size(0) < 10**9)
+    if torch.compiler.is_compiling():
+        size0 = x.size(0)
+        torch._check_is_size(size0, max=10**9 - 1)
+    # FX cannot trace Python control flow over symbolic stride checks
+    # (`x.stride(-1) == 1`). For AOT-T lowering, conservatively emit the
+    # contiguous op instead of branching on a symbolic value.
     if x.stride(-1) == 1:
         return x
     return x.contiguous()

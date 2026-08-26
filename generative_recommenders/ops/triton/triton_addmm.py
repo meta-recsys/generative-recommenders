@@ -28,6 +28,7 @@ import triton
 # @manual=//triton:triton
 import triton.language as tl
 from generative_recommenders.ops.utils import is_sm100_plus, maybe_register_custom_op
+from torch.fx.experimental.symbolic_shapes import guard_or_false
 
 try:
     # @manual=//triton:triton
@@ -1570,7 +1571,7 @@ def triton_addmm_fwd_tma_persistent(
 
     # Allocate output
     z = torch.empty((M, N), device=x.device, dtype=x.dtype)
-    if M == 0 or N == 0:
+    if guard_or_false(M == 0) or guard_or_false(N == 0):
         return z
 
     # A dummy block value that will be overwritten when we have the real block size
@@ -1635,7 +1636,7 @@ def triton_addmm_fwd_tma_ws_tlx(
 
     # Allocate output
     z = torch.empty((M, N), device=x.device, dtype=x.dtype)
-    if M == 0 or N == 0:
+    if guard_or_false(M == 0) or guard_or_false(N == 0):
         return z
 
     # A dummy block value that will be overwritten when we have the real block size
@@ -1690,7 +1691,7 @@ def triton_addmm_fwd_tma_ws_persistent_tlx(
 
     # Allocate output
     z = torch.empty((M, N), device=x.device, dtype=x.dtype)
-    if M == 0 or N == 0:
+    if guard_or_false(M == 0) or guard_or_false(N == 0):
         return z
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
@@ -1759,7 +1760,7 @@ def triton_addmm_fwd(
 
     # Allocate output
     z = torch.empty((M, N), device=x.device, dtype=x.dtype)
-    if M == 0 or N == 0:
+    if guard_or_false(M == 0) or guard_or_false(N == 0):
         return z
 
     grid = lambda meta: (  # noqa E731

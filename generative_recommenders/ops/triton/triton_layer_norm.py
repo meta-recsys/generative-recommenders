@@ -35,6 +35,7 @@ from generative_recommenders.ops.utils import (
     is_sm90,
     maybe_register_custom_op,
 )
+from torch.fx.experimental.symbolic_shapes import guard_or_false
 
 try:
     # @manual=//triton:triton
@@ -544,7 +545,7 @@ def triton_weighted_layer_norm_fwd(
     if D > BLOCK_D:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
 
-    if N == 0:
+    if guard_or_false(N == 0):
         return y, out_mean, out_rstd
 
     # pyre-ignore[28]
@@ -627,7 +628,7 @@ def _triton_weighted_layer_norm_bwd_impl(
         _dbias = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
         dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
         dbias = torch.empty((D,), dtype=weight.dtype, device=x.device)
-        if N == 0:
+        if guard_or_false(N == 0):
             dweight.zero_()
             dbias.zero_()
             return dx, dweight, dbias
@@ -675,7 +676,7 @@ def _triton_weighted_layer_norm_bwd_impl(
         # Return empty tensors as sentinels for None
         dweight = torch.empty(0, dtype=x.dtype, device=x.device)
         dbias = torch.empty(0, dtype=x.dtype, device=x.device)
-        if N == 0:
+        if guard_or_false(N == 0):
             return dx, dweight, dbias
         # pyre-ignore[28]
         _layer_norm_bwd_dx[(N,)](
@@ -1121,7 +1122,7 @@ class RMSNormFunction(torch.autograd.Function):
 
         ctx.save_for_backward(x, weight, rstd)
         ctx.silu = silu
-        if N == 0:
+        if guard_or_false(N == 0):
             return y
 
         # pyre-ignore[28]
@@ -1153,7 +1154,7 @@ class RMSNormFunction(torch.autograd.Function):
         N, D = x.shape
         dx = torch.empty_like(x)
         dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
-        if N == 0:
+        if guard_or_false(N == 0):
             dweight.zero_()
             return dx, dweight, None, None
 
