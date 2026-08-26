@@ -638,6 +638,7 @@ def _addmm_persistent_tile_body(
     offs_xm = pid_m * BLOCK_M
     offs_wn = pid_n * BLOCK_N
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # pyrefly: ignore [bad-argument-type]
     for k in tl.range(0, k_tiles, warp_specialize=INNER_WARP_SPECIALIZE):
         offs_k = k * BLOCK_K
         x = x_desc.load([offs_xm, offs_k])
@@ -727,11 +728,12 @@ def _addmm_fwd_tma_persistent(
             num_tiles,
             NUM_SMS,
             flatten=False,
+            # pyrefly: ignore [bad-argument-type]
             warp_specialize=WARP_SPECIALIZE,
             data_partition_factor=DATA_PARTITION_FACTOR,
-            # pyrefly: ignore [unexpected-keyword]
+            # pyrefly: ignore [bad-argument-type, unexpected-keyword]
             separate_epilogue_store=SEPARATE_EPILOGUE_STORE,
-            # pyrefly: ignore [unexpected-keyword]
+            # pyrefly: ignore [bad-argument-type, unexpected-keyword]
             smem_alloc_algo=1,
         ):
             _addmm_persistent_tile_body(
@@ -758,7 +760,13 @@ def _addmm_fwd_tma_persistent(
     else:
         # Pure OAI Triton version.
         for tile_id in tl.range(
-            start_pid, num_tiles, NUM_SMS, flatten=True, warp_specialize=WARP_SPECIALIZE
+            # pyrefly: ignore [bad-argument-type]
+            start_pid,
+            num_tiles,
+            NUM_SMS,
+            flatten=True,
+            # pyrefly: ignore [bad-argument-type]
+            warp_specialize=WARP_SPECIALIZE,
         ):
             _addmm_persistent_tile_body(
                 x_desc,

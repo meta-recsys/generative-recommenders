@@ -2611,6 +2611,7 @@ def helion_layer_norm_mul_dropout_fwd(
         u.stride(0),
         # pyrefly: ignore [bad-argument-type]
         y.stride(0),
+        # pyrefly: ignore [bad-argument-type]
         BLOCK_D,
         # pyrefly: ignore [bad-argument-type]
         CONCAT_UX=concat_ux,

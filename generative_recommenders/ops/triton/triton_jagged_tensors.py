@@ -621,6 +621,7 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
             stride_ad=d_values_a.stride(-2),
             stride_bd=d_values_b.stride(-2),
             n_prefix_to_B=ctx.n_prefix_from_B,
+            # pyrefly: ignore [bad-argument-type]
             BLOCK_D=BLOCK_D,
             IS_DENSE_A=ctx.is_dense_a,
             IS_DENSE_B=ctx.is_dense_b,

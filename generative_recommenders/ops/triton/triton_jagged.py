@@ -1440,9 +1440,12 @@ def concat_2D_jagged_jagged_w_prefix(
         0,
         stride_od,
         n_prefix_from_B,
+        # pyrefly: ignore [bad-argument-type]
         IS_DENSE_A=False,
+        # pyrefly: ignore [bad-argument-type]
         IS_DENSE_B=False,
         BLOCK_D=BLOCK_D,
+        # pyrefly: ignore [bad-argument-type]
         IS_REPLACE=False,
     )
 
@@ -1586,9 +1589,12 @@ def split_2D_jagged_jagged_w_prefix(
         stride_ad,
         stride_bd,
         n_prefix_to_B,
+        # pyrefly: ignore [bad-argument-type]
         IS_DENSE_A=False,
+        # pyrefly: ignore [bad-argument-type]
         IS_DENSE_B=False,
         BLOCK_D=BLOCK_D,
+        # pyrefly: ignore [bad-argument-type]
         IS_REPLACE=False,
     )
 
@@ -2350,10 +2356,13 @@ def concat_2D_jagged_jagged_w_prefix_multirow(
         0,
         stride_od,
         n_prefix_from_B,
+        # pyrefly: ignore [bad-argument-type]
         IS_DENSE_A=False,
+        # pyrefly: ignore [bad-argument-type]
         IS_DENSE_B=False,
         BLOCK_D=BLOCK_D,
         BLOCK_N=BLOCK_N,
+        # pyrefly: ignore [bad-argument-type]
         IS_REPLACE=False,
     )
 
@@ -2518,10 +2527,13 @@ def split_2D_jagged_jagged_w_prefix_multirow(
         stride_ad,
         stride_bd,
         n_prefix_to_B,
+        # pyrefly: ignore [bad-argument-type]
         IS_DENSE_A=False,
+        # pyrefly: ignore [bad-argument-type]
         IS_DENSE_B=False,
         BLOCK_D=BLOCK_D,
         BLOCK_N=BLOCK_N,
+        # pyrefly: ignore [bad-argument-type]
         IS_REPLACE=False,
     )
 
@@ -2616,7 +2628,9 @@ def _helion_split_2d_jagged_kernel(
             0,
             D,
             _BLOCK_SIZE_1,
+            # pyrefly: ignore [bad-argument-type]
             loop_unroll_factor=1,
+            # pyrefly: ignore [bad-argument-type]
             num_stages=4,
             disallow_acc_multi_buffer=True,
             flatten=True,
