@@ -16,13 +16,22 @@
 
 # pyre-strict
 import abc
-from typing import Optional
+from typing import Optional, TypeVar
 
 import torch
 from generative_recommenders.common import HammerModule, init_mlp_weights_optional_bias
 from generative_recommenders.ops.jagged_tensors import jagged_dense_bmm_broadcast_add
 from generative_recommenders.ops.layer_norm import LayerNorm, SwishLayerNorm
-from libfb.py.pyre import none_throws
+
+try:
+    from libfb.py.pyre import none_throws
+except ImportError:
+    _T = TypeVar("_T")
+
+    def none_throws(optional: Optional[_T], message: str = "Unexpected `None`") -> _T:
+        if optional is None:
+            raise AssertionError(message)
+        return optional
 
 
 class ContextualizedMLP(HammerModule):
