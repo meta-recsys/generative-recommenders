@@ -261,9 +261,10 @@ tma_unavailable: Tuple[bool, str] = (
 
 def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
     if not torch.jit.is_scripting() and torch.compiler.is_compiling():
-        # Tell Dynamo this data-dependent value is in the range (0, 10**9)
-        torch._check(x.size(0) > 0)
-        torch._check(x.size(0) < 10**9)
+        # Range the size as [0, 10**9-1] without requiring s > 0 to be
+        # provable, so unbacked SymInts (e.g. from custom-op fake kernels)
+        # don't fail the strict ``_check(s > 0)`` form at trace time.
+        torch._check_is_size(x.size(0), max=10**9 - 1)
     if x.stride(-1) == 1:
         return x
     return x.contiguous()
