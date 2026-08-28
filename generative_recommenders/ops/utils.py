@@ -84,6 +84,24 @@ def is_sm90_plus() -> bool:
     return is_sm100_plus() or is_sm90()
 
 
+def is_amd() -> bool:
+    """Check if the active GPU is an AMD (ROCm/HIP) device."""
+    return torch.version.hip is not None and torch.cuda.is_available()
+
+
+def _amd_arch_name() -> str:
+    """gcnArchName of the current AMD GPU, e.g. 'gfx950:sramecc+:xnack-'."""
+    if not is_amd():
+        return ""
+    props = torch.cuda.get_device_properties(0)
+    return getattr(props, "gcnArchName", "") or ""
+
+
+def is_gfx950() -> bool:
+    """Check if this is an AMD CDNA4 (MI350-class, gfx950) GPU."""
+    return "gfx950" in _amd_arch_name()
+
+
 def copy_if_different_ptr(dst: torch.Tensor, src: torch.Tensor) -> None:
     if torch.compiler.is_compiling():
         # .data_ptr() will break PT2
