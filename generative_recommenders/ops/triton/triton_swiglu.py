@@ -690,8 +690,8 @@ def _swiglu_fwd_kernel(
     result = (gate_activated * acc_up).to(out_ptr.dtype.element_ty)
 
     # -- Step 5: Store result --
-    offs_m = pid_m * BLOCK_M + offs_m
-    offs_n = pid_n * BLOCK_N + offs_n
+    offs_m = pid_m.to(tl.int64) * BLOCK_M + offs_m
+    offs_n = pid_n.to(tl.int64) * BLOCK_N + offs_n
     out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
     tl.store(out_ptrs, result, mask=mask_m & mask_n)
 
