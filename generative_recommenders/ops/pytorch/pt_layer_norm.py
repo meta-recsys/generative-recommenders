@@ -16,7 +16,7 @@
 # pyre-strict
 
 
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -41,7 +41,7 @@ def pytorch_layer_norm(
 def pytorch_rms_norm(
     x: torch.Tensor,
     normalized_shape: List[int],
-    weight: torch.Tensor,
+    weight: Optional[torch.Tensor],
     eps: float,
     silu: bool = False,
 ) -> torch.Tensor:
@@ -50,7 +50,7 @@ def pytorch_rms_norm(
     normalized = torch.nn.functional.rms_norm(
         x_float,
         normalized_shape,
-        weight.to(torch.float32),
+        weight.to(torch.float32) if weight is not None else None,
         eps,
     )
     if silu:
