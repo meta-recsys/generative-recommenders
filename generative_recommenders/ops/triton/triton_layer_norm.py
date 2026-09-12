@@ -1094,6 +1094,158 @@ def _rms_norm_bwd_dwdb(
     tl.store(FINAL_DW + cols, sum_dw.to(FINAL_DW.dtype.element_ty), mask=cols < D)
 
 
+@maybe_register_custom_op(
+    "generative_recommenders::triton_weighted_rms_norm_fwd", mutates_args=()
+)
+def triton_weighted_rms_norm_fwd(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    silu: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """RMSNorm counterpart of triton_weighted_layer_norm_fwd.
+
+    Returns (y, rstd). Unlike the LayerNorm version there is no mean to save,
+    and no bias, so callers that keep a mean slot should pass an empty tensor.
+
+    There is deliberately no rstd input for recomputation, unlike the LayerNorm
+    version: the underlying _weighted_rms_norm_fwd signature is pinned by the
+    TritonCC specs in hammer/ops/triton/cc/rms_norm/specs.py and by the AOT-T
+    annotations in triton_aot/ops/triton_rms_norm.py, so it must not grow a
+    COMPUTE_RSTD constexpr. Callers recomputing normed_x in backward just call
+    this again and discard rstd, which costs one extra reduction over D and is
+    the usual activation-recompute trade.
+    """
+    assert x.dim() == 2, f"x.dim() == {x.dim()}, expected 2"
+    x = switch_to_contiguous_if_needed(x)
+    N, D = x.shape
+    assert weight.dim() == 1
+    assert weight.numel() == D
+
+    y = torch.empty_like(x)
+    rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
+
+    # Less than 64KB per feature: enqueue fused kernel. RMSNormFunction stashes
+    # compute_BLOCK_D(x) on ctx for the backward, so derive the launch value
+    # from that same helper rather than repeating the formula here: two copies
+    # could drift and leave backward running with a BLOCK_D the forward never
+    # launched with.
+    BLOCK_D: int = compute_BLOCK_D(x)
+    if D > BLOCK_D:
+        raise RuntimeError("This rms norm doesn't support feature dim >= 64KB.")
+
+    if N == 0:
+        return y, rstd
+
+    # pyre-ignore[28]
+    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]),)  # noqa E731
+    _weighted_rms_norm_fwd[grid](
+        x,
+        y,
+        weight,
+        rstd,
+        N,
+        D,
+        eps,
+        x.stride(0),
+        y.stride(0),
+        SILU=silu,
+        BLOCK_D=BLOCK_D,
+    )
+    return y, rstd
+
+
+@triton_weighted_rms_norm_fwd.register_fake
+def _(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    silu: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    N = x.shape[0]
+    y = torch.empty_like(x)
+    rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
+    return y, rstd
+
+
+@maybe_register_custom_op(
+    "generative_recommenders::triton_weighted_rms_norm_bwd", mutates_args=()
+)
+def triton_weighted_rms_norm_bwd(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    rstd: torch.Tensor,
+    eps: float,
+    BLOCK_D: int,
+    silu: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """RMSNorm counterpart of triton_weighted_layer_norm_bwd.
+
+    Returns (dx, dweight). RMSNorm has no bias, so there is no dbias: the
+    caller must return None for the bias grad.
+    """
+    N, D = x.shape
+    dx = torch.empty_like(x)
+    dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
+    if N == 0:
+        dweight.zero_()
+        return dx, dweight
+
+    sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+    tile_num = max(1, min(sms * 8, N // 4, 1024))
+    _dweight = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
+
+    _weighted_rms_norm_bwd[(tile_num,)](
+        dx,
+        dy,
+        _dweight,
+        x,
+        weight,
+        rstd,
+        dx.stride(0),
+        dy.stride(0),
+        x.stride(0),
+        D,
+        eps,
+        N=N,
+        SILU=silu,
+        BLOCK_D=BLOCK_D,
+    )
+
+    def grid(META):
+        return (triton.cdiv(D, META["BLOCK_D"]),)
+
+    blocks = triton.next_power_of_2(sms * 4)
+    dwdb_BLOCK_D = triton.next_power_of_2(triton.cdiv(D, blocks))
+    dwdb_BLOCK_D = min(max(dwdb_BLOCK_D, 4), 128)
+    _rms_norm_bwd_dwdb[grid](
+        _dweight,
+        dweight,
+        tile_num,
+        D,
+        BLOCK_D=dwdb_BLOCK_D,
+    )
+
+    return dx, dweight
+
+
+@triton_weighted_rms_norm_bwd.register_fake
+def _(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    rstd: torch.Tensor,
+    eps: float,
+    BLOCK_D: int,
+    silu: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    D = x.shape[-1]
+    dx = torch.empty_like(x)
+    dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
+    return dx, dweight
+
+
 class RMSNormFunction(torch.autograd.Function):
     @staticmethod
     # pyre-ignore[14]
@@ -1104,43 +1256,16 @@ class RMSNormFunction(torch.autograd.Function):
         eps: float,
         silu: bool,
     ) -> torch.Tensor:
-        assert x.dim() == 2
         x = switch_to_contiguous_if_needed(x)
-        N, D = x.shape
-        assert weight.dim() == 1
-        assert weight.numel() == D
-
-        y = torch.empty_like(x)
-        rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
-
-        # Less than 64KB per feature: enqueue fused kernel
-        MAX_FUSED_SIZE = 65536 // x.element_size()
-        BLOCK_D = min(MAX_FUSED_SIZE, triton.next_power_of_2(D))
-        if D > BLOCK_D:
-            raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
-
+        y, rstd = triton_weighted_rms_norm_fwd(
+            x=x,
+            weight=weight,
+            eps=eps,
+            silu=silu,
+        )
         ctx.save_for_backward(x, weight, rstd)
         ctx.silu = silu
-        if N == 0:
-            return y
-
-        # pyre-ignore[28]
-        grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]),)  # noqa E731
-        _weighted_rms_norm_fwd[grid](
-            x,
-            y,
-            weight,
-            rstd,
-            N,
-            D,
-            eps,
-            x.stride(0),
-            y.stride(0),
-            SILU=silu,
-            BLOCK_D=BLOCK_D,
-        )
-
-        ctx.BLOCK_D = BLOCK_D
+        ctx.BLOCK_D = compute_BLOCK_D(x)
         ctx.eps = eps
         return y
 
@@ -1150,48 +1275,15 @@ class RMSNormFunction(torch.autograd.Function):
         ctx, dy: torch.Tensor
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], None, None]:
         x, weight, rstd = ctx.saved_tensors
-        N, D = x.shape
-        dx = torch.empty_like(x)
-        dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
-        if N == 0:
-            dweight.zero_()
-            return dx, dweight, None, None
-
-        sms = torch.cuda.get_device_properties(x.device).multi_processor_count
-        tile_num = max(1, min(sms * 8, N // 4, 1024))
-        _dweight = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
-
-        _weighted_rms_norm_bwd[(tile_num,)](
-            dx,
-            dy,
-            _dweight,
-            x,
-            weight,
-            rstd,
-            dx.stride(0),
-            dy.stride(0),
-            x.stride(0),
-            D,
-            ctx.eps,
-            N=N,
-            SILU=ctx.silu,
+        dx, dweight = triton_weighted_rms_norm_bwd(
+            dy=dy,
+            x=x,
+            weight=weight,
+            rstd=rstd,
+            eps=ctx.eps,
             BLOCK_D=ctx.BLOCK_D,
+            silu=ctx.silu,
         )
-
-        def grid(META):
-            return (triton.cdiv(D, META["BLOCK_D"]),)
-
-        blocks = triton.next_power_of_2(sms * 4)
-        BLOCK_D = triton.next_power_of_2(triton.cdiv(D, blocks))
-        BLOCK_D = min(max(BLOCK_D, 4), 128)
-        _rms_norm_bwd_dwdb[grid](
-            _dweight,
-            dweight,
-            tile_num,
-            D,
-            BLOCK_D=BLOCK_D,
-        )
-
         return dx, dweight, None, None
 
 
