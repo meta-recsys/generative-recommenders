@@ -143,10 +143,14 @@ def _generate_random_mask(
 
 @triton_autotune(
     configs=_get_layer_norm_mul_dropout_fwd_multirow_configs(),
-    key=["BLOCK_D"],
+    # IS_RMS_NORM must be in the key: triton builds the autotune cache key from
+    # these names plus arg dtypes, never from constexprs. Omitting it makes the
+    # RMSNorm specialization reuse the config tuned for LayerNorm, which does
+    # strictly more work per row.
+    key=["BLOCK_D", "IS_RMS_NORM"],
 )
 @triton.jit
-def _ln_mul_dropout_fwd_rng(
+def _ln_mul_dropout_fwd_rng(  # noqa: C901
     X,
     U,
     Y,
@@ -170,6 +174,7 @@ def _ln_mul_dropout_fwd_rng(
     CONCAT_U: tl.constexpr,
     CONCAT_X: tl.constexpr,
     MUL_U_ACTIVATION_TYPE: tl.constexpr,
+    IS_RMS_NORM: tl.constexpr = False,  # pyre-ignore [9]
 ):
     block_id = tl.program_id(0)
     start_row = block_id * BLOCK_N
@@ -211,12 +216,19 @@ def _ln_mul_dropout_fwd_rng(
     # Pre-compute inv_D to replace divisions with multiplications (optimization)
     inv_D = 1.0 / D
 
-    mean = tl.sum(x_block, axis=1) * inv_D
-    tl.store(Mean + rows, mean, mask=row_mask)
-    mean = tl.expand_dims(mean, 1)
-
-    x_mean = x_block - mean
-    x_mean = tl.where(mask_2d, x_mean, 0.0)
+    if IS_RMS_NORM:
+        # RMSNorm normalizes by the root mean square of x itself, so there is
+        # no mean to subtract and nothing to store in Mean. The load above used
+        # padding_option="zero", so out-of-range lanes are already 0 and fall
+        # out of the variance sum on their own. LayerNorm still needs the mask
+        # below: subtracting the mean leaves -mean in those lanes.
+        x_mean = x_block
+    else:
+        mean = tl.sum(x_block, axis=1) * inv_D
+        tl.store(Mean + rows, mean, mask=row_mask)
+        mean = tl.expand_dims(mean, 1)
+        x_mean = x_block - mean
+        x_mean = tl.where(mask_2d, x_mean, 0.0)
     _var = x_mean * x_mean
     var = tl.sum(_var, axis=1) * inv_D
     rstd = 1 / tl.sqrt(var + eps)
@@ -225,8 +237,11 @@ def _ln_mul_dropout_fwd_rng(
 
     y = x_mean * rstd
     w = tl.load(W + cols, mask=col_mask).to(tl.float32)
-    b = tl.load(B + cols, mask=col_mask).to(tl.float32)
-    y = y * w[None, :] + b[None, :]
+    y = y * w[None, :]
+    if not IS_RMS_NORM:
+        # RMSNorm has no bias term; B is unread on that path.
+        b = tl.load(B + cols, mask=col_mask).to(tl.float32)
+        y = y + b[None, :]
 
     # Pre-compute sigmoid once to avoid redundant computation
     sigmoid_u_block = tl.sigmoid(u_block)
@@ -384,6 +399,7 @@ def _ln_mul_dropout_fwd(
     CONCAT_X: tl.constexpr,
     MUL_U_ACTIVATION_TYPE: tl.constexpr,
     FAST_DROPOUT: tl.constexpr,
+    IS_RMS_NORM: tl.constexpr = False,  # pyre-ignore [9]
 ):
     row = tl.program_id(0)
     X += row.to(tl.int64) * stride_x
@@ -391,26 +407,34 @@ def _ln_mul_dropout_fwd(
     Y += row.to(tl.int64) * stride_y
     cols = tl.arange(0, BLOCK_D)
 
-    # Compute mean
-    mean = 0.0
+    # Compute mean (RMSNorm skips it: it normalizes by the RMS of x itself)
     x = tl.load(X + cols, mask=cols < D, other=0.0).to(tl.float32)
-    mean = tl.sum(x, axis=0) / D
+    if IS_RMS_NORM:
+        # other=0.0 on the load already zeroed the tail, and RMSNorm subtracts
+        # nothing from it, so the variance sum below is safe as-is. LayerNorm
+        # still needs its mask: x - mean puts -mean in those tail lanes.
+        x_mean = x
+    else:
+        mean = tl.sum(x, axis=0) / D
+        x_mean = tl.where(cols < D, x - mean, 0.0)
+        tl.store(Mean + row, mean)
 
     # Compute variance
     _var = tl.zeros([BLOCK_D], dtype=tl.float32)
-    x_mean = tl.where(cols < D, x - mean, 0.0)
     _var += x_mean * x_mean
     var = tl.sum(_var, axis=0) / D
     rstd = 1 / tl.sqrt(var + eps)
-    tl.store(Mean + row, mean)
     tl.store(Rstd + row, rstd)
 
     # Normalize and apply linear transformation
     mask = cols < D
     y = x_mean * rstd
     w = tl.load(W + cols, mask=mask).to(tl.float32)
-    b = tl.load(B + cols, mask=mask).to(tl.float32)
-    y = y * w + b
+    y = y * w
+    if not IS_RMS_NORM:
+        # RMSNorm has no bias term; B is unread on that path.
+        b = tl.load(B + cols, mask=mask).to(tl.float32)
+        y = y + b
     u = tl.load(U + cols, mask=cols < D, other=0.0).to(tl.float32)
     sigmoid_u = tl.sigmoid(u)
     silu_u = u * sigmoid_u
@@ -525,6 +549,7 @@ def _ln_mul_dropout_bwd_dx_du_rng(
     CONCAT_X: tl.constexpr,
     MUL_U_ACTIVATION_TYPE: tl.constexpr,
     COMPUTE_Y: tl.constexpr,
+    IS_RMS_NORM: tl.constexpr = False,  # pyre-ignore [9]
 ):
     pid = tl.program_id(0)
     tile_num = tl.num_programs(0)
@@ -558,7 +583,9 @@ def _ln_mul_dropout_bwd_dx_du_rng(
     partial_dw = tl.zeros((BLOCK_D,), dtype=tl.float32)
     partial_db = tl.zeros((BLOCK_D,), dtype=tl.float32)
     w = tl.load(W + cols, mask=mask).to(tl.float32)
-    b = tl.load(B + cols, mask=mask).to(tl.float32)
+    if not IS_RMS_NORM:
+        # RMSNorm has no bias term; B is unread on that path.
+        b = tl.load(B + cols, mask=mask).to(tl.float32)
 
     dropout_scale = 0.0
     if TRAINING:
@@ -616,13 +643,19 @@ def _ln_mul_dropout_bwd_dx_du_rng(
                 dy_keep = tl.load(RANDOM_MASK + cols, mask=mask, other=True)
                 dy = tl.where(dy_keep, dy * dropout_scale, 0.0)
 
-        mean = tl.load(Mean + row)
         rstd = tl.load(Rstd + row)
 
         # Compute dx
-        xhat = (x - mean) * rstd
+        if IS_RMS_NORM:
+            xhat = x * rstd
+        else:
+            mean = tl.load(Mean + row)
+            xhat = (x - mean) * rstd
         u = tl.load(U + cols, mask=mask, other=0).to(tl.float32)
-        ln = xhat * w + b
+        if IS_RMS_NORM:
+            ln = xhat * w
+        else:
+            ln = xhat * w + b  # pyre-ignore [61]
         du_y = dy * ln
         mul_u = u
         sig_u = tl.sigmoid(u)
@@ -692,14 +725,20 @@ def _ln_mul_dropout_bwd_dx_du_rng(
         # Note: xhat and wdy are already 0 outside valid range due to masked loads,
         # so no additional tl.where masking is needed before reduction
         c1 = tl.sum(xhat * wdy, axis=0) * inv_D
-        c2 = tl.sum(wdy, axis=0) * inv_D
-        dx += (wdy - (xhat * c1 + c2)) * rstd
+        if IS_RMS_NORM:
+            # No mean subtraction upstream, so the d(mean)/dx term (c2) that
+            # LayerNorm carries does not exist.
+            dx += (wdy - xhat * c1) * rstd
+        else:
+            c2 = tl.sum(wdy, axis=0) * inv_D
+            dx += (wdy - (xhat * c1 + c2)) * rstd
         # Write dx
         tl.store(DX + cols, dx, mask=mask)
 
         # Accumulate partial sums for dw/db
         partial_dw += dy * xhat
-        partial_db += dy
+        if not IS_RMS_NORM:
+            partial_db += dy
         X += tile_num_i64 * stride_x
         U += tile_num_i64 * stride_u
         DY += tile_num_i64 * stride_dy
@@ -709,7 +748,8 @@ def _ln_mul_dropout_bwd_dx_du_rng(
         RANDOM_MASK += tile_num_i64 * stride_mask
         row += tile_num
     tl.store(DW, partial_dw, mask=mask)
-    tl.store(DB, partial_db, mask=mask)
+    if not IS_RMS_NORM:
+        tl.store(DB, partial_db, mask=mask)
 
 
 @triton.jit
@@ -745,6 +785,7 @@ def _ln_mul_dropout_bwd_dx_du(
     MUL_U_ACTIVATION_TYPE: tl.constexpr,
     COMPUTE_Y: tl.constexpr,
     FAST_DROPOUT: tl.constexpr,
+    IS_RMS_NORM: tl.constexpr = False,  # pyre-ignore [9]
 ):
     pid = tl.program_id(0)
     tile_num = tl.num_programs(0)
@@ -772,7 +813,9 @@ def _ln_mul_dropout_bwd_dx_du(
     partial_dw = tl.zeros((BLOCK_D,), dtype=tl.float32)
     partial_db = tl.zeros((BLOCK_D,), dtype=tl.float32)
     w = tl.load(W + cols, mask=mask).to(tl.float32)
-    b = tl.load(B + cols, mask=mask).to(tl.float32)
+    if not IS_RMS_NORM:
+        # RMSNorm has no bias term; B is unread on that path.
+        b = tl.load(B + cols, mask=mask).to(tl.float32)
     for _idx in range(0, rows_per_tile):
         # Load data to SRAM
         x = tl.load(X + cols, mask=mask, other=0).to(tl.float32)
@@ -844,13 +887,19 @@ def _ln_mul_dropout_bwd_dx_du(
                 # write-back
                 dy = tl.where(dy_keep, dy / (1.0 - dropout_ratio), 0.0)
 
-        mean = tl.load(Mean + row)
         rstd = tl.load(Rstd + row)
 
         # Compute dx
-        xhat = (x - mean) * rstd
+        if IS_RMS_NORM:
+            xhat = x * rstd
+        else:
+            mean = tl.load(Mean + row)
+            xhat = (x - mean) * rstd
         u = tl.load(U + cols, mask=mask, other=0).to(tl.float32)
-        ln = xhat * w + b
+        if IS_RMS_NORM:
+            ln = xhat * w
+        else:
+            ln = xhat * w + b  # pyre-ignore [61]
         du_y = dy * ln
         mul_u = u
         sig_u = tl.sigmoid(u)
@@ -913,14 +962,20 @@ def _ln_mul_dropout_bwd_dx_du(
         xhat = tl.where(mask, xhat, 0.0)
         wdy = tl.where(mask, wdy, 0.0)
         c1 = tl.sum(xhat * wdy, axis=0) / D
-        c2 = tl.sum(wdy, axis=0) / D
-        dx += (wdy - (xhat * c1 + c2)) * rstd
+        if IS_RMS_NORM:
+            # No mean subtraction upstream, so the d(mean)/dx term (c2) that
+            # LayerNorm carries does not exist.
+            dx += (wdy - xhat * c1) * rstd
+        else:
+            c2 = tl.sum(wdy, axis=0) / D
+            dx += (wdy - (xhat * c1 + c2)) * rstd
         # Write dx
         tl.store(DX + cols, dx, mask=mask)
 
         # Accumulate partial sums for dw/db
         partial_dw += dy * xhat
-        partial_db += dy
+        if not IS_RMS_NORM:
+            partial_db += dy
         X += tile_num.to(tl.int64) * stride_x
         U += tile_num.to(tl.int64) * stride_u
         DY += tile_num.to(tl.int64) * stride_dy
@@ -928,7 +983,8 @@ def _ln_mul_dropout_bwd_dx_du(
         DU += tile_num.to(tl.int64) * stride_du
         row += tile_num
     tl.store(DW, partial_dw, mask=mask)
-    tl.store(DB, partial_db, mask=mask)
+    if not IS_RMS_NORM:
+        tl.store(DB, partial_db, mask=mask)
 
 
 def _get_bwd_dwdb_configs() -> List[triton.Config]:
@@ -946,7 +1002,10 @@ def _get_bwd_dwdb_configs() -> List[triton.Config]:
 
 @triton_autotune(
     configs=_get_bwd_dwdb_configs(),
-    key=["D"],
+    # See _ln_mul_dropout_fwd_rng: constexprs are not part of the cache key.
+    # The RMSNorm variant reads and reduces only DW, not DB, so its best
+    # BLOCK_N/num_warps need not match the LayerNorm one.
+    key=["D", "IS_RMS_NORM"],
 )
 @triton.jit
 def _ln_mul_dropout_bwd_dwdb(
@@ -958,6 +1017,7 @@ def _ln_mul_dropout_bwd_dwdb(
     D,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    IS_RMS_NORM: tl.constexpr = False,  # pyre-ignore [9]
 ):
     pid = tl.program_id(0).to(tl.int64)
     cols = pid * BLOCK_D + tl.arange(0, BLOCK_D)
@@ -970,12 +1030,15 @@ def _ln_mul_dropout_bwd_dwdb(
         mask = (rows[:, None] < N) & (cols[None, :] < D)
         offs = rows[:, None] * D + cols[None, :]
         dw += tl.load(DW + offs, mask=mask, other=0.0)
-        db += tl.load(DB + offs, mask=mask, other=0.0)
+        if not IS_RMS_NORM:
+            db += tl.load(DB + offs, mask=mask, other=0.0)
 
     sum_dw = tl.sum(dw, axis=0)
-    sum_db = tl.sum(db, axis=0)
     tl.store(FINAL_DW + cols, sum_dw.to(FINAL_DW.dtype.element_ty), mask=cols < D)
-    tl.store(FINAL_DB + cols, sum_db.to(FINAL_DB.dtype.element_ty), mask=cols < D)
+    if not IS_RMS_NORM:
+        # RMSNorm has no bias, so the partial DB buffer was never written.
+        sum_db = tl.sum(db, axis=0)
+        tl.store(FINAL_DB + cols, sum_db.to(FINAL_DB.dtype.element_ty), mask=cols < D)
 
 
 def _create_dropout_mask(
@@ -1037,6 +1100,7 @@ def _triton_layer_norm_mul_dropout_fwd_impl(
     concat_x: bool,
     mul_u_activation_type: str,
     seed: int,
+    use_rms_norm: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal implementation that returns only tensors for custom_op compatibility.
 
@@ -1107,6 +1171,7 @@ def _triton_layer_norm_mul_dropout_fwd_impl(
             CONCAT_U=concat_u,
             CONCAT_X=concat_x,
             MUL_U_ACTIVATION_TYPE=mul_u_activation_type,
+            IS_RMS_NORM=use_rms_norm,
         )
 
     else:
@@ -1142,6 +1207,8 @@ def _triton_layer_norm_mul_dropout_fwd_impl(
             MUL_U_ACTIVATION_TYPE=mul_u_activation_type,
             # pyrefly: ignore [bad-argument-type]
             FAST_DROPOUT=COMPUTE_OUTPUT_LN_FAST_DROPOUT,
+            # pyrefly: ignore [bad-argument-type]
+            IS_RMS_NORM=use_rms_norm,
             # pyrefly: ignore [unexpected-keyword]
             num_warps=num_warps,
         )
@@ -1162,6 +1229,7 @@ def _triton_layer_norm_mul_dropout_fwd_impl_fake(
     concat_x: bool,
     mul_u_activation_type: str,
     seed: int,
+    use_rms_norm: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fake implementation for FakeTensor tracing."""
     N, D = x.shape
@@ -1195,6 +1263,7 @@ def triton_layer_norm_mul_dropout_fwd(
     concat_x: bool = False,
     mul_u_activation_type: str = "none",
     seed: Optional[int] = None,
+    use_rms_norm: bool = False,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, int, int, int, Optional[torch.Tensor]
 ]:  # y, mean, rstd, BLOCK_D, num_warps, seed, random_mask
@@ -1271,6 +1340,7 @@ def triton_layer_norm_mul_dropout_fwd(
         concat_x,
         mul_u_activation_type,
         seed if seed is not None else 0,
+        use_rms_norm,
     )
 
     # Convert empty tensor back to None
@@ -1304,6 +1374,7 @@ def _triton_layer_norm_mul_dropout_bwd_impl(
     mul_u_activation_type: str,
     compute_y: bool,
     random_mask: torch.Tensor,
+    use_rms_norm: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Internal implementation that returns only tensors for custom_op compatibility.
 
@@ -1339,6 +1410,11 @@ def _triton_layer_norm_mul_dropout_bwd_impl(
     _dbias = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
     dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
     dbias = torch.empty((D,), dtype=weight.dtype, device=x.device)
+    if use_rms_norm:
+        # RMSNorm has no bias. The kernels below skip every DB read and write,
+        # so zero the output here rather than returning uninitialized memory;
+        # the caller returns None for the bias grad.
+        dbias.zero_()
 
     # Use separated RNG when random_mask is provided (from forward pass on SM100+ path)
     has_random_mask = random_mask.numel() > 0
@@ -1383,6 +1459,8 @@ def _triton_layer_norm_mul_dropout_bwd_impl(
             MUL_U_ACTIVATION_TYPE=mul_u_activation_type,
             # pyrefly: ignore [bad-argument-type]
             COMPUTE_Y=compute_y,
+            # pyrefly: ignore [bad-argument-type]
+            IS_RMS_NORM=use_rms_norm,
             # pyrefly: ignore [unexpected-keyword]
             num_warps=num_warps,
         )
@@ -1429,6 +1507,8 @@ def _triton_layer_norm_mul_dropout_bwd_impl(
             COMPUTE_Y=compute_y,
             # pyrefly: ignore [bad-argument-type]
             FAST_DROPOUT=COMPUTE_OUTPUT_LN_FAST_DROPOUT,
+            # pyrefly: ignore [bad-argument-type]
+            IS_RMS_NORM=use_rms_norm,
             # pyrefly: ignore [unexpected-keyword]
             num_warps=num_warps,
         )
@@ -1447,6 +1527,7 @@ def _triton_layer_norm_mul_dropout_bwd_impl(
         tile_num,
         D,
         BLOCK_D=BLOCK_D_bwd,
+        IS_RMS_NORM=use_rms_norm,
     )
     return dx, du, dweight, dbias, y
 
@@ -1472,6 +1553,7 @@ def _triton_layer_norm_mul_dropout_bwd_impl_fake(
     mul_u_activation_type: str,
     compute_y: bool,
     random_mask: torch.Tensor,
+    use_rms_norm: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fake implementation for FakeTensor tracing."""
     N, D = x.shape
@@ -1513,6 +1595,7 @@ def triton_layer_norm_mul_dropout_bwd(
     mul_u_activation_type: str = "none",
     compute_y: bool = False,
     random_mask: Optional[torch.Tensor] = None,
+    use_rms_norm: bool = False,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]
 ]:
@@ -1545,6 +1628,7 @@ def triton_layer_norm_mul_dropout_bwd(
         mul_u_activation_type,
         compute_y,
         random_mask_tensor,
+        use_rms_norm,
     )
 
     # Convert empty tensor back to None
@@ -1567,6 +1651,7 @@ class LayerNormMulDropoutFunction(torch.autograd.Function):
         silu_u: bool = False,
         concat_ux: bool = False,
         seed: Optional[int] = None,
+        use_rms_norm: bool = False,
     ) -> torch.Tensor:
         if dropout_ratio == 0.0:
             # skip dropout computation if dropout ratio is 0
@@ -1590,6 +1675,7 @@ class LayerNormMulDropoutFunction(torch.autograd.Function):
                 concat_u=concat_u,
                 concat_x=concat_x,
                 seed=seed,
+                use_rms_norm=use_rms_norm,
             )
         )
 
@@ -1611,6 +1697,7 @@ class LayerNormMulDropoutFunction(torch.autograd.Function):
         ctx.concat_ux = concat_ux
         ctx.silu_u = silu_u
         ctx.dropout_ratio = dropout_ratio
+        ctx.use_rms_norm = use_rms_norm
         return y
 
     @staticmethod
@@ -1621,7 +1708,8 @@ class LayerNormMulDropoutFunction(torch.autograd.Function):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
-        torch.Tensor,
+        torch.Tensor,  # dbias (all-zero on the RMSNorm path)
+        None,
         None,
         None,
         None,
@@ -1655,8 +1743,9 @@ class LayerNormMulDropoutFunction(torch.autograd.Function):
             concat_x=ctx.concat_ux,
             compute_y=False,
             random_mask=random_mask,  # Pass saved mask to backward
+            use_rms_norm=ctx.use_rms_norm,
         )
-        return dx, du, dweight, dbias, None, None, None, None, None, None
+        return dx, du, dweight, dbias, None, None, None, None, None, None, None
 
 
 @triton.jit
@@ -2269,11 +2358,13 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
         linear_dim: int = -1,
         seed: Optional[int] = None,
         recompute_y_in_backward: bool = False,
+        use_rms_norm: bool = False,
     ) -> torch.Tensor:
         if dropout_ratio == 0.0:
             training = False
 
         if group_norm:
+            assert not use_rms_norm, "use_rms_norm is incompatible with group_norm"
             y, mean, rstd, BLOCK_D, BLOCK_H, num_warps, seed = (
                 triton_group_norm_mul_dropout_fwd(
                     x=attn,
@@ -2306,6 +2397,7 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
                     concat_u=concat_u,
                     concat_x=concat_x,
                     seed=seed,
+                    use_rms_norm=use_rms_norm,
                 )
             )
 
@@ -2336,6 +2428,7 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
         ctx.recompute_y_in_backward = recompute_y_in_backward
         ctx.silu_u = silu_u
         ctx.mul_u_activation_type = mul_u_activation_type
+        ctx.use_rms_norm = use_rms_norm
         return out
 
     @staticmethod
@@ -2347,7 +2440,7 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
         torch.Tensor,  # du
         torch.Tensor,  # dx
         torch.Tensor,  # d_norm_weight
-        torch.Tensor,  # d_norm_bias
+        Optional[torch.Tensor],  # d_norm_bias (None on the RMSNorm path)
         torch.Tensor,  # d_output_weight
         None,  # eps
         None,  # dropout_ratio
@@ -2361,6 +2454,7 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
         None,  # linear_dim
         None,  # seed
         None,  # recompute_y_in_backward
+        None,  # use_rms_norm
     ]:
         attn, u, norm_weight, norm_bias, mean, rstd, output_weight = ctx.saved_tensors[
             :7
@@ -2424,8 +2518,13 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
                     mul_u_activation_type=ctx.mul_u_activation_type,
                     compute_y=ctx.recompute_y_in_backward,
                     random_mask=random_mask,
+                    use_rms_norm=ctx.use_rms_norm,
                 )
             )
+            if ctx.use_rms_norm:
+                # RMSNorm has no bias. norm_bias is a non-persistent zero
+                # buffer with requires_grad=False on this path.
+                d_norm_bias = None
         if not ctx.recompute_y_in_backward:
             y = saved_y
         # pyrefly: ignore [missing-attribute]
@@ -2449,6 +2548,7 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
             None,  # linear_dim
             None,  # seed
             None,  # recompute_y_in_backward
+            None,  # use_rms_norm
         )
 
 
@@ -3029,8 +3129,10 @@ def triton_norm_mul_dropout(
     num_heads: int = 1,
     linear_dim: int = -1,
     seed: Optional[int] = None,
+    use_rms_norm: bool = False,
 ) -> torch.Tensor:
     if group_norm:
+        assert not use_rms_norm, "use_rms_norm is incompatible with group_norm"
         return GroupNormMulDropoutFunction.apply(
             x,
             u,
@@ -3057,6 +3159,7 @@ def triton_norm_mul_dropout(
             silu_u,
             concat_u and concat_x,
             seed,
+            use_rms_norm,
         )
 
 
@@ -3081,6 +3184,7 @@ def triton_hstu_compute_output(
     linear_dim: int = -1,
     seed: Optional[int] = None,
     recompute_y_in_backward: bool = False,
+    use_rms_norm: bool = False,
 ) -> torch.Tensor:
     return HSTUComputeOutputFunction.apply(
         attn,
@@ -3101,4 +3205,5 @@ def triton_hstu_compute_output(
         linear_dim,
         seed,
         recompute_y_in_backward,
+        use_rms_norm,
     )

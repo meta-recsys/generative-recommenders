@@ -35,11 +35,13 @@ def pytorch_norm_mul_dropout(
     group_norm: bool = False,
     num_heads: int = 1,
     linear_dim: int = -1,
+    use_rms_norm: bool = False,
 ) -> torch.Tensor:
     dtype = x.dtype
     x = x.to(torch.float32)
     u = u.to(torch.float32)
     if group_norm:
+        assert not use_rms_norm, "use_rms_norm is incompatible with group_norm"
         if silu_u:
             u = F.silu(u)
             u = u.to(torch.float32)
@@ -58,13 +60,24 @@ def pytorch_norm_mul_dropout(
             mul_u = torch.sigmoid(u)
         elif mul_u_activation_type == "silu":
             mul_u = F.silu(u)
-        y = mul_u * F.layer_norm(
-            x,
-            normalized_shape=(x.shape[-1],),
-            weight=weight.to(torch.float32),
-            bias=bias.to(torch.float32),
-            eps=eps,
-        )
+        if use_rms_norm:
+            # RMSNorm subtracts no mean and has no bias term, so `bias` is
+            # left entirely unread on this path.
+            normed = F.rms_norm(
+                x,
+                normalized_shape=(x.shape[-1],),
+                weight=weight.to(torch.float32),
+                eps=eps,
+            )
+        else:
+            normed = F.layer_norm(
+                x,
+                normalized_shape=(x.shape[-1],),
+                weight=weight.to(torch.float32),
+                bias=bias.to(torch.float32),
+                eps=eps,
+            )
+        y = mul_u * normed
         if concat_u:
             if silu_u:
                 u = F.silu(u)
