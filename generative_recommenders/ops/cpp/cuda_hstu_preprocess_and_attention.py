@@ -406,6 +406,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         else:
             normed_x = saved_tensors[idx]
             idx += 1
+        assert normed_x is not None
         if ctx.skip_u:
             if ctx.recompute_uvqk_in_backward:
                 if ctx.has_uvqk_bias:
