@@ -56,7 +56,8 @@ template <
     bool V_colmajor,
     bool Cross,
     bool Softmax,
-    bool Training>
+    bool Training,
+    bool LargeBlockM>
 void run_flash_fwd(hstu::Flash_fwd_params& params, cudaStream_t stream) {
   static_assert(
       !(Causal && Local),
@@ -77,7 +78,8 @@ void run_flash_fwd(hstu::Flash_fwd_params& params, cudaStream_t stream) {
           sizeof(Element) /*element_size*/,
           V_colmajor,
           Cross,
-          Training);
+          Training,
+          LargeBlockM);
   static constexpr std::tuple<int, int, int, int, bool>
       kBlockMN_kNWarps_Stages_RS = hstu::tile_size_fwd_sm8x(
           Arch == 86 || Arch == 89,
@@ -313,46 +315,67 @@ template <
     typename T_out>
 void run_mha_fwd_dispatch(hstu::Flash_fwd_params& params, cudaStream_t stream) {
   static constexpr bool V_colmajor = false; // V_colmajor_ && sizeof(T) == 1;
+  // The large-blockM override is an inference-only lever for the 16-bit
+  // cross-attention path, so only that combination pays for the extra kernel.
+  // The conditions have to gate template *instantiation* via `if constexpr`,
+  // not just a runtime branch: BOOL_SWITCH emits its true-branch body even when
+  // the condition folds to a compile-time false, so a plain `&& SixteenBit`
+  // would still emit a second sm90a kernel in every TU. The widest ones (FP8,
+  // kBlockM 192 -> 3 MMA warpgroups) then segfault ptxas.
+  static constexpr bool SixteenBit = sizeof(T) == 2;
   BOOL_SWITCH(params.num_targets, Has_targets, [&] {
     BOOL_SWITCH(params.seq_offsets, Jagged, [&] {
       BOOL_SWITCH(params.seq_offsets_q, Cross, [&] {
         BOOL_SWITCH(params.has_contexual_mask, Contexual_mask, [&] {
           BOOL_SWITCH(params.training, Training, [&] {
+            auto dispatch_variant = [&]<bool LargeBlockM>() {
 #ifdef HSTU_FLASH_ATTN_DEBUG_INFO
-            std::printf(
-                "[flash_fwd_launch_template] Local: (%d), Jagged: (%d), Has_targets: (%d), Causal: (%d), max_kv_len: (%d), kHeadDim: (%d)\n",
-                Local,
-                Jagged,
-                Has_targets,
-                Causal,
-                params.max_kv_len,
-                kHeadDim);
+              std::printf(
+                  "[flash_fwd_launch_template] Local: (%d), Jagged: (%d), Has_targets: (%d), Causal: (%d), max_kv_len: (%d), kHeadDim: (%d), LargeBlockM: (%d)\n",
+                  Local,
+                  Jagged,
+                  Has_targets,
+                  Causal,
+                  params.max_kv_len,
+                  kHeadDim,
+                  LargeBlockM);
 #endif
-            // static constexpr bool Enable_cluster = Arch >= 90 &&
-            //     (sizeof(T) == 2 ? (kHeadDim >= 128) : (kHeadDim == 192)) &&
-            //     !Causal && !Local && !Jagged;
-            // static constexpr bool Enable_cluster = false;
-            // CLUSTER_SWITCH(
-            //     cutlass::ceil_div(params.max_q_len, kBlockM) % 2 == 0,
-            //     Use_cluster,
-            //     [&] {
-            // static constexpr int ClusterM =
-            //     Enable_cluster && Use_cluster ? 2 : 1;
-            run_flash_fwd<
-                Arch,
-                kHeadDim,
-                1, // ClusterM,
-                T,
-                T_out,
-                Causal,
-                Local,
-                Contexual_mask,
-                Jagged,
-                Has_targets,
-                V_colmajor,
-                Cross,
-                Softmax,
-                Training>(params, stream);
+              // static constexpr bool Enable_cluster = Arch >= 90 &&
+              //     (sizeof(T) == 2 ? (kHeadDim >= 128) : (kHeadDim == 192)) &&
+              //     !Causal && !Local && !Jagged;
+              // static constexpr bool Enable_cluster = false;
+              // CLUSTER_SWITCH(
+              //     cutlass::ceil_div(params.max_q_len, kBlockM) % 2 == 0,
+              //     Use_cluster,
+              //     [&] {
+              // static constexpr int ClusterM =
+              //     Enable_cluster && Use_cluster ? 2 : 1;
+              run_flash_fwd<
+                  Arch,
+                  kHeadDim,
+                  1, // ClusterM,
+                  T,
+                  T_out,
+                  Causal,
+                  Local,
+                  Contexual_mask,
+                  Jagged,
+                  Has_targets,
+                  V_colmajor,
+                  Cross,
+                  Softmax,
+                  Training,
+                  LargeBlockM>(params, stream);
+            };
+            // small_blockm only fires for Cross && !Training, so that is the
+            // only place LargeBlockM can change anything.
+            if constexpr (SixteenBit && Cross && !Training) {
+              BOOL_SWITCH(params.large_blockm_fwd, LargeBlockM, [&] {
+                dispatch_variant.template operator()<LargeBlockM>();
+              });
+            } else {
+              dispatch_variant.template operator()<false>();
+            }
           });
         });
       });

@@ -20,9 +20,19 @@
 
 #pragma once
 
+#include <cstdint>
 #include <tuple>
 
 namespace hstu {
+
+// Tri-state driving the force_large_blockm argument of tile_size_fwd_sm90 for
+// the inference cross-attention path. Auto lets the wave-count guard pick (see
+// large_blockm_fills_gpu in flash_common.cpp); the other two pin a tile height
+// regardless of shape, which is what an A/B harness needs in order to measure
+// both arms in one process.
+constexpr int64_t kLargeBlockMAuto = -1;
+constexpr int64_t kLargeBlockMOff = 0;
+constexpr int64_t kLargeBlockMOn = 1;
 
 constexpr int kBlockM_bwd(
     const int arch,
@@ -138,10 +148,16 @@ constexpr std::tuple<int, int, bool> tile_size_fwd_sm90(
     int element_size = 2,
     bool v_colmajor = false,
     bool Cross = false,
-    bool Training = true) {
+    bool Training = true,
+    bool force_large_blockm = false) {
   // for cross attention, q is usually much smaller than k/v, so we reduce the
-  // BlockM size to increase parallelism
-  bool small_blockm = Cross && (!Training);
+  // BlockM size to increase parallelism.
+  // The small tile costs throughput though: kBlockM 64 makes AtomLayoutM
+  // kBlockM/64 == 1, i.e. one MMA warpgroup and no softmax/GEMM ping-pong (see
+  // UseSchedulerBarrier, which needs NumMmaWarpGroups >= 2). force_large_blockm
+  // opts back out for inference shapes whose q is long enough to fill the GPU
+  // anyway.
+  bool small_blockm = Cross && (!Training) && (!force_large_blockm);
   if (element_size == 2) {
     if (headdim <= 64) {
       return {small_blockm ? 64 : 192, 128, true};

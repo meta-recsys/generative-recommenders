@@ -53,7 +53,8 @@ at::Tensor hstu_mha_cpu(
     const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
         std::nullopt,
     int64_t num_groups = 1,
-    [[maybe_unused]] bool use_bf16_dq_accum = false) {
+    [[maybe_unused]] bool use_bf16_dq_accum = false,
+    int64_t large_blockm_fwd = kLargeBlockMAuto) {
   auto fwd_out = hstu::hstu_mha_fwd_dummy(
       max_seq_len,
       alpha,
@@ -74,7 +75,13 @@ at::Tensor hstu_mha_cpu(
       max_q_len,
       seq_offsets_q,
       num_softmax_heads,
-      training);
+      training,
+      max_seq_len_tensor,
+      contextual_seq_len_tensor,
+      max_attn_len_tensor,
+      min_full_attn_seq_len_tensor,
+      num_groups,
+      large_blockm_fwd);
   return get<0>(fwd_out);
 }
 
@@ -107,7 +114,8 @@ at::Tensor hstu_mha_meta(
     const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
         std::nullopt,
     int64_t num_groups = 1,
-    [[maybe_unused]] bool use_bf16_dq_accum = false) {
+    [[maybe_unused]] bool use_bf16_dq_accum = false,
+    int64_t large_blockm_fwd = kLargeBlockMAuto) {
   auto fwd_out = hstu::hstu_mha_fwd_meta(
       max_seq_len,
       alpha,
@@ -128,7 +136,13 @@ at::Tensor hstu_mha_meta(
       max_q_len,
       seq_offsets_q,
       num_softmax_heads,
-      training);
+      training,
+      max_seq_len_tensor,
+      contextual_seq_len_tensor,
+      max_attn_len_tensor,
+      min_full_attn_seq_len_tensor,
+      num_groups,
+      large_blockm_fwd);
   return get<0>(fwd_out);
 }
 
@@ -165,7 +179,8 @@ TORCH_LIBRARY_FRAGMENT(hstu, m) {
       "Tensor? contextual_seq_len_tensor = None,"
       "Tensor? max_attn_len_tensor = None,"
       "Tensor? min_full_attn_seq_len_tensor = None,"
-      "int num_groups = 1"
+      "int num_groups = 1,"
+      "int large_blockm_fwd = -1"
       ") -> (Tensor, Tensor?)");
 
   m.def(
@@ -231,7 +246,8 @@ TORCH_LIBRARY_FRAGMENT(hstu, m) {
       "Tensor? max_attn_len_tensor = None,"
       "Tensor? min_full_attn_seq_len_tensor = None,"
       "int num_groups = 1,"
-      "bool use_bf16_dq_accum = False"
+      "bool use_bf16_dq_accum = False,"
+      "int large_blockm_fwd = -1"
       ") -> Tensor");
 
   // Register CPU implementations

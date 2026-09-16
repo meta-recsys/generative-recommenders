@@ -28,6 +28,8 @@
 
 #include <torch/library.h> // @manual
 
+#include "tile_size.h" // for kLargeBlockM*
+
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")
 #define CHECK_SHAPE(x, ...)                           \
   TORCH_CHECK(                                        \
@@ -112,7 +114,8 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd(
     const std::optional<at::Tensor>& max_attn_len_tensor = std::nullopt,
     const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
         std::nullopt,
-    int64_t num_groups = 1);
+    int64_t num_groups = 1,
+    int64_t large_blockm_fwd = kLargeBlockMAuto);
 
 std::vector<at::Tensor> hstu_mha_bwd(
     int64_t max_seq_len,

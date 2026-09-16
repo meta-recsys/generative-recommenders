@@ -102,6 +102,9 @@ struct Flash_fwd_params : public Qkv_params {
   bool has_contexual_mask;
   bool scalar_scale;
   bool training;
+  // Inference-only: skip the cross-attention small-kBlockM heuristic and use
+  // the training tile height, which gives two MMA warpgroups and ping-pong.
+  bool large_blockm_fwd;
 
   int* __restrict__ tile_count_semaphore;
 
