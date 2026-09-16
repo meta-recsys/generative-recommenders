@@ -35,6 +35,14 @@ except:
     pass
 
 
+# Tile height for the cross-attention inference fwd kernel. Mirrors
+# kLargeBlockM* in hstu_attention/tile_size.h; AUTO defers to the wave-count
+# guard in flash_common.cpp, the other two pin a tile height.
+LARGE_BLOCKM_AUTO: int = -1
+LARGE_BLOCKM_OFF: int = 0
+LARGE_BLOCKM_ON: int = 1
+
+
 def cuda_hstu_mha(
     max_seq_len: int,
     alpha: float,
@@ -65,10 +73,19 @@ def cuda_hstu_mha(
     num_groups: int = 1,
     is_inference: bool = False,
     use_bf16_dq_accum: bool = False,
+    large_blockm_fwd: int = LARGE_BLOCKM_AUTO,
 ) -> torch.Tensor:
     """
     Arguments:
         q, k, v: (batch_size, seqlen, nheads, headdim) or (total_seqlen, nheads, headdim)
+        large_blockm_fwd: tile height for the cross-attention inference fwd
+            kernel, as one of LARGE_BLOCKM_AUTO / _ON / _OFF. _ON uses the
+            training tile height (128 rows at head_dim 128 instead of 64),
+            which gives two MMA warpgroups and softmax/GEMM ping-pong; that is
+            ~1.45x on shapes with enough query rows to fill the GPU but a slight
+            loss below one wave, so _AUTO decides from the wave count (see
+            large_blockm_fills_gpu in flash_common.cpp). Only honored when
+            training=False, cross-attention, sm90+, and q/k/v are 16-bit.
     """
     if is_sm100_plus() and not is_inference:
         return torch.ops.bw_hstu.bw_hstu_mha(
@@ -129,6 +146,7 @@ def cuda_hstu_mha(
             min_full_attn_seq_len_tensor,
             num_groups,
             use_bf16_dq_accum,
+            large_blockm_fwd,
         )
 
 
@@ -162,6 +180,7 @@ def cuda_hstu_mha_inference_wrapper(
     min_full_attn_seq_len_tensor: Optional[torch.Tensor] = None,
     num_groups: int = 1,
     use_bf16_dq_accum: bool = False,
+    large_blockm_fwd: int = LARGE_BLOCKM_AUTO,
 ) -> torch.Tensor:
     attn_scale = attn_scale.to(torch.float32) if attn_scale is not None else attn_scale
 
@@ -194,4 +213,5 @@ def cuda_hstu_mha_inference_wrapper(
         min_full_attn_seq_len_tensor,
         num_groups,
         use_bf16_dq_accum,
+        large_blockm_fwd,
     )

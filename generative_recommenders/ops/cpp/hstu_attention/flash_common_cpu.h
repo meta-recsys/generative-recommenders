@@ -22,6 +22,8 @@
 #include <torch/library.h> // @manual
 #include <torch/nn/functional.h>
 
+#include "tile_size.h" // for kLargeBlockM*
+
 namespace hstu {
 
 std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd_dummy(
@@ -50,7 +52,8 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd_dummy(
     const std::optional<at::Tensor>& max_attn_len_tensor = std::nullopt,
     const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
         std::nullopt,
-    int64_t num_groups = 1);
+    int64_t num_groups = 1,
+    int64_t large_blockm_fwd = kLargeBlockMAuto);
 
 std::vector<at::Tensor> hstu_mha_bwd_dummy(
     const at::SymInt max_seq_len,
@@ -111,5 +114,6 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd_meta(
     const std::optional<at::Tensor>& max_attn_len_tensor = std::nullopt,
     const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
         std::nullopt,
-    int64_t num_groups = 1);
+    int64_t num_groups = 1,
+    int64_t large_blockm_fwd = kLargeBlockMAuto);
 } // namespace hstu
