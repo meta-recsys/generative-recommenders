@@ -24,10 +24,7 @@ from generative_recommenders.ops.triton.triton_addmm import (
     triton_addmm_bwd,
 )
 from generative_recommenders.ops.triton.triton_layer_norm import (
-    compute_BLOCK_D,
     triton_weighted_layer_norm_bwd,
-    triton_weighted_rms_norm_bwd,
-    triton_weighted_rms_norm_fwd,
 )
 from generative_recommenders.ops.utils import copy_if_different_ptr, is_sm100_plus
 from torch.nn import functional as F
@@ -91,34 +88,18 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         num_softmax_heads: int = 0,
         skip_u: bool = False,
         use_bf16_dq_accum: bool = False,
-        use_rms_norm: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         max_attn_len = max_attn_len or 0
         full_attn_size = full_attn_size or 0
-        if use_rms_norm:
-            assert not fp8_in_addmm_fwd, (
-                "use_rms_norm is incompatible with fp8_addmm_fwd"
-            )
-            normed_x, x_rstd = triton_weighted_rms_norm_fwd(
+        normed_x, x_mean, x_rstd, BLOCK_D, x_scale, normed_x_fp8 = (
+            triton_weighted_layer_norm_quantization_fwd(
                 x=x,
                 weight=norm_weight,
+                bias=norm_bias,
                 eps=norm_eps,
+                quantize_output=fp8_in_addmm_fwd,
             )
-            # RMSNorm has no mean. Keep the saved-tensor slot so the backward
-            # unpacking order is shared with the LayerNorm path.
-            x_mean = torch.empty(0, dtype=torch.float32, device=x.device)
-            BLOCK_D = compute_BLOCK_D(x)
-            x_scale, normed_x_fp8 = None, None
-        else:
-            normed_x, x_mean, x_rstd, BLOCK_D, x_scale, normed_x_fp8 = (
-                triton_weighted_layer_norm_quantization_fwd(
-                    x=x,
-                    weight=norm_weight,
-                    bias=norm_bias,
-                    eps=norm_eps,
-                    quantize_output=fp8_in_addmm_fwd,
-                )
-            )
+        )
         # When silu_u is False and we want to recompute in backward, we split the weight
         # for u and vqk separately during training to compute them independently.
         # This avoids needing to clone u (which would otherwise keep the whole uvqk alive).
@@ -356,7 +337,6 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         ctx.fp8_in_addmm_fwd = fp8_in_addmm_fwd
         ctx.num_softmax_heads = num_softmax_heads
         ctx.use_bf16_dq_accum = use_bf16_dq_accum
-        ctx.use_rms_norm = use_rms_norm
         # pyrefly: ignore [bad-return]
         return u, out
 
@@ -376,25 +356,22 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         None,
         torch.Tensor,  # d_uvqk_weight
         torch.Tensor,  # d_uvqk_bias
-        None,  # max_seq_len
-        None,  # seq_offsets
-        None,  # alpha
-        None,  # invalid_attn_mask_type
-        None,  # num_targets
-        None,  # rotary_weights
-        None,  # attn_scale
-        None,  # recompute_uvqk_in_backward
-        None,  # recompute_normed_x_in_backward
-        None,  # contextual_seq_len
-        None,  # sort_by_length
-        None,  # max_attn_len
-        None,  # full_attn_size
-        None,  # silu_u
-        None,  # fp8_in_addmm_fwd
-        None,  # num_softmax_heads
-        None,  # skip_u
-        None,  # use_bf16_dq_accum
-        None,  # use_rms_norm
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     ]:
         saved_tensors = ctx.saved_tensors
         x, norm_weight, norm_bias, x_mean, x_rstd, uvqk_weight, seq_offsets, out = (
@@ -417,25 +394,15 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         else:
             attn_scale = None
         if ctx.recompute_normed_x_in_backward:
-            if ctx.use_rms_norm:
-                # No rstd reuse: see triton_weighted_rms_norm_fwd. The
-                # recomputed rstd is discarded; the saved x_rstd is what the
-                # backward below uses.
-                normed_x, _ = triton_weighted_rms_norm_fwd(
-                    x=x,
-                    weight=norm_weight,
-                    eps=ctx.norm_eps,
-                )
-            else:
-                normed_x, _, _, _, _, _ = triton_weighted_layer_norm_quantization_fwd(
-                    x=x,
-                    weight=norm_weight,
-                    bias=norm_bias,
-                    eps=ctx.norm_eps,
-                    mean=x_mean,
-                    rstd=x_rstd,
-                    quantize_output=ctx.fp8_in_addmm_fwd,
-                )
+            normed_x, _, _, _, _, _ = triton_weighted_layer_norm_quantization_fwd(
+                x=x,
+                weight=norm_weight,
+                bias=norm_bias,
+                eps=ctx.norm_eps,
+                mean=x_mean,
+                rstd=x_rstd,
+                quantize_output=ctx.fp8_in_addmm_fwd,
+            )
         else:
             normed_x = saved_tensors[idx]
             idx += 1
@@ -749,30 +716,17 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             dz=duvqk,
             is_y_1d=ctx.uvqk_bias_1d and ctx.has_uvqk_bias,
         )
-        if ctx.use_rms_norm:
-            # RMSNorm has no bias, so d_norm_bias is None. norm_bias is a
-            # non-persistent zero buffer with requires_grad=False on this path.
-            d_x, d_norm_weight = triton_weighted_rms_norm_bwd(
-                dy=d_normed_x,
-                x=x,
-                weight=norm_weight,
-                rstd=x_rstd,
-                eps=ctx.norm_eps,
-                BLOCK_D=ctx.norm_BLOCK_D,
-            )
-            d_norm_bias = None
-        else:
-            d_x, d_norm_weight, d_norm_bias = triton_weighted_layer_norm_bwd(
-                dy=d_normed_x,
-                x=x,
-                weight=norm_weight,
-                bias=norm_bias,
-                mean=x_mean,
-                rstd=x_rstd,
-                learnable=True,
-                eps=ctx.norm_eps,
-                BLOCK_D=ctx.norm_BLOCK_D,
-            )
+        d_x, d_norm_weight, d_norm_bias = triton_weighted_layer_norm_bwd(
+            dy=d_normed_x,
+            x=x,
+            weight=norm_weight,
+            bias=norm_bias,
+            mean=x_mean,
+            rstd=x_rstd,
+            learnable=True,
+            eps=ctx.norm_eps,
+            BLOCK_D=ctx.norm_BLOCK_D,
+        )
         # pyre-ignore[7]
         return (
             d_x,
@@ -802,5 +756,4 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             None,
             None,  # skip_u
             None,  # use_bf16_dq_accum
-            None,  # use_rms_norm
         )
