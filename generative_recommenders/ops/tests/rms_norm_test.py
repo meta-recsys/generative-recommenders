@@ -22,6 +22,11 @@ import unittest
 import torch
 from generative_recommenders.common import gpu_unavailable, HammerKernel, set_dev_mode
 from generative_recommenders.ops.layer_norm import rms_norm, RMSNorm
+from generative_recommenders.ops.triton.triton_layer_norm import (
+    triton_rms_norm,
+    triton_rms_norm_bwd,
+    triton_rms_norm_fwd,
+)
 from hammer.ops.triton.cc.utils import set_triton_cc_version
 from hypothesis import given, settings, strategies as st, Verbosity
 
@@ -231,3 +236,60 @@ class LayerNormTest(unittest.TestCase):
             ref_dw,
             opt_dw,
         )
+
+
+class RMSNormFwdBwdHelperTest(unittest.TestCase):
+    """The fused HSTU preproc Function calls triton_rms_norm_fwd/_bwd directly
+    instead of going through RMSNormFunction, so they must stay in lockstep.
+    """
+
+    @unittest.skipIf(*gpu_unavailable)
+    # pyre-ignore[56]
+    @given(
+        N=st.sampled_from([1, 37, 1024]),
+        D=st.sampled_from([16, 128, 512]),
+        dtype=st.sampled_from([torch.float32, torch.bfloat16]),
+        silu=st.booleans(),
+    )
+    @settings(
+        deadline=None,
+        verbosity=Verbosity.verbose,
+        max_examples=20,
+    )
+    def test_helpers_match_autograd_function(
+        self, N: int, D: int, dtype: torch.dtype, silu: bool
+    ) -> None:
+        set_dev_mode(True)
+        eps = 1e-6
+        x = (
+            torch.empty((N, D), dtype=dtype, device=torch.device("cuda"))
+            .normal_(0.0, 1.0)
+            .requires_grad_()
+        )
+        weight = (
+            torch.empty((D,), dtype=dtype, device=torch.device("cuda"))
+            .normal_(0.0, 0.1)
+            .requires_grad_()
+        )
+        ref_out = triton_rms_norm(x, weight, eps, silu)
+        dout = torch.randn_like(ref_out) * 0.05
+        ref_out.backward(dout)
+        # pyre-ignore[16]
+        ref_dx, x.grad = x.grad.detach().clone(), None
+        # pyre-ignore[16]
+        ref_dw, weight.grad = weight.grad.detach().clone(), None
+
+        x_d = x.detach().clone()
+        weight_d = weight.detach().clone()
+        out, rstd = triton_rms_norm_fwd(x=x_d, weight=weight_d, eps=eps, silu=silu)
+        dx, dw = triton_rms_norm_bwd(
+            dy=dout.detach().clone(),
+            x=x_d,
+            weight=weight_d,
+            rstd=rstd,
+            eps=eps,
+            silu=silu,
+        )
+        torch.testing.assert_close(ref_out, out, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(ref_dx, dx, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(ref_dw, dw, atol=0.0, rtol=0.0)
