@@ -81,7 +81,8 @@ class HSTUFlashAttentionFunctionGPU
       const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
           std::nullopt,
       int64_t num_groups = 1,
-      bool use_bf16_dq_accum = false) {
+      bool use_bf16_dq_accum = false,
+      int64_t large_blockm_fwd = kLargeBlockMAuto) {
     ctx->saved_data["max_seq_len"] = max_seq_len;
     ctx->saved_data["alpha"] = alpha;
     ctx->saved_data["causal"] = causal;
@@ -120,7 +121,8 @@ class HSTUFlashAttentionFunctionGPU
         contextual_seq_len_tensor,
         max_attn_len_tensor,
         min_full_attn_seq_len_tensor,
-        num_groups);
+        num_groups,
+        large_blockm_fwd);
     auto out = get<0>(fwd_out);
     auto softmax_lse = get<1>(fwd_out);
     ctx->save_for_backward(
@@ -247,6 +249,7 @@ class HSTUFlashAttentionFunctionGPU
         torch::autograd::Variable(), // min_full_attn_seq_len_tensor
         torch::autograd::Variable(), // num_groups
         torch::autograd::Variable(), // use_bf16_dq_accum
+        torch::autograd::Variable(), // large_blockm_fwd
     };
   }
 };
@@ -280,7 +283,8 @@ at::Tensor cuda_hstu_mha(
     const std::optional<at::Tensor>& min_full_attn_seq_len_tensor =
         std::nullopt,
     int64_t num_groups = 1,
-    bool use_bf16_dq_accum = false) {
+    bool use_bf16_dq_accum = false,
+    int64_t large_blockm_fwd = kLargeBlockMAuto) {
   return hstu::HSTUFlashAttentionFunctionGPU::apply(
       max_seq_len,
       alpha,
@@ -309,7 +313,8 @@ at::Tensor cuda_hstu_mha(
       max_attn_len_tensor,
       min_full_attn_seq_len_tensor,
       num_groups,
-      use_bf16_dq_accum);
+      use_bf16_dq_accum,
+      large_blockm_fwd);
 }
 
 TORCH_LIBRARY_FRAGMENT(hstu, m) {

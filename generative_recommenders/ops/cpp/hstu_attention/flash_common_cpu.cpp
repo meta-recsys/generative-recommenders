@@ -50,7 +50,8 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd_meta(
     const std::optional<at::Tensor>& contextual_seq_len_tensor,
     const std::optional<at::Tensor>& max_attn_len_tensor,
     const std::optional<at::Tensor>& min_full_attn_seq_len_tensor,
-    int64_t num_groups) {
+    int64_t num_groups,
+    [[maybe_unused]] int64_t large_blockm_fwd) {
   auto q_type = q.scalar_type();
   auto const sizes = q.sym_sizes();
   at::Tensor seq_offsets_;
@@ -105,7 +106,8 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd_dummy(
     const std::optional<at::Tensor>& contextual_seq_len_tensor,
     const std::optional<at::Tensor>& max_attn_len_tensor,
     const std::optional<at::Tensor>& min_full_attn_seq_len_tensor,
-    int64_t num_groups) {
+    int64_t num_groups,
+    [[maybe_unused]] int64_t large_blockm_fwd) {
   auto q_type = q.scalar_type();
   auto const sizes = q.sizes();
   at::Tensor seq_offsets_;

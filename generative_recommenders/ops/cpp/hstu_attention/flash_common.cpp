@@ -26,6 +26,8 @@
 #include <torch/nn/functional.h>
 #include <torch/version.h> // For TORCH_VERSION* macros
 
+#include <string_view>
+
 #include <cutlass/numeric_types.h>
 
 #include "flash.h"
@@ -49,6 +51,90 @@ at::Tensor switch_to_contiguous_if_needed(const at::Tensor& x) {
 }
 
 namespace hstu {
+
+namespace {
+// The cross-attention inference default shrinks the tile height to 64 rows
+// (small_blockm in tile_size_fwd_sm90). That makes AtomLayoutM == kBlockM/64 ==
+// 1, i.e. a single MMA warpgroup, which also switches off softmax/GEMM
+// ping-pong (UseSchedulerBarrier needs NumMmaWarpGroups >= 2). The training
+// tile height is worth ~1.45x when it applies.
+//
+// What it costs is tile quantization: the large tile halves the CTA count, so a
+// q that only just filled the GPU at 64 rows leaves SMs idle at 128. Measured
+// on H100 (132 SMs, b=8, h=6, kv cap 32768 at sparsity 0.5, T288157648),
+// medians over 7 round-robin-interleaved reps:
+//
+//   q     waves @ large tile   large vs small
+//   256   0.73                 0.96x  (regression)
+//   512   1.45                 1.14x
+//   768   2.18                 1.45x
+//   1024  2.91                 1.44x
+//   1300  4.00                 1.46x
+//   2048  5.82                 1.23x
+//
+// The sign flips at one full wave, so that is the guard. A second run put
+// q=1300 at 1.462x and moved the other rows by up to 0.07x, so treat anything
+// past the first decimal as noise.
+//
+// Interleaving the arms matters: a fixed ABAB order reads 1.52x at q=1300
+// rather than 1.46x, because the SM clock droops (1980 -> ~1500 MHz) over a rep
+// and charges whichever arm ran later for it.
+bool large_blockm_fills_gpu(
+    const int large_blockm,
+    const int b,
+    const int h,
+    const int max_q_len,
+    const int num_sm) {
+  if (large_blockm <= 64 || num_sm <= 0) {
+    return false;
+  }
+  const int64_t num_ctas =
+      static_cast<int64_t>((max_q_len + large_blockm - 1) / large_blockm) * h *
+      b;
+  return num_ctas >= num_sm;
+}
+
+// Only sm90 has the small_blockm heuristic at all, and only the 16-bit
+// cross-attention inference path instantiates the override kernel (see
+// run_mha_fwd_dispatch), so every other shape keeps the built-in tile.
+bool tile_height_override_available(const Flash_fwd_params& params) {
+  return params.arch >= 90 && !params.training &&
+      params.seq_offsets_q != nullptr && !params.is_e4m3;
+}
+
+// Resolves the kLargeBlockM* tri-state against the shape: ON/OFF pin a tile
+// height, AUTO defers to the wave-count guard below.
+bool resolve_large_blockm_fwd(
+    const Flash_fwd_params& params,
+    const int64_t requested) {
+  if (!tile_height_override_available(params)) {
+    return false;
+  }
+  if (requested == kLargeBlockMOn) {
+    return true;
+  }
+  if (requested == kLargeBlockMOff) {
+    return false;
+  }
+  // Mirrors the run_flash_fwd instantiation, so the wave count is measured
+  // against the tile the large-blockM kernel would actually use (192 rows at
+  // head_dim <= 96, 128 above it) rather than an assumed 128. V_colmajor is
+  // hardcoded false at dispatch.
+  const int large_blockm = std::get<0>(tile_size_fwd_sm90(
+      round_up_headdim(static_cast<int>(params.qk_d)),
+      params.is_causal,
+      params.is_local,
+      // tile_height_override_available() already excluded e4m3 above, so the
+      // element size here is always 2 bytes.
+      /*element_size=*/2,
+      /*v_colmajor=*/false,
+      /*Cross=*/true,
+      /*Training=*/false,
+      /*force_large_blockm=*/true));
+  return large_blockm_fills_gpu(
+      large_blockm, params.b, params.h, params.max_q_len, params.num_sm);
+}
+} // namespace
 
 void set_params_fprop(
     hstu::Flash_fwd_params& params,
@@ -84,7 +170,8 @@ void set_params_fprop(
     const int contextual_seq_len,
     const int num_softmax_heads,
     const bool training,
-    const int sm_margin = 0) {
+    const int sm_margin = 0,
+    const int64_t large_blockm_fwd = kLargeBlockMAuto) {
   // Reset the parameters
   params = {};
 
@@ -157,6 +244,8 @@ void set_params_fprop(
       at::cuda::getCurrentDeviceProperties()->minor;
   params.num_sm =
       at::cuda::getCurrentDeviceProperties()->multiProcessorCount - sm_margin;
+
+  params.large_blockm_fwd = resolve_large_blockm_fwd(params, large_blockm_fwd);
 
 #ifdef FLASHATTENTION_DISABLE_LOCAL
   TORCH_CHECK(
@@ -416,7 +505,8 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd(
     const std::optional<at::Tensor>& contextual_seq_len_tensor,
     const std::optional<at::Tensor>& max_attn_len_tensor,
     const std::optional<at::Tensor>& min_full_attn_seq_len_tensor,
-    int64_t num_groups) {
+    int64_t num_groups,
+    int64_t large_blockm_fwd) {
   auto dprops = at::cuda::getCurrentDeviceProperties();
   bool is_sm9x = dprops->major >= 9;
   TORCH_CHECK(is_sm9x, "HSTU Attention only supports Hopper GPUs or newer.");
@@ -664,7 +754,8 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd(
       contextual_seq_len,
       num_softmax_heads,
       training,
-      sm_margin);
+      sm_margin,
+      large_blockm_fwd);
   at::Tensor tile_count_semaphore;
   // We don't use the persistent scheduler if not jagged
   bool const persistent_scheduler = params.arch >= 90
