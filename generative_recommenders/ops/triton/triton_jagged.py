@@ -2607,9 +2607,9 @@ def _helion_split_2d_jagged_kernel(
         is_part_b = (row_indices >= len_a_i32) & valid_mask
 
         # Extract scalar values once
-        input_start_i32 = tl.cast(input_start[None, None], tl.int32)
-        out_a_start_i32 = tl.cast(out_a_start[None, None], tl.int32)
-        out_b_start_i32 = tl.cast(out_b_start[None, None], tl.int32)
+        input_start_i64 = tl.cast(input_start[None, None], tl.int64)
+        out_a_start_i64 = tl.cast(out_a_start[None, None], tl.int64)
+        out_b_start_i64 = tl.cast(out_b_start[None, None], tl.int64)
 
         # Process features in smaller tiles
         for feature_offset in tl.range(
@@ -2624,55 +2624,45 @@ def _helion_split_2d_jagged_kernel(
             feature_indices = feature_offset + tl.arange(0, _BLOCK_SIZE_1).to(tl.int32)
 
             # Compute D constant and feature mask once per feature iteration
-            D_const = tl.full([], tl.cast(D, tl.int32), tl.int32)
+            D_i64 = tl.cast(D, tl.int64)
             D_i32 = tl.cast(D, tl.int32)
             feature_mask = feature_indices < D_i32
 
-            # Compute indices for part A
-            row_subscript = row_indices[:, None]
-            input_row_a = input_start_i32 + row_subscript
-            input_idx_a = (
-                tl.cast(input_row_a * D_const, tl.int32) + feature_indices[None, :]
-            )
+            # Compute input pointers shared by parts A and B
+            row_subscript = tl.cast(row_indices[:, None], tl.int64)
+            input_row = input_start_i64 + row_subscript
+            input_ptrs = values_flat + input_row * D_i64 + feature_indices[None, :]
 
-            out_a_row = out_a_start_i32 + row_subscript
-            out_a_idx = (
-                tl.cast(out_a_row * D_const, tl.int32) + feature_indices[None, :]
-            )
+            # Compute pointers for part A
+            out_a_row = out_a_start_i64 + row_subscript
+            out_a_ptrs = out_a_flat + out_a_row * D_i64 + feature_indices[None, :]
 
             mask_a = is_part_a[:, None] & valid_mask[:, None] & feature_mask[None, :]
 
             # Load and store part A data
             slice_a = tl.load(
-                values_flat + input_idx_a * 1,
+                input_ptrs,
                 mask_a,
                 other=0,
                 eviction_policy="evict_first",
             )
-            tl.store(out_a_flat + out_a_idx * 1, slice_a, mask_a)
+            tl.store(out_a_ptrs, slice_a, mask_a)
 
-            # Compute indices for part B
-            input_idx_b = (
-                tl.cast((input_start_i32 + row_subscript) * D_const, tl.int32)
-                + feature_indices[None, :]
-            )
-
-            row_minus_len_a = row_subscript - len_a_i32
-            out_b_row = out_b_start_i32 + row_minus_len_a
-            out_b_idx = (
-                tl.cast(out_b_row * D_const, tl.int32) + feature_indices[None, :]
-            )
+            # Compute pointers for part B
+            row_minus_len_a = row_subscript - tl.cast(len_a_i32, tl.int64)
+            out_b_row = out_b_start_i64 + row_minus_len_a
+            out_b_ptrs = out_b_flat + out_b_row * D_i64 + feature_indices[None, :]
 
             mask_b = is_part_b[:, None] & feature_mask[None, :]
 
             # Load and store part B data
             slice_b = tl.load(
-                values_flat + input_idx_b * 1,
+                input_ptrs,
                 mask_b,
                 other=0,
                 eviction_policy="evict_first",
             )
-            tl.store(out_b_flat + out_b_idx * 1, slice_b, mask_b)
+            tl.store(out_b_ptrs, slice_b, mask_b)
 
 
 class _HelionSplit2DJaggedFunction(torch.autograd.Function):
