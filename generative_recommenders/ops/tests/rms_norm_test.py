@@ -28,6 +28,22 @@ from hypothesis import given, settings, strategies as st, Verbosity
 
 class LayerNormTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
+    def test_large_feature_dim(self) -> None:
+        dtype = (
+            torch.bfloat16
+            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            else torch.float32
+        )
+        self._test_rms_norm(
+            N=64,
+            D=14400,
+            dtype=dtype,
+            silu=False,
+            ref_kernel=HammerKernel.PYTORCH,
+            real_kernel=HammerKernel.TRITON,
+        )
+
+    @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore[56]
     @given(
         N=st.sampled_from([2000000]),

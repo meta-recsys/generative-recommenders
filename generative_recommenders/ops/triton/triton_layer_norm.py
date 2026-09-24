@@ -55,7 +55,7 @@ except ImportError:
 def _get_layer_norm_fwd_configs() -> List[triton.Config]:
     """Generate autotune configs for multi-row LayerNorm kernels."""
     configs = []
-    block_ns = [4, 8, 16] if is_sm100_plus() else [1, 2, 4, 8]
+    block_ns = [1, 4, 8, 16] if is_sm100_plus() else [1, 2, 4, 8]
     for BLOCK_N in block_ns:
         for num_warps in [1, 2, 4, 8]:
             if torch.version.hip is not None and BLOCK_N == 1 and num_warps == 8:
@@ -67,6 +67,33 @@ def _get_layer_norm_fwd_configs() -> List[triton.Config]:
                     num_warps=num_warps,
                 )
             )
+    return configs
+
+
+def _get_layer_norm_bwd_configs() -> List[triton.Config]:
+    """Generate autotune configs for multi-row LayerNorm backward kernels."""
+    configs = []
+    block_ns = [1, 4, 8, 16] if is_sm100_plus() else [1, 2, 4, 8]
+    for BLOCK_N in block_ns:
+        for num_warps in [1, 2, 4, 8]:
+            if torch.version.hip is not None and BLOCK_N == 1 and num_warps == 8:
+                continue
+            configs.append(
+                triton.Config(
+                    {"BLOCK_N": BLOCK_N},
+                    num_warps=num_warps,
+                )
+            )
+    return configs
+
+
+def _prune_norm_configs(
+    configs: List[triton.Config],
+    named_args,
+    **kwargs,
+) -> List[triton.Config]:
+    if named_args["D"] > 4096:
+        return [config for config in configs if config.kwargs["BLOCK_N"] == 1]
     return configs
 
 
@@ -106,6 +133,7 @@ def _get_norm_bwd_configs() -> List[triton.Config]:
 @triton_autotune(
     configs=_get_layer_norm_fwd_configs(),
     key=["BLOCK_D"],
+    prune_configs_by={"early_config_prune": _prune_norm_configs},
 )
 @triton.jit
 def _layer_norm_fwd(
@@ -183,6 +211,7 @@ def _layer_norm_fwd(
 @triton_autotune(
     configs=_get_layer_norm_fwd_configs(),
     key=["BLOCK_D"],
+    prune_configs_by={"early_config_prune": _prune_norm_configs},
 )
 @triton.jit
 def _weighted_layer_norm_fwd(
@@ -309,8 +338,9 @@ def _layer_norm_bwd_dx(
 
 
 @triton_autotune(
-    configs=_get_layer_norm_fwd_configs(),
+    configs=_get_layer_norm_bwd_configs(),
     key=["BLOCK_D"],
+    prune_configs_by={"early_config_prune": _prune_norm_configs},
 )
 @triton.jit
 def _weighted_layer_norm_bwd_dx(
@@ -820,6 +850,7 @@ def _get_rms_norm_fwd_configs() -> List[triton.Config]:
 @triton.autotune(
     configs=_get_rms_norm_fwd_configs(),
     key=["BLOCK_D", "SILU"],
+    prune_configs_by={"early_config_prune": _prune_norm_configs},
 )
 @triton.jit
 def _weighted_rms_norm_fwd(
@@ -951,8 +982,9 @@ def _weighted_rms_norm_bwd_dx(
 
 
 @triton_autotune(
-    configs=_get_layer_norm_fwd_configs(),
+    configs=_get_layer_norm_bwd_configs(),
     key=["BLOCK_D", "SILU"],
+    prune_configs_by={"early_config_prune": _prune_norm_configs},
 )
 @triton.jit
 def _weighted_rms_norm_bwd(

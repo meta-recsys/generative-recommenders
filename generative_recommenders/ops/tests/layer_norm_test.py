@@ -27,10 +27,56 @@ from generative_recommenders.ops.layer_norm import (
     swish_layer_norm,
     SwishLayerNorm,
 )
+from generative_recommenders.ops.triton.triton_layer_norm import (
+    compute_BLOCK_D,
+    triton_weighted_layer_norm_bwd,
+    triton_weighted_layer_norm_fwd,
+)
 from hypothesis import given, settings, strategies as st, Verbosity
 
 
 class LayerNormTest(unittest.TestCase):
+    @unittest.skipIf(*gpu_unavailable)
+    def test_large_feature_dim(self) -> None:
+        n, d = 64, 14400
+        dtype = (
+            torch.bfloat16
+            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            else torch.float32
+        )
+        x = torch.randn((n, d), device="cuda", dtype=dtype)
+        weight = torch.randn((d,), device="cuda", dtype=dtype)
+        bias = torch.randn((d,), device="cuda", dtype=dtype)
+        dy = torch.randn_like(x)
+        out, mean, rstd = triton_weighted_layer_norm_fwd(
+            x,
+            weight,
+            bias,
+            eps=1e-6,
+        )
+
+        dx, dweight, dbias = triton_weighted_layer_norm_bwd(
+            dy,
+            x,
+            weight,
+            bias,
+            mean,
+            rstd,
+            learnable=True,
+            eps=1e-6,
+            BLOCK_D=compute_BLOCK_D(x),
+        )
+
+        x.requires_grad_()
+        weight.requires_grad_()
+        bias.requires_grad_()
+        ref = torch.nn.functional.layer_norm(x, (d,), weight, bias, eps=1e-6)
+        ref.backward(dy)
+        torch.testing.assert_close(ref, out)
+        torch.testing.assert_close(x.grad, dx)
+        torch.testing.assert_close(weight.grad, dweight)
+        torch.testing.assert_close(bias.grad, dbias)
+
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore[56]
     @given(
