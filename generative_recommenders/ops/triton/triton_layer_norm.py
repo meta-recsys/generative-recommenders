@@ -1094,16 +1094,21 @@ def _rms_norm_bwd_dwdb(
     tl.store(FINAL_DW + cols, sum_dw.to(FINAL_DW.dtype.element_ty), mask=cols < D)
 
 
-@maybe_register_custom_op(
-    "generative_recommenders::triton_weighted_rms_norm_fwd", mutates_args=()
-)
-def triton_weighted_rms_norm_fwd(
+def _triton_weighted_rms_norm_fwd_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
     silu: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """RMSNorm counterpart of triton_weighted_layer_norm_fwd.
+
+    Plain function. torch.export / AOTI callers must use this rather than the
+    registered op below: maybe_register_custom_op builds a
+    torch.library.custom_op, which is Python-only, so a lowered artifact that
+    references it by name fails in the C++ predictor with "Could not find
+    schema for generative_recommenders::triton_weighted_rms_norm_fwd"
+    (S709738). Tracing through the plain function compiles the kernel into the
+    .so instead.
 
     Returns (y, rstd). Unlike the LayerNorm version there is no mean to save,
     and no bias, so callers that keep a mean slot should pass an empty tensor.
@@ -1153,6 +1158,23 @@ def triton_weighted_rms_norm_fwd(
         BLOCK_D=BLOCK_D,
     )
     return y, rstd
+
+
+@maybe_register_custom_op(
+    "generative_recommenders::triton_weighted_rms_norm_fwd", mutates_args=()
+)
+def triton_weighted_rms_norm_fwd(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    silu: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Registered-op form of _triton_weighted_rms_norm_fwd_impl.
+
+    Stays opaque so FX ShapeProp resolves it from the meta kernel rather than
+    executing raw Triton on CPU sample tensors during a TorchScript publish.
+    """
+    return _triton_weighted_rms_norm_fwd_impl(x=x, weight=weight, eps=eps, silu=silu)
 
 
 @triton_weighted_rms_norm_fwd.register_fake
@@ -1257,12 +1279,33 @@ class RMSNormFunction(torch.autograd.Function):
         silu: bool,
     ) -> torch.Tensor:
         x = switch_to_contiguous_if_needed(x)
-        y, rstd = triton_weighted_rms_norm_fwd(
-            x=x,
-            weight=weight,
-            eps=eps,
-            silu=silu,
-        )
+        # The two serving modes need opposite things, so branch on the tracer:
+        #
+        #   torch.export / AOTI  -> the PLAIN impl. The registered op is
+        #     Python-only, so a lowered artifact naming it fails to load in the
+        #     C++ predictor ("Could not find schema for ...rms_norm_fwd",
+        #     S709738, reached via NormWithInit / tokenizer RMSNorm).
+        #   FX symbolic_trace / TorchScript publish -> the registered OP, which
+        #     stays opaque so ShapeProp uses the meta kernel instead of running
+        #     raw Triton on CPU sample tensors.
+        #
+        # Keyed on is_exporting() and not the AOTI_LOWER env var, which the
+        # publish env may set to "0"; same pattern as the serving-attention
+        # branch in minimal_viable_ai/.../pure_device_hstu.py.
+        if torch.compiler.is_exporting():
+            y, rstd = _triton_weighted_rms_norm_fwd_impl(
+                x=x,
+                weight=weight,
+                eps=eps,
+                silu=silu,
+            )
+        else:
+            y, rstd = triton_weighted_rms_norm_fwd(
+                x=x,
+                weight=weight,
+                eps=eps,
+                silu=silu,
+            )
         ctx.save_for_backward(x, weight, rstd)
         ctx.silu = silu
         ctx.BLOCK_D = compute_BLOCK_D(x)

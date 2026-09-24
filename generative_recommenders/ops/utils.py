@@ -52,6 +52,26 @@ def maybe_register_custom_op(op_name, mutates_args):
     When AOTI_LOWER is set in the environment, the function is returned
     unwrapped so that torch.export / Dynamo can trace through the plain
     Python implementation instead of treating the custom op as opaque.
+
+    WARNING: the op this produces is PYTHON-ONLY. If a graph that reaches AOTI
+    serving contains a call to it, the lowered artifact carries the operator
+    name and the C++ predictor fails at load with "Could not find schema for
+    <op_name>". There is no predictor-side op registry to add it to.
+
+    The two serving modes want opposite things:
+      - torch.export / AOTI      wants the PLAIN function, so the kernel is
+                                 compiled into the .so.
+      - FX symbolic_trace /      wants the OPAQUE op, so ShapeProp resolves it
+        TorchScript publish      from the meta kernel instead of executing raw
+                                 Triton on CPU sample tensors.
+
+    So a caller reachable from both must branch on
+    torch.compiler.is_exporting() rather than pick one. Key on that and not on
+    the AOTI_LOWER env var, which the publish environment may set to "0" -- a
+    truthiness check reads that as unset. See RMSNormFunction in
+    generative_recommenders/ops/triton/triton_layer_norm.py (S709738) and
+    _serving_ragged_hstu_attn_fwd in minimal_viable_ai/umia_v1/ig/
+    omni_hstu_igr_v2_pt2_pure_device/pure_device_hstu.py.
     """
 
     def decorator(func):
