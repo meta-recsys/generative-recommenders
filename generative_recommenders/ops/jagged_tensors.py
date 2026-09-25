@@ -45,6 +45,16 @@ try:
 except ImportError:
     triton_cc_jagged_dense_bmm = None
 
+# Optional for the same reason as TRITON_CC: nvidia-cutlass-dsl is a heavy dependency and
+# the kernel is Blackwell-only, so importing it must not be a hard requirement for every
+# consumer of this module.
+try:
+    from generative_recommenders.ops.cutedsl.cutedsl_jagged import (
+        cutedsl_jagged_dense_bmm_broadcast_add,
+    )
+except ImportError:
+    cutedsl_jagged_dense_bmm_broadcast_add = None
+
 
 torch.fx.wrap("triton_concat_2D_jagged")
 torch.fx.wrap("triton_split_2D_jagged")
@@ -253,6 +263,14 @@ def jagged_dense_bmm_broadcast_add(
             dense=dense,
             bias=bias,
             elementwise=False,
+        )
+    elif kernel == HammerKernel.CUTEDSL:
+        if cutedsl_jagged_dense_bmm_broadcast_add is None:
+            raise ImportError(
+                "nvidia-cutlass-dsl is required for the CUTEDSL kernel in jagged_dense_bmm_broadcast_add."
+            )
+        return cutedsl_jagged_dense_bmm_broadcast_add(
+            seq_offsets, jagged, dense, bias, max_seq_len
         )
     elif kernel == HammerKernel.TRITON_CC:
         if triton_cc_jagged_dense_bmm is None:
