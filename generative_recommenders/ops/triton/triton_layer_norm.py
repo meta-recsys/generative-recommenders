@@ -817,9 +817,42 @@ def _get_rms_norm_fwd_configs() -> List[triton.Config]:
     return configs
 
 
+def _prune_rms_norm_configs(configs, named_args, **kwargs) -> List[triton.Config]:
+    block_d = kwargs.get("BLOCK_D", named_args.get("BLOCK_D", 0))
+    assert block_d is not None
+    if not is_sm100_plus() or block_d < 4096:
+        return configs
+    # Large per-thread tiles cause excessive register spilling and compile time.
+    return [
+        config
+        for config in configs
+        if config.kwargs["BLOCK_N"] * block_d <= 256 * 32 * config.num_warps
+    ]
+
+
+def _get_rms_norm_bwd_configs() -> List[triton.Config]:
+    configs = _get_layer_norm_fwd_configs()
+    if is_sm100_plus():
+        configs.extend(
+            triton.Config({"BLOCK_N": block_n}, num_warps=num_warps)
+            for block_n in [1, 2]
+            for num_warps in [4, 8]
+        )
+    return configs
+
+
+def _prune_rms_norm_bwd_configs(configs, named_args, **kwargs) -> List[triton.Config]:
+    block_d = kwargs.get("BLOCK_D", named_args.get("BLOCK_D", 0))
+    assert block_d is not None
+    if is_sm100_plus() and block_d < 4096:
+        return [config for config in configs if config.kwargs["BLOCK_N"] >= 4]
+    return _prune_rms_norm_configs(configs, named_args, **kwargs)
+
+
 @triton.autotune(
     configs=_get_rms_norm_fwd_configs(),
     key=["BLOCK_D", "SILU"],
+    prune_configs_by={"early_config_prune": _prune_rms_norm_configs},
 )
 @triton.jit
 def _weighted_rms_norm_fwd(
@@ -951,8 +984,9 @@ def _weighted_rms_norm_bwd_dx(
 
 
 @triton_autotune(
-    configs=_get_layer_norm_fwd_configs(),
+    configs=_get_rms_norm_bwd_configs(),
     key=["BLOCK_D", "SILU"],
+    prune_configs_by={"early_config_prune": _prune_rms_norm_bwd_configs},
 )
 @triton.jit
 def _weighted_rms_norm_bwd(

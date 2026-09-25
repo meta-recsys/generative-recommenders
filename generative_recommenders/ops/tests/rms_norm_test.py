@@ -18,10 +18,13 @@
 
 import copy
 import unittest
+from unittest import mock
 
 import torch
 from generative_recommenders.common import gpu_unavailable, HammerKernel, set_dev_mode
 from generative_recommenders.ops.layer_norm import rms_norm, RMSNorm
+from generative_recommenders.ops.triton import triton_layer_norm
+from generative_recommenders.ops.utils import is_sm100_plus
 from hammer.ops.triton.cc.utils import set_triton_cc_version
 from hypothesis import given, settings, strategies as st, Verbosity
 
@@ -81,6 +84,28 @@ class LayerNormTest(unittest.TestCase):
         )
 
     @unittest.skipIf(*gpu_unavailable)
+    @unittest.skipUnless(is_sm100_plus(), "Wide RMS autotuning regression for SM100")
+    def test_rms_norm_wide(self) -> None:
+        for N, D, dtype in [
+            (13, 2048, torch.float32),
+            (13, 2049, torch.float32),
+            (13, 4097, torch.float32),
+            (13, 9843, torch.float32),
+            (13, 15859, torch.float32),
+            (4096, 16384, torch.bfloat16),
+        ]:
+            for silu in [False, True]:
+                with self.subTest(N=N, D=D, dtype=dtype, silu=silu):
+                    self._test_rms_norm(
+                        N=N,
+                        D=D,
+                        dtype=dtype,
+                        silu=silu,
+                        ref_kernel=HammerKernel.PYTORCH,
+                        real_kernel=HammerKernel.TRITON,
+                    )
+
+    @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore[56]
     @given(
         N=st.integers(min_value=4, max_value=10000),
@@ -116,7 +141,6 @@ class LayerNormTest(unittest.TestCase):
         skip_comparisons: bool = False,
         test_backward: bool = True,
     ) -> None:
-        N = N // 4 * 4
         # enable auto-tuning to verify correctness of multi-row kernel
         set_dev_mode(False)
         x = (
@@ -231,3 +255,77 @@ class LayerNormTest(unittest.TestCase):
             ref_dw,
             opt_dw,
         )
+
+
+class RMSNormAutotuneTest(unittest.TestCase):
+    def test_narrow_configs_unchanged(self) -> None:
+        with mock.patch.object(triton_layer_norm, "is_sm100_plus", return_value=True):
+            original = triton_layer_norm._get_layer_norm_fwd_configs()
+            backward = triton_layer_norm._get_rms_norm_bwd_configs()
+            forward = triton_layer_norm._get_rms_norm_fwd_configs()
+            for block_d in [256, 512, 2048]:
+                self.assertEqual(
+                    [str(c) for c in original],
+                    [
+                        str(c)
+                        for c in triton_layer_norm._prune_rms_norm_bwd_configs(
+                            backward, {}, BLOCK_D=block_d
+                        )
+                    ],
+                )
+                self.assertIs(
+                    forward,
+                    triton_layer_norm._prune_rms_norm_configs(
+                        forward, {}, BLOCK_D=block_d
+                    ),
+                )
+
+    def test_wide_configs(self) -> None:
+        with mock.patch.object(triton_layer_norm, "is_sm100_plus", return_value=True):
+            configs = triton_layer_norm._get_rms_norm_bwd_configs()
+            for block_d in [4096, 8192, 16384, 32768]:
+                with self.subTest(block_d=block_d):
+                    retained = triton_layer_norm._prune_rms_norm_bwd_configs(
+                        configs, {}, BLOCK_D=block_d
+                    )
+                    self.assertEqual(
+                        retained,
+                        triton_layer_norm._prune_rms_norm_bwd_configs(
+                            configs, {"BLOCK_D": block_d}
+                        ),
+                    )
+                    self.assertGreater(len(retained), 1)
+                    self.assertIn(
+                        (1, 8), [(c.kwargs["BLOCK_N"], c.num_warps) for c in retained]
+                    )
+                    self.assertNotIn(
+                        (16, 1), [(c.kwargs["BLOCK_N"], c.num_warps) for c in retained]
+                    )
+                    self.assertTrue(
+                        triton_layer_norm._prune_rms_norm_configs(
+                            triton_layer_norm._get_rms_norm_fwd_configs(),
+                            {},
+                            BLOCK_D=block_d,
+                        )
+                    )
+            retained = triton_layer_norm._prune_rms_norm_bwd_configs(
+                configs, {}, BLOCK_D=16384
+            )
+            choices = [(c.kwargs["BLOCK_N"], c.num_warps) for c in retained]
+            self.assertIn((4, 8), choices)
+            self.assertNotIn((4, 1), choices)
+            self.assertNotEqual(
+                [str(c) for c in configs],
+                [str(c) for c in triton_layer_norm._get_layer_norm_fwd_configs()],
+            )
+
+    def test_other_architectures_unchanged(self) -> None:
+        with mock.patch.object(triton_layer_norm, "is_sm100_plus", return_value=False):
+            original = triton_layer_norm._get_layer_norm_fwd_configs()
+            configs = triton_layer_norm._get_rms_norm_bwd_configs()
+            self.assertEqual([str(c) for c in original], [str(c) for c in configs])
+            for prune in [
+                triton_layer_norm._prune_rms_norm_configs,
+                triton_layer_norm._prune_rms_norm_bwd_configs,
+            ]:
+                self.assertIs(configs, prune(configs, {}, BLOCK_D=16384))
