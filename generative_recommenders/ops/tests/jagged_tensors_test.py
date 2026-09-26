@@ -32,6 +32,7 @@ from generative_recommenders.ops.jagged_tensors import (
     split_2D_jagged,
     split_2D_jagged_multirow,
 )
+from generative_recommenders.ops.utils import is_sm100_plus
 from hypothesis import given, settings, strategies as st, Verbosity
 
 
@@ -606,6 +607,131 @@ class JaggedTensorsTest(unittest.TestCase):
             real_kernel=HammerKernel.TRITON,
         )
 
+    # tcgen05 MMA with cta_group=2 is Blackwell-only. Gate the test rather than
+    # disabling remote_execution for the whole target: the other tests here have no
+    # such constraint and should keep running on the RE GPU workers.
+    @unittest.skipIf(not is_sm100_plus(), "CuTeDSL kernel requires sm_100+ (Blackwell)")
+    @unittest.skipIf(*gpu_unavailable)
+    # pyrefly: ignore [bad-argument-type]
+    @given(
+        # batch_size and max_seq_len are DELIBERATELY unconstrained: the jagged coverage
+        # comes from `lengths = torch.randint(max_seq_len + 1, ...)` below, which is what
+        # generates ragged lengths and empty rows.
+        batch_size=st.integers(4, 8),
+        max_seq_len=st.integers(50, 500),
+        # D (contraction) and K (output) are restricted to 16-divisible values. This is
+        # NOT a CuTeDSL limitation -- it is the shipped contract: the production Triton
+        # kernel annotates N/K and their strides as ("i32", 16)
+        # (triton_ppo_jagged_dense_bmm), and the existing sm80 CuTeDSL kernel takes the
+        # same div=16 for the same reason
+        # (prime_perf_optimizer/.../cutedsl/jagged_dense_bmm_cute.py). The unconstrained
+        # 20..200 used by the Triton test above is broader than the advertised contract.
+        D=st.sampled_from([64, 128, 256, 512]),
+        K=st.sampled_from([64, 128, 256, 512]),
+        # bf16 only by scope. fp16 is close to free later (ab_dtype is a parameter);
+        # fp32 needs a tf32 MMA path.
+        dtype=st.just(torch.bfloat16),
+        contiguous=st.just(True),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=20,
+        deadline=None,
+    )
+    # pyrefly: ignore [bad-argument-type]
+    def test_jagged_dense_bmm_broadcast_add_cutedsl(self, *args, **kwargs) -> None:
+        """Blackwell tcgen05 CuTeDSL kernel, forward only.
+
+        Reuses _test_jagged_dense_bmm_broadcast_add unchanged: same PYTORCH reference,
+        same length generation (including the deliberate empty-row edge case), same
+        torch.testing.assert_close default tolerances as the Triton test.
+
+        test_backward=False: the backward pass needs two further kernels (dJagged,
+        dDense/dBias) and is out of scope.
+        """
+        self._test_jagged_dense_bmm_broadcast_add(
+            *args,
+            **kwargs,
+            test_backward=False,
+            atol=None,
+            rtol=None,
+            ref_kernel=HammerKernel.PYTORCH,
+            real_kernel=HammerKernel.CUTEDSL,
+        )
+
+    # tcgen05 MMA with cta_group=2 is Blackwell-only. Gate the test rather than
+    # disabling remote_execution for the whole target: the other tests here have no
+    # such constraint and should keep running on the RE GPU workers.
+    @unittest.skipIf(not is_sm100_plus(), "CuTeDSL kernel requires sm_100+ (Blackwell)")
+    @unittest.skipIf(*gpu_unavailable)
+    def test_jagged_dense_bmm_broadcast_add_cutedsl_shapes(self) -> None:
+        """Deterministic length/shape patterns the hypothesis test above cannot reach.
+
+        The hypothesis method draws max_seq_len from 50..500 and lengths from
+        randint(max_seq_len + 1), which is good fuzzing but has two structural blind
+        spots for a tiled kernel:
+
+          * Group lengths are always far below the padded bound, so there are ALWAYS
+            skipped M-tiles. A deadlock that only fires when few or no tiles are skipped
+            at a large group length shipped unnoticed for exactly this reason, so the
+            first two cases below pin that regime.
+          * D and K never reach production dimensions (2176 contraction, 768 output), and
+            768 is the only value here that is a whole number of 256-wide N tiles.
+
+        The remaining cases are edge shapes whose position matters -- an empty group at
+        the start versus the middle, a group shorter than one 128-row M tile -- which a
+        random draw hits only occasionally and never reports as a distinct case.
+        """
+        # atol is None (torch.testing bf16 default, 1e-5) except where the contraction is
+        # deep enough that the default is simply unreachable: at D=2176 the PRODUCTION
+        # TRITON kernel misses it too, by the same margin (125 / 12.5M elements at
+        # 6.1e-5), so 1e-5 is measuring fp32-reference drift, not kernel correctness.
+        # 1e-3 is still ~4 orders below the 22.0 absolute error of a real bug this test
+        # caught during development.
+        DEEP_K_ATOL = 1e-3
+
+        # (name, batch_size, lengths, max_seq_len, D_contraction, K_output, atol)
+        cases = [
+            # No skipped tiles at a length spanning many M tiles: the deadlock regime.
+            ("no_skipped_tiles", 8, [2048] * 8, 2048, 2176, 768, DEEP_K_ATOL),
+            # Same, deeper persistent loop (20 M tiles per group).
+            ("long_groups_no_skip", 8, [5120] * 8, 5120, 256, 256, None),
+            # Production dims, plus an empty group, a single-row group and a partial tile.
+            ("production_dims", 4, [3000, 5000, 1, 0], 8192, 2176, 768, DEEP_K_ATOL),
+            # Empty-group position matters: leading, interior, and all-but-one.
+            ("empty_first", 4, [0, 501, 501, 501], 512, 256, 256, None),
+            ("empty_middle", 4, [501, 0, 501, 501], 512, 256, 256, None),
+            ("only_one_nonempty", 4, [0, 0, 0, 1007], 1024, 256, 256, None),
+            # One group far longer than the rest.
+            ("skewed", 4, [8009, 149, 149, 149], 8192, 256, 256, None),
+            ("single_group", 1, [2023], 2048, 256, 256, None),
+            # Group shorter than one 128-row M tile.
+            ("short_group", 4, [17, 501, 501, 501], 512, 256, 256, None),
+            # N tiling: 320 is one full 256 tile plus a partial, 832 is three plus a
+            # partial. Both exercise the per-element epilogue fallback, which the
+            # vectorised store path never takes.
+            ("n_one_full_one_partial", 4, [501] * 4, 512, 256, 320, None),
+            ("n_multi_tile_partial_tail", 4, [501] * 4, 512, 256, 832, None),
+        ]
+        for name, batch_size, lengths, max_seq_len, d, k, atol in cases:
+            with self.subTest(case=name):
+                self._test_jagged_dense_bmm_broadcast_add(
+                    batch_size=batch_size,
+                    max_seq_len=max_seq_len,
+                    D=d,
+                    K=k,
+                    dtype=torch.bfloat16,
+                    contiguous=True,
+                    test_backward=False,
+                    atol=atol,
+                    # assert_close requires both or neither. 1.6e-2 is torch's own bf16
+                    # default, so only atol is being relaxed, never rtol.
+                    rtol=None if atol is None else 1.6e-2,
+                    ref_kernel=HammerKernel.PYTORCH,
+                    real_kernel=HammerKernel.CUTEDSL,
+                    lengths=torch.tensor(lengths, dtype=torch.int64),
+                )
+
     def _test_jagged_dense_bmm_broadcast_add(
         self,
         batch_size: int,
@@ -620,6 +746,7 @@ class JaggedTensorsTest(unittest.TestCase):
         atol: Optional[float] = None,
         rtol: Optional[float] = None,
         sparsity: float = -1,
+        lengths: Optional[torch.Tensor] = None,
     ) -> None:
         set_dev_mode(True)
         torch.backends.cudnn.allow_tf32 = False
@@ -628,7 +755,11 @@ class JaggedTensorsTest(unittest.TestCase):
             jagged_dense_bmm_broadcast_add,
         )
 
-        if sparsity > 0.0:
+        if lengths is not None:
+            # Caller-supplied, for deterministic length patterns the random draw below
+            # cannot reach -- see test_jagged_dense_bmm_broadcast_add_cutedsl_shapes.
+            lengths = lengths.to(device=torch.device("cuda"), dtype=torch.int64)
+        elif sparsity > 0.0:
             lengths = generate_sparse_seq_len(
                 size=batch_size,
                 max_seq_len=max_seq_len,
