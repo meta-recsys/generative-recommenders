@@ -90,6 +90,7 @@ def setup(
     # set device
     torch.cuda.set_device(device)
 
+    # pyrefly: ignore [bad-return]
     return pg
 
 
