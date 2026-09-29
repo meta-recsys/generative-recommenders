@@ -57,7 +57,9 @@ class SequentialEncoderWithLearnedSimilarityModule(torch.nn.Module):
         if item_embeddings is None:
             item_embeddings = self.get_item_embeddings(item_ids)  # pyre-ignore [29]
         torch._assert(
-            len(item_embeddings.size()) == 3, "len(item_embeddings.size()) must be 3"
+            # pyrefly: ignore [missing-attribute]
+            len(item_embeddings.size()) == 3,
+            "len(item_embeddings.size()) must be 3",
         )
 
         return self._ndp_module(
