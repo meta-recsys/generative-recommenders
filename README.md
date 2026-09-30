@@ -121,6 +121,22 @@ self-attention. Pass ``--sequence-lengths`` to override the conservative
 reference defaults; long production lengths may require substantial GPU memory
 because the PyTorch implementation materializes dense attention matrices.
 
+#### FP8 linear reference and benchmark
+
+``ops/fp8.py`` provides portable row-wise E4M3 quantization and FP8 addmm using
+PyTorch ``torch._scaled_mm`` on CUDA, with a CPU reference fallback. The initial
+implementation supports both on-the-fly and prequantized inference inputs and a
+full-precision backward for training; custom fused kernels are not included.
+Set ``fp8_in_addmm_fwd=True`` on ``hstu_compute_uqvk`` and
+``hstu_compute_output`` to use the FP8 path for the HSTU input and output
+projections. ``STULayerConfig(fp8_addmm_fwd=True)`` enables both projection
+GEMMs for an HSTU layer.
+
+```bash
+python3 -m generative_recommenders.ops.benchmarks.fp8_addmm_bench \
+  --provider all --m 4096 --k 512 --n 512
+```
+
 ## DLRM-v3
 
 We have created a DLRM model using HSTU and have developed benchmarks for both training and inference to faciliate production RecSys use cases.
