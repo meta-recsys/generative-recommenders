@@ -15,6 +15,7 @@ from generative_recommenders.ops.triton.triton_jagged import (
     triton_jagged_dense_bmm,
     triton_jagged_dense_broadcast_add,
 )
+from generative_recommenders.ops.utils import is_sm100_plus
 
 # buck2 run @mode/{opt,inplace} //generative_recommenders/ops/benchmarks:jagged_dense_bmm_broadcast_add_bench -- --fwd-only
 
@@ -27,6 +28,8 @@ def get_kernel(provider: str) -> HammerKernel:
         return HammerKernel.TRITON
     elif provider == "pytorch":
         return HammerKernel.PYTORCH
+    elif provider == "cutedsl":
+        return HammerKernel.CUTEDSL
     else:
         raise ValueError(f"Unknown provider {provider}")
 
@@ -166,9 +169,9 @@ def main(
             x_names=["seq_len"],
             x_vals=[2**i for i in range(8, max_seq_len_log2 + 1)],
             line_arg="provider",
-            line_vals=["triton", "pytorch", "triton_nonfused"],
-            line_names=["Triton", "Pytorch", "Triton_Nonfused"],
-            styles=[("red", "-"), ("blue", "-"), ("green", "-")],
+            line_vals=["triton", "pytorch", "triton_nonfused", "cutedsl"],
+            line_names=["Triton", "Pytorch", "Triton_Nonfused", "CuTeDSL"],
+            styles=[("red", "-"), ("blue", "-"), ("green", "-"), ("orange", "-")],
             ylabel="ms",
             plot_name=f"jagged_dense_bmm_broadcast_add-{mode}-b{batch_size}-D{d}-K{k}-{dtype}",
             args={
@@ -220,6 +223,21 @@ def main(
             .uniform_(-1.0, 1.0)
             .requires_grad_()
         )
+
+        if provider == "cutedsl":
+            # Forward-only (the backward needs two further kernels) and sm_100+ only.
+            # -1 is this file's convention for an unsupported provider/mode combination.
+            if mode == "bwd" or not is_sm100_plus():
+                return -1
+            fn = lambda: jagged_dense_bmm_broadcast_add(  # noqa E731
+                max_seq_len=max_seq_len,
+                seq_offsets=seq_offsets,
+                jagged=jagged,
+                dense=dense,
+                bias=bias,
+                kernel=get_kernel(provider),
+            )
+            return triton.testing.do_bench(fn, warmup=warmup, rep=rep)
 
         if provider in ["triton", "pytorch"]:
             fn = lambda: jagged_dense_bmm_broadcast_add(  # noqa E731
