@@ -104,6 +104,23 @@ python3 run_fractal_expansion.py --input-csv-file tmp/ml-20m/ratings.csv --write
 
 ``ops/triton`` contains triton kernels needed for efficiency experiments. ``ops/cpp`` contains efficient CUDA kernels. In particular, ``ops/cpp/hstu_attention`` contains the attention implementation based on [FlashAttention V3](https://github.com/Dao-AILab/flash-attention) with state-of-the-art efficiency on H100 GPUs.
 
+#### HSTU Ultra PyTorch reference benchmark
+
+``ops/hstu_ultra.py`` provides named, model-derived HSTU Ultra self-attention
+configurations backed by ``ops/pytorch/pt_hstu_ultra.py``. The accompanying
+benchmark measures this dedicated PyTorch reference; optimized HSTU Ultra
+kernels are not included yet.
+
+```bash
+python3 -m generative_recommenders.ops.benchmarks.hstu_ultra_bench \
+  --config-name hstu_ultra_l1 --batch-size 1 --mode fwd
+```
+
+Use ``--config-name hstu_ultra_post_cross`` for post-cross full causal
+self-attention. Pass ``--sequence-lengths`` to override the conservative
+reference defaults; long production lengths may require substantial GPU memory
+because the PyTorch implementation materializes dense attention matrices.
+
 ## DLRM-v3
 
 We have created a DLRM model using HSTU and have developed benchmarks for both training and inference to faciliate production RecSys use cases.
