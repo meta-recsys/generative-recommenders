@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark the dedicated PyTorch HSTU Ultra attention module."""
+"""Benchmark the dedicated HSTU Ultra attention implementations."""
 
 from __future__ import annotations
 
@@ -22,11 +22,12 @@ from dataclasses import asdict, dataclass
 
 import click
 import torch
+from generative_recommenders.common import HammerKernel
 from generative_recommenders.ops.hstu_ultra import (
     hstu_ultra_attention_configs,
     HSTU_ULTRA_CONFIG_NAMES,
+    hstu_ultra_mha,
     HSTUUltraAttentionConfig,
-    pytorch_hstu_ultra_mha,
 )
 
 
@@ -44,6 +45,7 @@ class HSTUUltraInputs:
 @dataclass(frozen=True)
 class BenchmarkResult:
     config: str
+    kernel: str
     mode: str
     batch_size: int
     sequence_length: int
@@ -113,8 +115,9 @@ def _forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    kernel: HammerKernel,
 ) -> torch.Tensor:
-    return pytorch_hstu_ultra_mha(
+    return hstu_ultra_mha(
         config=config,
         max_seq_len=inputs.max_seq_len,
         q=q,
@@ -122,6 +125,7 @@ def _forward(
         v=v,
         seq_offsets=inputs.seq_offsets,
         num_targets=inputs.num_targets,
+        kernel=kernel,
     )
 
 
@@ -129,11 +133,12 @@ def _benchmark_callable(
     config: HSTUUltraAttentionConfig,
     inputs: HSTUUltraInputs,
     mode: str,
+    kernel: HammerKernel,
 ) -> Callable[[], None]:
     if mode == "fwd":
 
         def run_forward() -> None:
-            _forward(config, inputs, inputs.q, inputs.k, inputs.v)
+            _forward(config, inputs, inputs.q, inputs.k, inputs.v, kernel)
 
         return run_forward
     if mode != "fwd_bwd":
@@ -148,7 +153,7 @@ def _benchmark_callable(
         q.grad = None
         k.grad = None
         v.grad = None
-        _forward(config, inputs, q, k, v).backward(output_gradient)
+        _forward(config, inputs, q, k, v, kernel).backward(output_gradient)
 
     return run_forward_backward
 
@@ -177,6 +182,7 @@ def benchmark_hstu_ultra(
     mode: str,
     warmup: int,
     repetitions: int,
+    kernel: HammerKernel = HammerKernel.PYTORCH,
 ) -> BenchmarkResult:
     inputs = build_hstu_ultra_inputs(
         config=config,
@@ -186,10 +192,11 @@ def benchmark_hstu_ultra(
         device=torch.device("cuda"),
     )
     latency_ms = _measure_cuda_ms(
-        _benchmark_callable(config, inputs, mode), warmup, repetitions
+        _benchmark_callable(config, inputs, mode, kernel), warmup, repetitions
     )
     return BenchmarkResult(
         config=config.name,
+        kernel=kernel.name.lower(),
         mode=mode,
         batch_size=batch_size,
         sequence_length=sequence_length,
@@ -243,6 +250,12 @@ def _parse_sequence_lengths(
     default="fwd",
     show_default=True,
 )
+@click.option(
+    "--kernel",
+    type=click.Choice(("pytorch", "triton")),
+    default="pytorch",
+    show_default=True,
+)
 @click.option("--warmup", type=click.IntRange(min=1), default=5, show_default=True)
 @click.option(
     "--repetitions", type=click.IntRange(min=1), default=20, show_default=True
@@ -253,10 +266,11 @@ def main(
     sequence_lengths: str | None,
     data_type: str,
     mode: str,
+    kernel: str,
     warmup: int,
     repetitions: int,
 ) -> None:
-    """Run the PyTorch baseline for a named HSTU Ultra configuration."""
+    """Run a PyTorch or Triton benchmark for a named HSTU Ultra configuration."""
     if not torch.cuda.is_available():
         raise click.ClickException("this benchmark requires a CUDA device")
     torch.manual_seed(1001)
@@ -265,6 +279,10 @@ def main(
         "bf16": torch.bfloat16,
         "fp16": torch.float16,
         "fp32": torch.float32,
+    }
+    kernels = {
+        "pytorch": HammerKernel.PYTORCH,
+        "triton": HammerKernel.TRITON,
     }
     for sequence_length in _parse_sequence_lengths(sequence_lengths, config):
         result = benchmark_hstu_ultra(
@@ -275,6 +293,7 @@ def main(
             mode=mode,
             warmup=warmup,
             repetitions=repetitions,
+            kernel=kernels[kernel],
         )
         click.echo(json.dumps(asdict(result), sort_keys=True))
 

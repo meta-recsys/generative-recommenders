@@ -17,12 +17,14 @@ from __future__ import annotations
 import unittest
 
 import torch
+from generative_recommenders.common import HammerKernel
 from generative_recommenders.ops.benchmarks.hstu_ultra_bench import (
     build_hstu_ultra_inputs,
 )
 from generative_recommenders.ops.hstu_ultra import (
     get_hstu_ultra_valid_attn_mask,
     hstu_ultra_attention_configs,
+    hstu_ultra_mha,
     HSTUUltraAttentionConfig,
     pytorch_hstu_ultra_mha,
 )
@@ -97,6 +99,77 @@ class HSTUUltraTest(unittest.TestCase):
         )
 
         torch.testing.assert_close(actual, expected)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    @parameterized.expand(
+        [
+            ("semi_local", 0, 3, 3),
+            ("post_cross", 2, 0, 0),
+        ]
+    )
+    def test_triton_matches_pytorch(
+        self,
+        _name: str,
+        max_targets: int,
+        max_attn_len: int,
+        full_attn_size: int,
+    ) -> None:
+        torch.manual_seed(0)
+        config = HSTUUltraAttentionConfig(
+            name="test",
+            description="test configuration",
+            heads=2,
+            attention_dim=16,
+            value_dim=16,
+            max_uih_length=9,
+            max_targets=max_targets,
+            max_attn_len=max_attn_len,
+            full_attn_size=full_attn_size,
+            default_sequence_lengths=(9,),
+        )
+        device = torch.device("cuda")
+        seq_offsets = torch.tensor([0, 9, 16], dtype=torch.int32, device=device)
+        num_targets = None
+        if max_targets > 0:
+            num_targets = torch.tensor([2, 1], dtype=torch.int32, device=device)
+        q = torch.randn(16, 2, 16, dtype=torch.bfloat16, device=device)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+
+        reference_inputs = [tensor.detach().requires_grad_() for tensor in (q, k, v)]
+        triton_inputs = [tensor.detach().requires_grad_() for tensor in (q, k, v)]
+        reference = hstu_ultra_mha(
+            config=config,
+            max_seq_len=9,
+            q=reference_inputs[0],
+            k=reference_inputs[1],
+            v=reference_inputs[2],
+            seq_offsets=seq_offsets,
+            num_targets=num_targets,
+            kernel=HammerKernel.PYTORCH,
+        )
+        actual = hstu_ultra_mha(
+            config=config,
+            max_seq_len=9,
+            q=triton_inputs[0],
+            k=triton_inputs[1],
+            v=triton_inputs[2],
+            seq_offsets=seq_offsets,
+            num_targets=num_targets,
+            kernel=HammerKernel.TRITON,
+        )
+        torch.testing.assert_close(actual, reference, atol=0.02, rtol=0.02)
+
+        output_gradient = torch.randn_like(reference)
+        reference.backward(output_gradient)
+        actual.backward(output_gradient)
+        for actual_input, reference_input in zip(triton_inputs, reference_inputs):
+            torch.testing.assert_close(
+                actual_input.grad,
+                reference_input.grad,
+                atol=0.03,
+                rtol=0.03,
+            )
 
     def test_builds_regular_jagged_inputs(self) -> None:
         config = _test_config(max_targets=1, max_attn_len=0, full_attn_size=0)
