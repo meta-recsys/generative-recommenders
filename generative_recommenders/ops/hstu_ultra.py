@@ -20,13 +20,16 @@ import importlib
 from dataclasses import dataclass
 
 import torch
+from generative_recommenders.common import HammerKernel, switch_to_contiguous_if_needed
 from generative_recommenders.ops.pytorch.pt_hstu_ultra import (
     get_hstu_ultra_valid_attn_mask,
     pytorch_hstu_ultra_attention,
 )
+from generative_recommenders.ops.triton.triton_hstu_attention import triton_hstu_mha
 
 __all__ = [
     "get_hstu_ultra_valid_attn_mask",
+    "hstu_ultra_mha",
     "hstu_ultra_attention_configs",
     "HSTUUltraAttentionConfig",
     "pytorch_hstu_ultra_mha",
@@ -148,4 +151,52 @@ def pytorch_hstu_ultra_mha(
         num_targets=num_targets,
         max_attn_len=config.max_attn_len,
         full_attn_size=config.full_attn_size,
+    )
+
+
+def hstu_ultra_mha(
+    config: HSTUUltraAttentionConfig,
+    max_seq_len: int,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    num_targets: torch.Tensor | None = None,
+    dropout_pr: float = 0.0,
+    training: bool = False,
+    kernel: HammerKernel = HammerKernel.PYTORCH,
+) -> torch.Tensor:
+    """Run a named HSTU Ultra configuration with PyTorch or Triton."""
+    if kernel == HammerKernel.PYTORCH:
+        return pytorch_hstu_ultra_mha(
+            config=config,
+            max_seq_len=max_seq_len,
+            q=q,
+            k=k,
+            v=v,
+            seq_offsets=seq_offsets,
+            num_targets=num_targets,
+            dropout_pr=dropout_pr,
+            training=training,
+        )
+    if kernel != HammerKernel.TRITON:
+        raise ValueError(f"unsupported HSTU Ultra kernel: {kernel}")
+
+    _register_fbgemm_ops()
+    _validate_inputs(config, max_seq_len, q, k, v, seq_offsets, num_targets)
+    torch._assert(q.is_cuda, "q must be a CUDA tensor for Triton")
+    torch._assert(k.is_cuda, "k must be a CUDA tensor for Triton")
+    torch._assert(v.is_cuda, "v must be a CUDA tensor for Triton")
+    torch._assert(seq_offsets.is_cuda, "seq_offsets must be a CUDA tensor for Triton")
+    torch._assert(dropout_pr == 0.0, "dropout is not implemented for Triton")
+    return triton_hstu_mha(
+        N=max_seq_len,
+        alpha=1.0 / config.attention_dim,
+        q=switch_to_contiguous_if_needed(q),
+        k=switch_to_contiguous_if_needed(k),
+        v=switch_to_contiguous_if_needed(v),
+        seq_offsets=seq_offsets.contiguous(),
+        num_targets=num_targets,
+        max_attn_len=config.max_attn_len,
+        min_full_attn_seq_len=config.full_attn_size,
     )
