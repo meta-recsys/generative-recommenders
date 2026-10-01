@@ -61,12 +61,12 @@ def _get_col_indices(
     col_indices = col_indices + max_contextual_seq_len
     col_indices = torch.clamp(col_indices, max=max_pos_ind - 1)
     if max_contextual_seq_len > 0:
-        col_indices[:, :max_contextual_seq_len] = torch.arange(
-            0,
-            max_contextual_seq_len,
-            device=col_indices.device,
-            dtype=col_indices.dtype,
+        positions = torch.arange(
+            max_seq_len, device=col_indices.device, dtype=col_indices.dtype
         ).view(1, -1)
+        col_indices = torch.where(
+            positions < max_contextual_seq_len, positions, col_indices
+        )
     return col_indices
 
 
