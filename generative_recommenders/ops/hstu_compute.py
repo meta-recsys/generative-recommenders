@@ -20,10 +20,12 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+from generative_recommenders.ops.fp8 import fp8_rowwise_addmm
 from generative_recommenders.ops.layer_norm import layer_norm
 from generative_recommenders.ops.mm import addmm
 from generative_recommenders.ops.pytorch.pt_hstu_linear import (
     pytorch_hstu_compute_output,
+    pytorch_norm_mul_dropout,
 )
 
 try:
@@ -62,8 +64,13 @@ def hstu_compute_uqvk(
     uvqk_weight: torch.Tensor,
     uvqk_bias: torch.Tensor,
     kernel: HammerKernel = HammerKernel.PYTORCH,
+    fp8_in_addmm_fwd: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if torch.jit.is_scripting():
+        torch._assert(
+            not fp8_in_addmm_fwd,
+            "FP8 HSTU projections are not supported under TorchScript",
+        )
         # Script-mode fast path: pure PyTorch, no HammerKernel dispatch.
         normed_x = F.layer_norm(
             x,
@@ -81,9 +88,16 @@ def hstu_compute_uqvk(
             eps=norm_eps,
             kernel=kernel,
         )
+        if fp8_in_addmm_fwd:
+            uvqk = fp8_rowwise_addmm(
+                input=uvqk_bias,
+                mat1=normed_x,
+                mat2=uvqk_weight.to(normed_x.dtype),
+                is_inference=not torch.is_grad_enabled(),
+            )
         # NOTE: for AMD training, we go with torch.addmm instead of the triton
         # version before Triton on AMD achieves on-par perf with NV GPU.
-        if torch.version.hip and kernel == HammerKernel.TRITON:
+        elif torch.version.hip and kernel == HammerKernel.TRITON:
             uvqk = torch.addmm(uvqk_bias, normed_x, uvqk_weight)
         else:
             uvqk = addmm(uvqk_bias, normed_x, uvqk_weight, kernel)
@@ -122,8 +136,13 @@ def hstu_compute_output(
     group_norm: bool,
     recompute_y_in_backward: bool,
     kernel: HammerKernel = HammerKernel.PYTORCH,
+    fp8_in_addmm_fwd: bool = False,
 ) -> torch.Tensor:
     if torch.jit.is_scripting():
+        torch._assert(
+            not fp8_in_addmm_fwd,
+            "FP8 HSTU projections are not supported under TorchScript",
+        )
         return pytorch_hstu_compute_output(
             attn=attn,
             u=u,
@@ -140,6 +159,28 @@ def hstu_compute_output(
             group_norm=group_norm,
             num_heads=num_heads,
             linear_dim=linear_dim,
+        )
+    if fp8_in_addmm_fwd:
+        y = pytorch_norm_mul_dropout(
+            x=attn,
+            u=u,
+            weight=norm_weight,
+            bias=norm_bias,
+            eps=norm_eps,
+            dropout_ratio=dropout_ratio,
+            training=training,
+            concat_u=concat_u,
+            concat_x=concat_x,
+            mul_u_activation_type=mul_u_activation_type,
+            group_norm=group_norm,
+            num_heads=num_heads,
+            linear_dim=linear_dim,
+        )
+        return fp8_rowwise_addmm(
+            input=x,
+            mat1=y,
+            mat2=output_weight.to(y.dtype),
+            is_inference=not torch.is_grad_enabled(),
         )
     if kernel == HammerKernel.TRITON:
         return triton_hstu_compute_output(
@@ -237,6 +278,7 @@ def hstu_preprocess_and_attention(
     prefill: bool = False,
     kernel: HammerKernel = HammerKernel.PYTORCH,
     enable_tma: Optional[bool] = None,
+    fp8_in_addmm_fwd: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     if not is_fx_tracing():
         torch._assert(max_seq_len > 0, "max_seq_len must be larger than 0")
@@ -265,6 +307,7 @@ def hstu_preprocess_and_attention(
             uvqk_weight=uvqk_weight,
             uvqk_bias=uvqk_bias,
             kernel=HammerKernel.PYTORCH,
+            fp8_in_addmm_fwd=fp8_in_addmm_fwd,
         )
         attn_output = hstu_mha_cuda(
             max_seq_len=max_seq_len,
@@ -278,7 +321,7 @@ def hstu_preprocess_and_attention(
             contextual_seq_len=contextual_seq_len,
         ).view(-1, hidden_dim * num_heads)
         return u, attn_output, k, v
-    if kernel == HammerKernel.TRITON and prefill is False:
+    if kernel == HammerKernel.TRITON and prefill is False and not fp8_in_addmm_fwd:
         u, attn_output = triton_hstu_preprocess_and_attention(
             x=x,
             norm_weight=norm_weight,
@@ -315,6 +358,7 @@ def hstu_preprocess_and_attention(
             uvqk_weight=uvqk_weight,
             uvqk_bias=uvqk_bias,
             kernel=kernel,
+            fp8_in_addmm_fwd=fp8_in_addmm_fwd,
         )
         attn_output = hstu_mha(
             max_seq_len=max_seq_len,

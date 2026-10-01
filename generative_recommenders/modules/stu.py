@@ -79,6 +79,7 @@ class STULayerConfig:
     recompute_y: bool = True
     sort_by_length: bool = True
     contextual_seq_len: int = 0
+    fp8_addmm_fwd: bool = False
 
 
 @torch.fx.wrap
@@ -203,6 +204,7 @@ class STULayer(STU):
         self._recompute_y: bool = config.recompute_y
         self._sort_by_length: bool = config.sort_by_length
         self._contextual_seq_len: int = config.contextual_seq_len
+        self._fp8_addmm_fwd: bool = config.fp8_addmm_fwd
 
         self._uvqk_weight: torch.nn.Parameter = torch.nn.Parameter(
             torch.empty(
@@ -323,6 +325,7 @@ class STULayer(STU):
                 sort_by_length=self._sort_by_length,
                 prefill=kv_caching_lengths is not None,
                 kernel=self.hammer_kernel(),
+                fp8_in_addmm_fwd=self._fp8_addmm_fwd,
             )
 
         self.update_kv_cache(
@@ -353,6 +356,7 @@ class STULayer(STU):
                 training=self.training,
                 kernel=self.hammer_kernel(),
                 recompute_y_in_backward=self._recompute_y,
+                fp8_in_addmm_fwd=self._fp8_addmm_fwd,
             )
 
     def cached_forward(
@@ -374,6 +378,7 @@ class STULayer(STU):
                 uvqk_weight=self._uvqk_weight.to(delta_x.dtype),
                 uvqk_bias=self._uvqk_beta.to(delta_x.dtype),
                 kernel=self.hammer_kernel(),
+                fp8_in_addmm_fwd=self._fp8_addmm_fwd,
             )
         k, v, max_seq_len, seq_offsets = self.construct_full_kv(
             delta_k=delta_k.flatten(1, 2),
@@ -421,6 +426,7 @@ class STULayer(STU):
                 training=self.training,
                 kernel=self.hammer_kernel(),
                 recompute_y_in_backward=self._recompute_y,
+                fp8_in_addmm_fwd=self._fp8_addmm_fwd,
             )
 
 
