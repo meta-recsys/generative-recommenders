@@ -19,7 +19,7 @@ Configuration module for DLRMv3 model.
 This module provides configuration functions for the HSTU model architecture and embedding table configurations.
 """
 
-from typing import Dict
+from typing import Dict, Optional
 
 from generative_recommenders.modules.dlrm_hstu import DlrmHSTUConfig
 from generative_recommenders.modules.multitask_module import (
@@ -33,7 +33,11 @@ HASH_SIZE = 10_000_000
 HASH_SIZE_1B = 1_000_000_000
 
 
-def get_hstu_configs(dataset: str = "debug") -> DlrmHSTUConfig:
+def get_hstu_configs(
+    dataset: str = "debug",
+    hstu_ultra_stack_name: Optional[str] = None,
+    hstu_fp8_addmm_fwd: bool = False,
+) -> DlrmHSTUConfig:
     """
     Create and return HSTU model configuration.
 
@@ -42,7 +46,10 @@ def get_hstu_configs(dataset: str = "debug") -> DlrmHSTUConfig:
     and feature name mappings.
 
     Args:
-        dataset: Dataset identifier (currently unused, reserved for dataset-specific configs).
+        dataset: Dataset identifier.
+        hstu_ultra_stack_name: Named HSTU Ultra stack, or ``None`` for the
+            original generic HSTU stack.
+        hstu_fp8_addmm_fwd: Whether HSTU Ultra projection GEMMs use FP8.
 
     Returns:
         DlrmHSTUConfig: Complete configuration object for the HSTU model.
@@ -59,6 +66,8 @@ def get_hstu_configs(dataset: str = "debug") -> DlrmHSTUConfig:
         hstu_input_dropout_ratio=0.2,
         hstu_linear_dropout_rate=0.1,
         causal_multitask_weights=0.2,
+        hstu_ultra_stack_name=hstu_ultra_stack_name,
+        hstu_fp8_addmm_fwd=hstu_fp8_addmm_fwd,
     )
     if "movielens" in dataset:
         assert dataset in [
@@ -375,6 +384,12 @@ def get_hstu_configs(dataset: str = "debug") -> DlrmHSTUConfig:
                 task_type=MultitaskTaskType.BINARY_CLASSIFICATION,
             )
         ]
+    if hstu_ultra_stack_name is not None:
+        if hstu_ultra_stack_name != "hstu_ultra":
+            raise ValueError("The DLRM HSTU path currently supports only 'hstu_ultra'")
+        hstu_config.max_seq_len = 1536
+    elif hstu_fp8_addmm_fwd:
+        raise ValueError("hstu_fp8_addmm_fwd requires an HSTU Ultra stack")
     return hstu_config
 
 
