@@ -35,7 +35,7 @@ __all__ = [
     "pytorch_hstu_ultra_mha",
 ]
 
-HSTU_ULTRA_CONFIG_NAMES = ("hstu_ultra_l1", "hstu_ultra_post_cross")
+HSTU_ULTRA_CONFIG_NAMES = ("hstu_ultra_semi_local", "hstu_ultra")
 
 
 @dataclass(frozen=True)
@@ -61,9 +61,9 @@ class HSTUUltraAttentionConfig:
 def hstu_ultra_attention_configs() -> dict[str, HSTUUltraAttentionConfig]:
     """Return the supported HSTU Ultra self-attention configurations."""
     return {
-        "hstu_ultra_l1": HSTUUltraAttentionConfig(
-            name="hstu_ultra_l1",
-            description="L1 causal self-attention with a semi-local window",
+        "hstu_ultra_semi_local": HSTUUltraAttentionConfig(
+            name="hstu_ultra_semi_local",
+            description="Causal self-attention with a semi-local window",
             heads=4,
             attention_dim=128,
             value_dim=128,
@@ -73,9 +73,9 @@ def hstu_ultra_attention_configs() -> dict[str, HSTUUltraAttentionConfig]:
             full_attn_size=256,
             default_sequence_lengths=(512, 1024, 2048),
         ),
-        "hstu_ultra_post_cross": HSTUUltraAttentionConfig(
-            name="hstu_ultra_post_cross",
-            description="Post-cross causal self-attention with target tokens",
+        "hstu_ultra": HSTUUltraAttentionConfig(
+            name="hstu_ultra",
+            description="Full causal self-attention with target tokens",
             heads=4,
             attention_dim=128,
             value_dim=128,

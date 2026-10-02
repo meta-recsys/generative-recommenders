@@ -229,7 +229,7 @@ def _parse_sequence_lengths(
     "--config-name",
     "config_name",
     type=click.Choice(HSTU_ULTRA_CONFIG_NAMES),
-    default="hstu_ultra_l1",
+    default="hstu_ultra_semi_local",
     show_default=True,
 )
 @click.option("--batch-size", type=click.IntRange(min=1), default=1, show_default=True)

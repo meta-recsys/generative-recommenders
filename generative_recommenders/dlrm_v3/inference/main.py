@@ -85,6 +85,16 @@ def get_args():  # pyre-ignore [3]
     parser.add_argument(
         "--dataset", default="debug", choices=SUPPORTED_DATASETS, help="dataset"
     )
+    parser.add_argument(
+        "--hstu-ultra",
+        action="store_true",
+        help="use the target-aware HSTU Ultra stack",
+    )
+    parser.add_argument(
+        "--hstu-ultra-fp8",
+        action="store_true",
+        help="use FP8 projection GEMMs in the HSTU Ultra stack",
+    )
     args, unknown_args = parser.parse_known_args()
     logger.warning(f"unknown_args: {unknown_args}")
     return args
@@ -126,6 +136,9 @@ class Runner:
             )
         self.batchsize = batchsize
         self.compute_eval = compute_eval
+        # Data loading may be concurrent, but each GPU owns one dense model
+        # instance and its forward calls must not overlap across host threads.
+        self._predict_lock = threading.Lock()
         self.reset_states(num_queries=num_queries)
 
     def reset_states(self, num_queries: int) -> None:
@@ -154,7 +167,8 @@ class Runner:
         """
         try:
             t0_prediction: float = time.time()
-            prediction_output = self.model.predict(qitem.samples)
+            with self._predict_lock:
+                prediction_output = self.model.predict(qitem.samples)
             dt_prediction: float = time.time() - t0_prediction
             assert prediction_output is not None
             (
@@ -583,6 +597,8 @@ def run(
     numpy_rand_seed: int = 123,
     sparse_quant: bool = False,
     dataset_percentage: float = 1.0,
+    hstu_ultra_stack_name: Optional[str] = None,
+    hstu_fp8_addmm_fwd: bool = False,
 ) -> None:
     """
     Execute the MLPerf DLRMv3 inference benchmark.
@@ -615,7 +631,11 @@ def run(
     np.random.seed(numpy_rand_seed)
     random.seed(numpy_rand_seed)
 
-    hstu_config = get_hstu_configs(dataset)
+    hstu_config = get_hstu_configs(
+        dataset,
+        hstu_ultra_stack_name=hstu_ultra_stack_name,
+        hstu_fp8_addmm_fwd=hstu_fp8_addmm_fwd,
+    )
     hstu_config.max_num_candidates = hstu_config.max_num_candidates_inference
     table_config = get_embedding_table_config(dataset)
     set_is_inference(is_inference=not compute_eval)
@@ -804,7 +824,13 @@ def main() -> None:
     logger.info(args)
     gin_path = f"{os.path.dirname(__file__)}/gin/{SUPPORTED_CONFIGS[args.dataset]}"
     gin.parse_config_file(gin_path)
-    run(dataset=args.dataset)
+    run(
+        dataset=args.dataset,
+        hstu_ultra_stack_name=(
+            "hstu_ultra" if args.hstu_ultra or args.hstu_ultra_fp8 else None
+        ),
+        hstu_fp8_addmm_fwd=args.hstu_ultra_fp8,
+    )
 
 
 if __name__ == "__main__":
