@@ -121,6 +121,26 @@ residual connection. Pass ``fp8_addmm_fwd=True`` to
 inference, call ``stack.prepare_fp8_weights()`` after moving or loading the
 model to cache the row-wise quantized projection weights.
 
+The end-to-end integration uses the target-aware HSTU Ultra stack inside
+the existing DLRMv3 data, multitask-loss, optimizer, checkpoint, and eager
+inference paths. Start a BF16 training run with:
+
+```bash
+python3 -m generative_recommenders.dlrm_v3.train.train_ranker \
+  --dataset kuairand-1k --hstu-ultra
+```
+
+Add ``--hstu-ultra-fp8`` to use FP8 projection GEMMs (it also enables the
+Ultra stack). Eager inference accepts the same flags and prepares the FP8
+weight caches after loading the checkpoint:
+
+```bash
+python3 -m generative_recommenders.dlrm_v3.inference.main \
+  --dataset debug --hstu-ultra-fp8
+```
+
+Cached incremental decoding and scripted inference export are not included yet.
+
 The complete-stack benchmark measures all configured layers, including input
 normalization, UVQK projection, attention, output projection, and residuals:
 
@@ -149,10 +169,10 @@ target-aware configurations are measured independently.
 
 ```bash
 python3 -m generative_recommenders.ops.benchmarks.hstu_ultra_bench \
-  --config-name hstu_ultra_l1 --kernel triton --batch-size 1 --mode fwd
+  --config-name hstu_ultra_semi_local --kernel triton --batch-size 1 --mode fwd
 ```
 
-Use ``--config-name hstu_ultra_post_cross`` for post-cross full causal
+Use ``--config-name hstu_ultra`` for target-aware full causal
 self-attention. Pass ``--sequence-lengths`` to override the conservative
 reference defaults; long production lengths may require substantial GPU memory
 because the PyTorch implementation materializes dense attention matrices.
@@ -163,12 +183,12 @@ cap, 10 warmup iterations, 100 timed iterations, and the median of three runs.
 
 | Configuration | Sequence length | PyTorch | Triton | Speedup |
 | --- | ---: | ---: | ---: | ---: |
-| ``hstu_ultra_l1`` | 512 | 0.570 ms | 0.253 ms | 2.25x |
-| ``hstu_ultra_l1`` | 1024 | 0.592 ms | 0.254 ms | 2.32x |
-| ``hstu_ultra_l1`` | 2048 | 0.587 ms | 0.255 ms | 2.30x |
-| ``hstu_ultra_post_cross`` | 768 | 0.517 ms | 0.256 ms | 2.02x |
-| ``hstu_ultra_post_cross`` | 1024 | 0.540 ms | 0.252 ms | 2.15x |
-| ``hstu_ultra_post_cross`` | 1536 | 0.528 ms | 0.253 ms | 2.08x |
+| ``hstu_ultra_semi_local`` | 512 | 0.570 ms | 0.253 ms | 2.25x |
+| ``hstu_ultra_semi_local`` | 1024 | 0.592 ms | 0.254 ms | 2.32x |
+| ``hstu_ultra_semi_local`` | 2048 | 0.587 ms | 0.255 ms | 2.30x |
+| ``hstu_ultra`` | 768 | 0.517 ms | 0.256 ms | 2.02x |
+| ``hstu_ultra`` | 1024 | 0.540 ms | 0.252 ms | 2.15x |
+| ``hstu_ultra`` | 1536 | 0.528 ms | 0.253 ms | 2.08x |
 
 This benchmark measures attention only with precomputed BF16 Q/K/V tensors. It
 does not include the UVQK or output projection GEMMs, so the FP8 addmm path is

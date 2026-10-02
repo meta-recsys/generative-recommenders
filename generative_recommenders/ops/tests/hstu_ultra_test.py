@@ -213,14 +213,16 @@ class HSTUUltraTest(unittest.TestCase):
     def test_model_derived_attention_settings(self) -> None:
         configs = hstu_ultra_attention_configs()
 
-        l1 = configs["hstu_ultra_l1"]
-        self.assertEqual((l1.heads, l1.attention_dim), (4, 128))
-        self.assertEqual((l1.max_attn_len, l1.full_attn_size), (256, 256))
+        semi_local = configs["hstu_ultra_semi_local"]
+        self.assertEqual((semi_local.heads, semi_local.attention_dim), (4, 128))
+        self.assertEqual(
+            (semi_local.max_attn_len, semi_local.full_attn_size), (256, 256)
+        )
 
-        post_cross = configs["hstu_ultra_post_cross"]
-        self.assertEqual(post_cross.max_targets, 512)
-        self.assertEqual(post_cross.max_sequence_length, 1536)
-        self.assertEqual((post_cross.max_attn_len, post_cross.full_attn_size), (0, 0))
+        ultra = configs["hstu_ultra"]
+        self.assertEqual(ultra.max_targets, 512)
+        self.assertEqual(ultra.max_sequence_length, 1536)
+        self.assertEqual((ultra.max_attn_len, ultra.full_attn_size), (0, 0))
 
     def test_semi_local_attention_mask(self) -> None:
         actual = get_hstu_ultra_valid_attn_mask(

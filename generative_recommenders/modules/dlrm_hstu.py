@@ -31,6 +31,10 @@ from generative_recommenders.common import (
     set_static_max_seq_lens,
 )
 from generative_recommenders.modules.hstu_transducer import HSTUTransducer
+from generative_recommenders.modules.hstu_ultra import (
+    hstu_ultra_stack_configs,
+    HSTUUltraStack,
+)
 from generative_recommenders.modules.multitask_module import (
     DefaultMultitaskModule,
     MultitaskTaskType,
@@ -97,6 +101,8 @@ class DlrmHSTUConfig:
     action_embedding_init_std: float = 0.1
     enable_postprocessor: bool = True
     use_layer_norm_postprocessor: bool = False
+    hstu_ultra_stack_name: Optional[str] = None
+    hstu_fp8_addmm_fwd: bool = False
 
 
 def _get_supervision_labels_and_weights(
@@ -215,32 +221,69 @@ class DlrmHSTU(HammerModule):
             postprocessor = None
 
         # construct HSTU
-        stu_module: STU = STUStack(
-            stu_list=[
-                STULayer(
-                    config=STULayerConfig(
-                        embedding_dim=hstu_configs.hstu_transducer_embedding_dim,
-                        num_heads=hstu_configs.hstu_num_heads,
-                        hidden_dim=hstu_configs.hstu_attn_linear_dim,
-                        attention_dim=hstu_configs.hstu_attn_qk_dim,
-                        output_dropout_ratio=hstu_configs.hstu_linear_dropout_rate,
-                        use_group_norm=hstu_configs.hstu_group_norm,
-                        causal=True,
-                        target_aware=True,
-                        max_attn_len=None,
-                        attn_alpha=None,
-                        recompute_normed_x=True,
-                        recompute_uvqk=True,
-                        recompute_y=True,
-                        sort_by_length=True,
-                        contextual_seq_len=0,
-                    ),
-                    is_inference=is_inference,
+        stu_module: STU
+        if hstu_configs.hstu_ultra_stack_name is not None:
+            ultra_configs = hstu_ultra_stack_configs(
+                fp8_addmm_fwd=hstu_configs.hstu_fp8_addmm_fwd
+            )
+            stack_name = hstu_configs.hstu_ultra_stack_name
+            if stack_name not in ultra_configs:
+                raise ValueError(
+                    f"Unknown HSTU Ultra stack {stack_name!r}; "
+                    f"expected one of {sorted(ultra_configs)}"
                 )
-                for _ in range(hstu_configs.hstu_attn_num_layers)
-            ],
-            is_inference=is_inference,
-        )
+            ultra_config = ultra_configs[stack_name]
+            if ultra_config.embedding_dim != hstu_configs.hstu_transducer_embedding_dim:
+                raise ValueError(
+                    "HSTU Ultra stack embedding dimension "
+                    f"{ultra_config.embedding_dim} does not match the DLRM "
+                    "transducer embedding dimension "
+                    f"{hstu_configs.hstu_transducer_embedding_dim}"
+                )
+            max_targets = ultra_config.attention.max_targets
+            configured_targets = max(
+                hstu_configs.max_num_candidates,
+                hstu_configs.max_num_candidates_inference,
+            )
+            if configured_targets > max_targets:
+                raise ValueError(
+                    f"HSTU Ultra stack {stack_name!r} supports at most "
+                    f"{max_targets} targets, but DLRM is configured for "
+                    f"{configured_targets} candidates"
+                )
+            stu_module = HSTUUltraStack(
+                config=ultra_config,
+                is_inference=is_inference,
+            )
+        else:
+            if hstu_configs.hstu_fp8_addmm_fwd:
+                raise ValueError("hstu_fp8_addmm_fwd requires hstu_ultra_stack_name")
+            stu_module = STUStack(
+                stu_list=[
+                    STULayer(
+                        config=STULayerConfig(
+                            embedding_dim=hstu_configs.hstu_transducer_embedding_dim,
+                            num_heads=hstu_configs.hstu_num_heads,
+                            hidden_dim=hstu_configs.hstu_attn_linear_dim,
+                            attention_dim=hstu_configs.hstu_attn_qk_dim,
+                            output_dropout_ratio=hstu_configs.hstu_linear_dropout_rate,
+                            use_group_norm=hstu_configs.hstu_group_norm,
+                            causal=True,
+                            target_aware=True,
+                            max_attn_len=None,
+                            attn_alpha=None,
+                            recompute_normed_x=True,
+                            recompute_uvqk=True,
+                            recompute_y=True,
+                            sort_by_length=True,
+                            contextual_seq_len=0,
+                        ),
+                        is_inference=is_inference,
+                    )
+                    for _ in range(hstu_configs.hstu_attn_num_layers)
+                ],
+                is_inference=is_inference,
+            )
         self._hstu_transducer: HSTUTransducer = HSTUTransducer(
             stu_module=stu_module,
             input_preprocessor=preprocessor,
@@ -266,6 +309,13 @@ class DlrmHSTU(HammerModule):
             ),
             LayerNorm(hstu_configs.hstu_transducer_embedding_dim),
         ).apply(init_mlp_weights_optional_bias)
+
+    @torch.jit.unused
+    def prepare_fp8_weights(self) -> None:
+        """Prepare HSTU Ultra projection weights for repeated eager inference."""
+        stu_module = self._hstu_transducer._stu_module
+        if isinstance(stu_module, HSTUUltraStack):
+            stu_module.prepare_fp8_weights()
 
     def _construct_payload(
         self,

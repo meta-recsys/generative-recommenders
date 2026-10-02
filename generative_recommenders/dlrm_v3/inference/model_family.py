@@ -42,7 +42,11 @@ from generative_recommenders.dlrm_v3.inference.inference_modules import (
     set_is_inference,
 )
 from generative_recommenders.dlrm_v3.utils import Profiler
-from generative_recommenders.modules.dlrm_hstu import DlrmHSTUConfig, SequenceEmbedding
+from generative_recommenders.modules.dlrm_hstu import (
+    DlrmHSTU,
+    DlrmHSTUConfig,
+    SequenceEmbedding,
+)
 from pyre_extensions import none_throws
 from torch import quantization as quant
 from torchrec.distributed.quant_embedding import QuantEmbeddingCollection
@@ -419,6 +423,7 @@ class ModelFamilyDenseDist:
         )
         model = model.to(device)
         model.eval()
+        model.prepare_fp8_weights()
         profiler = Profiler(rank) if self.output_trace else None
 
         with torch.no_grad():
@@ -594,7 +599,7 @@ class ModelFamilyDenseSingleWorker:
         output_trace: bool = False,
         compute_eval: bool = False,
     ) -> None:
-        self.model: Optional[torch.nn.Module] = None
+        self.model: Optional[DlrmHSTU] = None
         self.hstu_config = hstu_config
         self.table_config = table_config
         self.output_trace = output_trace
@@ -628,6 +633,7 @@ class ModelFamilyDenseSingleWorker:
         )
         assert self.model is not None
         self.model.eval()
+        self.model.prepare_fp8_weights()
 
     def predict(
         self,

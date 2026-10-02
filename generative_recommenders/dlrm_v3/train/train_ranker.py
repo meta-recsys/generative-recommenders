@@ -61,6 +61,8 @@ def _main_func(
     master_port: int,
     gin_file: str,
     mode: str,
+    hstu_ultra: bool,
+    hstu_ultra_fp8: bool,
 ) -> None:
     device = torch.device(f"cuda:{rank}")
     logger.info(f"rank: {rank}, world_size: {world_size}, device: {device}")
@@ -73,7 +75,10 @@ def _main_func(
     # parse all arguments
     gin.parse_config_file(gin_file)
 
-    model, model_configs, embedding_table_configs = make_model()
+    model, model_configs, embedding_table_configs = make_model(
+        hstu_ultra_stack_name=("hstu_ultra" if hstu_ultra else None),
+        hstu_fp8_addmm_fwd=hstu_ultra_fp8,
+    )
     model, optimizer = make_optimizer_and_shard(
         model=model, device=device, world_size=world_size
     )
@@ -152,6 +157,16 @@ def get_args():  # pyre-ignore [3]
         "--dataset", default="debug", choices=SUPPORTED_CONFIGS.keys(), help="dataset"
     )
     parser.add_argument(
+        "--hstu-ultra",
+        action="store_true",
+        help="use the target-aware HSTU Ultra stack",
+    )
+    parser.add_argument(
+        "--hstu-ultra-fp8",
+        action="store_true",
+        help="use FP8 projection GEMMs in the HSTU Ultra stack",
+    )
+    parser.add_argument(
         "--mode",
         default="train",
         choices=["train", "eval", "train-eval", "streaming-train-eval"],
@@ -178,7 +193,14 @@ def main() -> None:
 
     mp.start_processes(
         _main_func,
-        args=(WORLD_SIZE, MASTER_PORT, gin_path, args.mode),
+        args=(
+            WORLD_SIZE,
+            MASTER_PORT,
+            gin_path,
+            args.mode,
+            args.hstu_ultra or args.hstu_ultra_fp8,
+            args.hstu_ultra_fp8,
+        ),
         nprocs=WORLD_SIZE,
         join=True,
         start_method="spawn",

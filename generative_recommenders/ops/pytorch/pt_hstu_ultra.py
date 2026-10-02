@@ -35,7 +35,7 @@ def get_hstu_ultra_valid_attn_mask(
 
     Rows outside the trailing ``full_attn_size`` positions attend to at most
     ``max_attn_len`` preceding positions. The trailing rows retain full causal
-    attention, matching the HSTU Ultra L1 layout.
+    attention, matching the HSTU Ultra semi-local layout.
     """
     ids = torch.arange(max_seq_len, device=device).view(1, max_seq_len)
     max_ids = seq_lengths.view(-1, 1, 1)

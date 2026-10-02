@@ -86,6 +86,7 @@ def setup(
         backend=BACKEND,
         timeout=timedelta(seconds=TIMEOUT),
     )
+    assert isinstance(pg, dist.ProcessGroup)
 
     # set device
     torch.cuda.set_device(device)
@@ -168,8 +169,14 @@ class ChunkDistributedSampler(DistributedSampler[_T_co]):
 @gin.configurable
 def make_model(
     dataset: str,
+    hstu_ultra_stack_name: Optional[str] = None,
+    hstu_fp8_addmm_fwd: bool = False,
 ) -> Tuple[torch.nn.Module, DlrmHSTUConfig, Dict[str, EmbeddingConfig]]:
-    hstu_config = get_hstu_configs(dataset)
+    hstu_config = get_hstu_configs(
+        dataset,
+        hstu_ultra_stack_name=hstu_ultra_stack_name,
+        hstu_fp8_addmm_fwd=hstu_fp8_addmm_fwd,
+    )
     table_config = get_embedding_table_config(dataset)
 
     model = DlrmHSTU(
@@ -354,6 +361,7 @@ def make_streaming_dataloader(
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         sampler=DistributedSampler(subset, drop_last=True),
+        pin_memory=True,
     )
     return dataloader
 
@@ -403,6 +411,7 @@ def make_train_test_dataloaders(
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         sampler=ChunkDistributedSampler(train_set, drop_last=True, shuffle=True),
+        pin_memory=True,
     )
     test_dataloader = DataLoader(
         dataset=test_set,
@@ -413,6 +422,7 @@ def make_train_test_dataloaders(
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         sampler=ChunkDistributedSampler(test_set, drop_last=True, shuffle=True),
+        pin_memory=True,
     )
     return train_dataloader, test_dataloader
 
