@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark portable row-wise FP8 addmm against BF16."""
+"""Benchmark PyTorch and Triton row-wise FP8 addmm against BF16."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass
 
 import click
 import torch
+from generative_recommenders.common import HammerKernel
 from generative_recommenders.ops.fp8 import fp8_rowwise_addmm, quantize_fp8_per_row
 
 
@@ -71,7 +72,7 @@ def benchmark_fp8_addmm(
         def run() -> None:
             torch.addmm(bias, x, w)
 
-    elif provider == "fp8_prequantized":
+    elif provider in ("fp8_prequantized", "fp8_pytorch_prequantized"):
 
         def run() -> None:
             fp8_rowwise_addmm(
@@ -83,7 +84,20 @@ def benchmark_fp8_addmm(
                 is_inference=True,
             )
 
-    elif provider == "fp8_end_to_end":
+    elif provider == "fp8_triton_prequantized":
+
+        def run() -> None:
+            fp8_rowwise_addmm(
+                input=bias,
+                mat1_fp8=x_fp8,
+                mat1_scale=x_scale,
+                mat2_fp8=w_fp8,
+                mat2_scale=w_scale,
+                is_inference=True,
+                kernel=HammerKernel.TRITON,
+            )
+
+    elif provider in ("fp8_end_to_end", "fp8_pytorch_end_to_end"):
 
         def run() -> None:
             fp8_rowwise_addmm(
@@ -91,6 +105,17 @@ def benchmark_fp8_addmm(
                 mat1=x,
                 mat2=w,
                 is_inference=True,
+            )
+
+    elif provider == "fp8_triton_end_to_end":
+
+        def run() -> None:
+            fp8_rowwise_addmm(
+                input=bias,
+                mat1=x,
+                mat2=w,
+                is_inference=True,
+                kernel=HammerKernel.TRITON,
             )
 
     else:
@@ -110,7 +135,16 @@ def benchmark_fp8_addmm(
 @click.command()
 @click.option(
     "--provider",
-    type=click.Choice(("bf16", "fp8_prequantized", "fp8_end_to_end", "all")),
+    type=click.Choice(
+        (
+            "bf16",
+            "fp8_pytorch_prequantized",
+            "fp8_triton_prequantized",
+            "fp8_pytorch_end_to_end",
+            "fp8_triton_end_to_end",
+            "all",
+        )
+    ),
     default="all",
     show_default=True,
 )
@@ -129,11 +163,17 @@ def main(
     warmup: int,
     repetitions: int,
 ) -> None:
-    """Benchmark BF16 and portable row-wise FP8 addmm on CUDA."""
+    """Benchmark BF16 and row-wise FP8 addmm on CUDA."""
     if not torch.cuda.is_available():
         raise click.ClickException("this benchmark requires a CUDA device")
     providers = (
-        ("bf16", "fp8_prequantized", "fp8_end_to_end")
+        (
+            "bf16",
+            "fp8_pytorch_prequantized",
+            "fp8_triton_prequantized",
+            "fp8_pytorch_end_to_end",
+            "fp8_triton_end_to_end",
+        )
         if provider == "all"
         else (provider,)
     )

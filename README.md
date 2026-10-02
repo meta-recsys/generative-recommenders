@@ -111,6 +111,42 @@ configurations backed by ``ops/pytorch/pt_hstu_ultra.py``. The accompanying
 benchmark can compare the PyTorch reference with the Triton forward and
 backward kernels, including the semi-local attention configuration.
 
+For the model architecture, see the
+[HSTU Ultra paper](https://dl.acm.org/doi/10.1145/3770855.3818322).
+``modules/hstu_ultra.py`` builds complete semi-local or target-aware layer
+stacks from those configurations. Each layer includes input normalization, UVQK
+projection, HSTU Ultra attention, output normalization and projection, and the
+residual connection. Pass ``fp8_addmm_fwd=True`` to
+``hstu_ultra_stack_configs`` to use FP8 for both projection GEMMs. For repeated
+inference, call ``stack.prepare_fp8_weights()`` after moving or loading the
+model to cache the row-wise quantized projection weights.
+
+The complete-stack benchmark measures all configured layers, including input
+normalization, UVQK projection, attention, output projection, and residuals:
+
+```bash
+python3 -m generative_recommenders.ops.benchmarks.hstu_ultra_stack_bench \
+  --config-name hstu_ultra_semi_local --provider all --sequence-lengths 512
+```
+
+Representative forward-only results for the complete configured stacks on one
+NVIDIA H100 96 GB GPU are shown below. Each result is the median of three
+trials with 10 warmup iterations and 100 timed iterations per trial.
+
+| Configuration | Layers | Sequence length | BF16 | FP8 | Speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ``hstu_ultra_semi_local`` | 8 | 512 | 6.036 ms | 5.325 ms | 1.13x |
+| ``hstu_ultra_semi_local`` | 8 | 1024 | 5.911 ms | 5.211 ms | 1.13x |
+| ``hstu_ultra_semi_local`` | 8 | 2048 | 6.071 ms | 5.396 ms | 1.13x |
+| ``hstu_ultra`` | 12 | 768 | 9.104 ms | 8.056 ms | 1.13x |
+| ``hstu_ultra`` | 12 | 1024 | 9.375 ms | 7.768 ms | 1.21x |
+| ``hstu_ultra`` | 12 | 1536 | 9.469 ms | 7.565 ms | 1.25x |
+
+The FP8 provider uses cached weights, fused LayerNorm-to-FP8 quantization for
+the UVQK projection, fused output normalization/gating/dropout-to-FP8
+quantization, and a persistent Triton row-wise FP8 GEMM. The semi-local and
+target-aware configurations are measured independently.
+
 ```bash
 python3 -m generative_recommenders.ops.benchmarks.hstu_ultra_bench \
   --config-name hstu_ultra_l1 --kernel triton --batch-size 1 --mode fwd
@@ -144,10 +180,12 @@ decisions.
 
 #### FP8 linear reference and benchmark
 
-``ops/fp8.py`` provides portable row-wise E4M3 quantization and FP8 addmm using
-PyTorch ``torch._scaled_mm`` on CUDA, with a CPU reference fallback. The initial
-implementation supports both on-the-fly and prequantized inference inputs and a
-full-precision backward for training; custom fused kernels are not included.
+``ops/fp8.py`` provides row-wise E4M3 quantization and FP8 addmm. It dispatches
+to a persistent Triton implementation when requested and retains the portable
+PyTorch ``torch._scaled_mm`` implementation and CPU fallback. Both paths
+support on-the-fly or prequantized inputs and a full-precision backward for
+training. HSTU's Triton path also fuses activation quantization into its input
+LayerNorm and output postprocessing kernels.
 Set ``fp8_in_addmm_fwd=True`` on ``hstu_compute_uqvk`` and
 ``hstu_compute_output`` to use the FP8 path for the HSTU input and output
 projections. ``STULayerConfig(fp8_addmm_fwd=True)`` enables both projection

@@ -21,6 +21,7 @@ from typing import List, Optional, Tuple
 
 import torch
 from generative_recommenders.common import fx_unwrap_optional_tensor, HammerModule
+from generative_recommenders.ops.fp8 import quantize_fp8_per_row
 from generative_recommenders.ops.hstu_attention import delta_hstu_mha
 from generative_recommenders.ops.hstu_compute import (
     hstu_compute_output,
@@ -80,6 +81,7 @@ class STULayerConfig:
     sort_by_length: bool = True
     contextual_seq_len: int = 0
     fp8_addmm_fwd: bool = False
+    min_full_attn_seq_len: int = 0
 
 
 @torch.fx.wrap
@@ -179,6 +181,10 @@ class STULayer(STU):
     k_cache: Optional[torch.Tensor]
     v_cache: Optional[torch.Tensor]
     kv_caching_offsets: Optional[torch.Tensor]
+    _uvqk_weight_fp8: Optional[torch.Tensor]
+    _uvqk_weight_scale: Optional[torch.Tensor]
+    _output_weight_fp8: Optional[torch.Tensor]
+    _output_weight_scale: Optional[torch.Tensor]
 
     def __init__(
         self,
@@ -205,6 +211,7 @@ class STULayer(STU):
         self._sort_by_length: bool = config.sort_by_length
         self._contextual_seq_len: int = config.contextual_seq_len
         self._fp8_addmm_fwd: bool = config.fp8_addmm_fwd
+        self._min_full_attn_seq_len: int = config.min_full_attn_seq_len
 
         self._uvqk_weight: torch.nn.Parameter = torch.nn.Parameter(
             torch.empty(
@@ -245,6 +252,62 @@ class STULayer(STU):
         )
         self._output_norm_bias: torch.nn.Parameter = torch.nn.Parameter(
             torch.zeros((output_norm_shape,)),
+        )
+        self._uvqk_weight_fp8 = None
+        self._uvqk_weight_scale = None
+        self._output_weight_fp8 = None
+        self._output_weight_scale = None
+        self._uvqk_weight_cache_version: int = -1
+        self._output_weight_cache_version: int = -1
+
+    @torch.jit.unused
+    @torch.no_grad()
+    def prepare_fp8_weights(self) -> None:
+        """Prequantize projection weights for repeated inference calls."""
+        if not self._fp8_addmm_fwd:
+            return
+        kernel = self.hammer_kernel()
+        self._uvqk_weight_fp8, self._uvqk_weight_scale = quantize_fp8_per_row(
+            self._uvqk_weight.detach().t().contiguous(), kernel=kernel
+        )
+        self._output_weight_fp8, self._output_weight_scale = quantize_fp8_per_row(
+            self._output_weight.detach().t().contiguous(), kernel=kernel
+        )
+        self._uvqk_weight_cache_version = self._uvqk_weight._version
+        self._output_weight_cache_version = self._output_weight._version
+
+    @torch.jit.unused
+    def clear_fp8_weight_cache(self) -> None:
+        self._uvqk_weight_fp8 = None
+        self._uvqk_weight_scale = None
+        self._output_weight_fp8 = None
+        self._output_weight_scale = None
+        self._uvqk_weight_cache_version = -1
+        self._output_weight_cache_version = -1
+
+    @torch.jit.unused
+    def _fp8_weight_cache(
+        self,
+    ) -> Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        if not self._fp8_addmm_fwd or self.training:
+            return None, None, None, None
+        if self._uvqk_weight_fp8 is None or self._output_weight_fp8 is None:
+            return None, None, None, None
+        if (
+            self._uvqk_weight_cache_version != self._uvqk_weight._version
+            or self._output_weight_cache_version != self._output_weight._version
+        ):
+            self.clear_fp8_weight_cache()
+        return (
+            self._uvqk_weight_fp8,
+            self._uvqk_weight_scale,
+            self._output_weight_fp8,
+            self._output_weight_scale,
         )
 
     def reset_kv_cache(self) -> None:
@@ -302,6 +365,17 @@ class STULayer(STU):
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        uvqk_weight_fp8: Optional[torch.Tensor] = None
+        uvqk_weight_scale: Optional[torch.Tensor] = None
+        output_weight_fp8: Optional[torch.Tensor] = None
+        output_weight_scale: Optional[torch.Tensor] = None
+        if not torch.jit.is_scripting():
+            (
+                uvqk_weight_fp8,
+                uvqk_weight_scale,
+                output_weight_fp8,
+                output_weight_scale,
+            ) = self._fp8_weight_cache()
         with record_function("## stu_preprocess_and_attention ##"):
             u, attn_output, k, v = hstu_preprocess_and_attention(
                 x=x,
@@ -326,6 +400,9 @@ class STULayer(STU):
                 prefill=kv_caching_lengths is not None,
                 kernel=self.hammer_kernel(),
                 fp8_in_addmm_fwd=self._fp8_addmm_fwd,
+                min_full_attn_seq_len=self._min_full_attn_seq_len,
+                uvqk_weight_fp8=uvqk_weight_fp8,
+                uvqk_weight_scale=uvqk_weight_scale,
             )
 
         self.update_kv_cache(
@@ -357,6 +434,8 @@ class STULayer(STU):
                 kernel=self.hammer_kernel(),
                 recompute_y_in_backward=self._recompute_y,
                 fp8_in_addmm_fwd=self._fp8_addmm_fwd,
+                output_weight_fp8=output_weight_fp8,
+                output_weight_scale=output_weight_scale,
             )
 
     def cached_forward(
@@ -366,6 +445,21 @@ class STULayer(STU):
         max_kv_caching_len: int = 0,
         kv_caching_lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self._min_full_attn_seq_len > 0:
+            raise NotImplementedError(
+                "cached HSTU attention does not support min_full_attn_seq_len"
+            )
+        uvqk_weight_fp8: Optional[torch.Tensor] = None
+        uvqk_weight_scale: Optional[torch.Tensor] = None
+        output_weight_fp8: Optional[torch.Tensor] = None
+        output_weight_scale: Optional[torch.Tensor] = None
+        if not torch.jit.is_scripting():
+            (
+                uvqk_weight_fp8,
+                uvqk_weight_scale,
+                output_weight_fp8,
+                output_weight_scale,
+            ) = self._fp8_weight_cache()
         with record_function("## stu_compute_uqvk ##"):
             delta_u, delta_q, delta_k, delta_v = hstu_compute_uqvk(
                 x=delta_x,
@@ -379,6 +473,8 @@ class STULayer(STU):
                 uvqk_bias=self._uvqk_beta.to(delta_x.dtype),
                 kernel=self.hammer_kernel(),
                 fp8_in_addmm_fwd=self._fp8_addmm_fwd,
+                uvqk_weight_fp8=uvqk_weight_fp8,
+                uvqk_weight_scale=uvqk_weight_scale,
             )
         k, v, max_seq_len, seq_offsets = self.construct_full_kv(
             delta_k=delta_k.flatten(1, 2),
@@ -427,6 +523,8 @@ class STULayer(STU):
                 kernel=self.hammer_kernel(),
                 recompute_y_in_backward=self._recompute_y,
                 fp8_in_addmm_fwd=self._fp8_addmm_fwd,
+                output_weight_fp8=output_weight_fp8,
+                output_weight_scale=output_weight_scale,
             )
 
 

@@ -17,15 +17,48 @@
 from __future__ import annotations
 
 import torch
+from generative_recommenders.common import HammerKernel
 from generative_recommenders.ops.pytorch.pt_fp8 import (
     pytorch_fp8_rowwise_addmm,
     pytorch_quantize_fp8_per_row,
 )
+from generative_recommenders.ops.triton.triton_fp8 import (
+    triton_fp8_rowwise_addmm,
+    triton_layer_norm_fp8_quantize,
+    triton_quantize_fp8_per_row,
+)
 
 
-def quantize_fp8_per_row(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_fp8_per_row(
+    x: torch.Tensor,
+    kernel: HammerKernel = HammerKernel.PYTORCH,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``x`` to E4M3 with one dequantization scale per row."""
+    if kernel == HammerKernel.TRITON and x.device.type == "cuda":
+        return triton_quantize_fp8_per_row(x)
     return pytorch_quantize_fp8_per_row(x)
+
+
+def layer_norm_fp8_quantize(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+    kernel: HammerKernel = HammerKernel.PYTORCH,
+    save_y: bool = True,
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    """Layer-normalize and row-wise quantize an activation tensor."""
+    if kernel == HammerKernel.TRITON and x.device.type == "cuda":
+        return triton_layer_norm_fp8_quantize(x, weight, bias, eps, save_y)
+    normalized = torch.nn.functional.layer_norm(
+        x,
+        normalized_shape=(x.shape[-1],),
+        weight=weight,
+        bias=bias,
+        eps=eps,
+    )
+    normalized_fp8, scale = quantize_fp8_per_row(normalized, kernel=kernel)
+    return normalized if save_y else None, normalized_fp8, scale
 
 
 def fp8_rowwise_addmm(
@@ -39,6 +72,7 @@ def fp8_rowwise_addmm(
     out_dtype: torch.dtype = torch.bfloat16,
     use_fast_accum: bool = True,
     is_inference: bool = False,
+    kernel: HammerKernel = HammerKernel.PYTORCH,
 ) -> torch.Tensor:
     """Compute ``mat1 @ mat2 + input`` using row-wise E4M3 inputs.
 
@@ -49,11 +83,26 @@ def fp8_rowwise_addmm(
     if mat1_fp8 is None or mat1_scale is None:
         if mat1 is None:
             raise ValueError("mat1 is required when mat1_fp8 and mat1_scale are absent")
-        mat1_fp8, mat1_scale = quantize_fp8_per_row(mat1)
+        mat1_fp8, mat1_scale = quantize_fp8_per_row(mat1, kernel=kernel)
     if mat2_fp8 is None or mat2_scale is None:
         if mat2 is None:
             raise ValueError("mat2 is required when mat2_fp8 and mat2_scale are absent")
-        mat2_fp8, mat2_scale = quantize_fp8_per_row(mat2.t().contiguous())
+        mat2_fp8, mat2_scale = quantize_fp8_per_row(
+            mat2.t().contiguous(), kernel=kernel
+        )
+    if kernel == HammerKernel.TRITON and mat1_fp8.device.type == "cuda":
+        return triton_fp8_rowwise_addmm(
+            input=input,
+            mat1=mat1,
+            mat2=mat2,
+            mat1_fp8=mat1_fp8,
+            mat2_fp8=mat2_fp8,
+            mat1_scale=mat1_scale,
+            mat2_scale=mat2_scale,
+            out_dtype=out_dtype,
+            use_fast_accum=use_fast_accum,
+            is_inference=is_inference,
+        )
     return pytorch_fp8_rowwise_addmm(
         input=input,
         mat1=mat1,

@@ -31,6 +31,11 @@ from generative_recommenders.common import (
     triton_autotune,
 )
 from generative_recommenders.ops.triton.triton_addmm import maybe_triton_addmm_fwd
+from generative_recommenders.ops.triton.triton_fp8 import (
+    triton_fp8_rowwise_addmm_fwd,
+    triton_hstu_output_fp8_quantize_fwd,
+    triton_quantize_fp8_per_row,
+)
 from generative_recommenders.ops.utils import maybe_register_custom_op
 
 
@@ -2359,11 +2364,44 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
         seed: Optional[int] = None,
         recompute_y_in_backward: bool = False,
         use_rms_norm: bool = False,
+        fp8_in_addmm_fwd: bool = False,
+        output_weight_fp8: Optional[torch.Tensor] = None,
+        output_weight_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if dropout_ratio == 0.0:
             training = False
 
-        if group_norm:
+        y_fp8: Optional[torch.Tensor] = None
+        y_scale: Optional[torch.Tensor] = None
+        if fp8_in_addmm_fwd:
+            assert not group_norm, "FP8 output projection does not support group norm"
+            assert not use_rms_norm, "FP8 output projection does not support RMSNorm"
+            (
+                y,
+                y_fp8,
+                y_scale,
+                mean,
+                rstd,
+                BLOCK_D,
+                num_warps,
+                seed,
+            ) = triton_hstu_output_fp8_quantize_fwd(
+                x=attn,
+                u=u,
+                weight=norm_weight,
+                bias=norm_bias,
+                eps=eps,
+                dropout_ratio=dropout_ratio,
+                training=training,
+                silu_u=silu_u,
+                concat_u=concat_u,
+                concat_x=concat_x,
+                mul_u_activation_type=mul_u_activation_type,
+                seed=seed,
+                save_y=not recompute_y_in_backward,
+            )
+            random_mask = None
+        elif group_norm:
             assert not use_rms_norm, "use_rms_norm is incompatible with group_norm"
             y, mean, rstd, BLOCK_D, BLOCK_H, num_warps, seed = (
                 triton_group_norm_mul_dropout_fwd(
@@ -2401,10 +2439,25 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
                 )
             )
 
-        out = maybe_triton_addmm_fwd(x=y, w=output_weight, y=x)
+        if fp8_in_addmm_fwd:
+            assert y_fp8 is not None and y_scale is not None
+            if output_weight_fp8 is None or output_weight_scale is None:
+                output_weight_fp8, output_weight_scale = triton_quantize_fp8_per_row(
+                    output_weight.t().contiguous()
+                )
+            out = triton_fp8_rowwise_addmm_fwd(
+                input=x,
+                mat1_fp8=y_fp8,
+                mat2_fp8=output_weight_fp8,
+                mat1_scale=y_scale,
+                mat2_scale=output_weight_scale,
+            )
+        else:
+            out = maybe_triton_addmm_fwd(x=y, w=output_weight, y=x)
 
         saved_tensors = [attn, u, norm_weight, norm_bias, mean, rstd, output_weight]
         if not recompute_y_in_backward:
+            assert y is not None
             saved_tensors.append(y)
         # Save random_mask for reuse in backward pass (avoids regenerating mask)
         # When random_mask is available (SM100+ path), always save it.
@@ -2429,6 +2482,7 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
         ctx.silu_u = silu_u
         ctx.mul_u_activation_type = mul_u_activation_type
         ctx.use_rms_norm = use_rms_norm
+        ctx.fp8_in_addmm_fwd = fp8_in_addmm_fwd
         return out
 
     @staticmethod
@@ -2455,6 +2509,9 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
         None,  # seed
         None,  # recompute_y_in_backward
         None,  # use_rms_norm
+        None,  # fp8_in_addmm_fwd
+        None,  # output_weight_fp8
+        None,  # output_weight_scale
     ]:
         attn, u, norm_weight, norm_bias, mean, rstd, output_weight = ctx.saved_tensors[
             :7
@@ -2549,6 +2606,9 @@ class HSTUComputeOutputFunction(torch.autograd.Function):
             None,  # seed
             None,  # recompute_y_in_backward
             None,  # use_rms_norm
+            None,  # fp8_in_addmm_fwd
+            None,  # output_weight_fp8
+            None,  # output_weight_scale
         )
 
 
@@ -3185,6 +3245,9 @@ def triton_hstu_compute_output(
     seed: Optional[int] = None,
     recompute_y_in_backward: bool = False,
     use_rms_norm: bool = False,
+    fp8_in_addmm_fwd: bool = False,
+    output_weight_fp8: Optional[torch.Tensor] = None,
+    output_weight_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return HSTUComputeOutputFunction.apply(
         attn,
@@ -3206,4 +3269,7 @@ def triton_hstu_compute_output(
         seed,
         recompute_y_in_backward,
         use_rms_norm,
+        fp8_in_addmm_fwd,
+        output_weight_fp8,
+        output_weight_scale,
     )
