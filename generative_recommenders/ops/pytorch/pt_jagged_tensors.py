@@ -28,6 +28,21 @@ except OSError:
     pass
 
 
+def _interleaved_offsets(
+    offsets_left: torch.Tensor, offsets_right: torch.Tensor
+) -> torch.Tensor:
+    """Offsets of the 2B segments ``l0, r0, l1, r1, ...`` of a concatenated
+    jagged tensor (row b's left part followed by its right part)."""
+    starts_left = offsets_left[:-1] + offsets_right[:-1]
+    starts_right = offsets_left[1:] + offsets_right[:-1]
+    return torch.cat(
+        [
+            torch.stack([starts_left, starts_right], dim=1).view(-1),
+            offsets_left[-1:] + offsets_right[-1:],
+        ]
+    )
+
+
 def _concat_2D_jagged_jagged(
     values_left: torch.Tensor,
     values_right: torch.Tensor,
@@ -36,31 +51,27 @@ def _concat_2D_jagged_jagged(
     offsets_left: torch.Tensor,
     offsets_right: torch.Tensor,
 ) -> torch.Tensor:
-    max_seq_len = max_len_left + max_len_right
-    lengths_left = offsets_left[1:] - offsets_left[:-1]
-    lengths_right = offsets_right[1:] - offsets_right[:-1]
+    B = offsets_left.shape[0] - 1
+    max_len = max(max_len_left, max_len_right)
     padded_left = torch.ops.fbgemm.jagged_to_padded_dense(
         values=values_left,
         offsets=[offsets_left],
-        max_lengths=[max_len_left],
+        max_lengths=[max_len],
         padding_value=0.0,
     )
     padded_right = torch.ops.fbgemm.jagged_to_padded_dense(
         values=values_right,
         offsets=[offsets_right],
-        max_lengths=[max_len_right],
+        max_lengths=[max_len],
         padding_value=0.0,
     )
-    concatted_dense = torch.cat([padded_left, padded_right], dim=1)
-    mask = fx_arange(max_seq_len, device=offsets_left.device).view(1, -1)
-    mask = torch.logical_or(
-        mask < lengths_left.view(-1, 1),
-        torch.logical_and(
-            mask >= max_len_left,
-            mask < max_len_left + lengths_right.view(-1, 1),
-        ),
-    )
-    return concatted_dense.flatten(0, 1)[mask.view(-1), :]
+    # [B, 2 * max_len, D] viewed as 2B padded segments l0, r0, l1, r1, ...
+    interleaved = torch.cat([padded_left, padded_right], dim=1).view(2 * B, max_len, -1)
+    return torch.ops.fbgemm.dense_to_jagged(
+        interleaved,
+        [_interleaved_offsets(offsets_left, offsets_right)],
+        values_left.shape[0] + values_right.shape[0],
+    )[0]
 
 
 @torch.fx.wrap
@@ -121,23 +132,31 @@ def _split_2D_jagged_jagged(
     values: torch.Tensor,
     offsets_left: torch.Tensor,
     offsets_right: torch.Tensor,
+    total_len_left: Optional[int] = None,
+    total_len_right: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    offsets = offsets_left + offsets_right
-    padded_values = torch.ops.fbgemm.jagged_to_padded_dense(
+    if total_len_left is None and total_len_right is None:
+        total_len_left = int(offsets_left[-1].item())
+    if total_len_left is None:
+        assert total_len_right is not None
+        total_len_left = values.shape[0] - total_len_right
+    if total_len_right is None:
+        total_len_right = values.shape[0] - total_len_left
+    B = offsets_left.shape[0] - 1
+    # 2B padded segments l0, r0, l1, r1, ... viewed as [B, 2 * max_seq_len, D].
+    padded = torch.ops.fbgemm.jagged_to_padded_dense(
         values=values,
-        offsets=[offsets],
+        offsets=[_interleaved_offsets(offsets_left, offsets_right)],
         max_lengths=[max_seq_len],
         padding_value=0.0,
-    ).flatten(0, 1)
-    lengths_left = offsets_left[1:] - offsets_left[:-1]
-    lengths_right = offsets_right[1:] - offsets_right[:-1]
-    mask = fx_arange(max_seq_len, device=values.device).view(1, -1)
-    mask_left = mask < lengths_left.view(-1, 1)
-    mask_right = torch.logical_and(
-        mask >= lengths_left.view(-1, 1),
-        mask < (lengths_left + lengths_right).view(-1, 1),
-    )
-    return padded_values[mask_left.view(-1), :], padded_values[mask_right.view(-1), :]
+    ).view(B, 2 * max_seq_len, -1)
+    left = torch.ops.fbgemm.dense_to_jagged(
+        padded[:, :max_seq_len], [offsets_left], total_len_left
+    )[0]
+    right = torch.ops.fbgemm.dense_to_jagged(
+        padded[:, max_seq_len:], [offsets_right], total_len_right
+    )[0]
+    return left, right
 
 
 @torch.fx.wrap
@@ -148,6 +167,8 @@ def pytorch_split_2D_jagged(
     max_len_right: Optional[int],
     offsets_left: Optional[torch.Tensor],
     offsets_right: Optional[torch.Tensor],
+    total_len_left: Optional[int] = None,
+    total_len_right: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if offsets_left is None:
         assert max_len_left is not None
@@ -170,6 +191,8 @@ def pytorch_split_2D_jagged(
         values=values,
         offsets_left=offsets_left_non_optional,
         offsets_right=offsets_right_non_optional,
+        total_len_left=total_len_left,
+        total_len_right=total_len_right,
     )
 
 
