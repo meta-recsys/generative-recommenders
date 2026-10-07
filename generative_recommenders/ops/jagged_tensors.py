@@ -128,6 +128,8 @@ def split_2D_jagged(
             max_len_right=max_len_right,
             offsets_left=offsets_left,
             offsets_right=offsets_right,
+            total_len_left=total_len_left,
+            total_len_right=total_len_right,
         )
     if not is_fx_tracing():
         torch._assert(values.dim() == 2, "values must be 2D")
@@ -169,6 +171,8 @@ def split_2D_jagged(
             max_len_right=max_len_right,
             offsets_left=offsets_left,
             offsets_right=offsets_right,
+            total_len_left=total_len_left,
+            total_len_right=total_len_right,
         )
 
 
