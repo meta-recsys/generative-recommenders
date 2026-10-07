@@ -1321,6 +1321,149 @@ class RMSNormFunction(torch.autograd.Function):
         return dx, dweight, None, None
 
 
+@maybe_register_custom_op(
+    "generative_recommenders::triton_swish_layer_norm_fwd", mutates_args=()
+)
+def triton_swish_layer_norm_fwd(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Returns ``(y, mean, rstd)``."""
+    assert x.dim() == 2, f"x.dim() == {x.dim()}, expected 2"
+    x = switch_to_contiguous_if_needed(x)
+    N, D = x.shape
+    assert weight.dim() == 1
+    assert bias.dim() == 1
+    assert weight.numel() == D
+    assert bias.numel() == D
+
+    y = torch.empty_like(x)
+    mean = torch.empty((N,), dtype=torch.float32, device=x.device)
+    rstd = torch.empty((N,), dtype=torch.float32, device=x.device)
+    if N == 0:
+        return y, mean, rstd
+
+    # pyre-ignore[28]
+    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_N"]),)  # noqa E731
+    _weighted_layer_norm_fwd[grid](
+        x,
+        y,
+        weight,
+        bias,
+        mean,
+        rstd,
+        N,
+        D,
+        eps,
+        x.stride(0),
+        y.stride(0),
+        IS_SWISH=True,
+        TRAINING=True,
+        BLOCK_D=triton.next_power_of_2(D),
+        COMPUTE_MEAN_AND_RSTD=True,
+    )
+    return y, mean, rstd
+
+
+@triton_swish_layer_norm_fwd.register_fake
+def _(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    N = x.shape[0]
+    return (
+        torch.empty_like(x),
+        x.new_empty((N,), dtype=torch.float32),
+        x.new_empty((N,), dtype=torch.float32),
+    )
+
+
+@maybe_register_custom_op(
+    "generative_recommenders::triton_swish_layer_norm_bwd", mutates_args=()
+)
+def triton_swish_layer_norm_bwd(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Returns ``(dx, dweight, dbias)``."""
+    N, D = x.shape
+    dx = torch.empty_like(x)
+    sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+    tile_num = max(1, min(sms * 8, N // 4))
+    _dweight = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
+    _dbias = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
+    dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
+    dbias = torch.empty((D,), dtype=weight.dtype, device=x.device)
+    if N == 0:
+        dweight.zero_()
+        dbias.zero_()
+        return dx, dweight, dbias
+    # pyre-ignore[28]
+    _weighted_layer_norm_bwd_dx[(tile_num,)](
+        dx,
+        dy,
+        _dweight,
+        _dbias,
+        x,
+        weight,
+        bias,
+        mean,
+        rstd,
+        dx.stride(0),
+        dy.stride(0),
+        x.stride(0),
+        D,
+        eps,
+        IS_SWISH=True,
+        N=N,
+        BLOCK_D=triton.next_power_of_2(D),
+    )
+
+    def grid(META):
+        return (triton.cdiv(D, META["BLOCK_D"]),)
+
+    blocks = triton.next_power_of_2(sms * 4)
+    BLOCK_D = triton.next_power_of_2(triton.cdiv(D, blocks))
+    BLOCK_D = min(max(BLOCK_D, 4), 128)
+    _layer_norm_bwd_dwdb[grid](
+        _dweight,
+        _dbias,
+        dweight,
+        dbias,
+        tile_num,
+        D,
+        BLOCK_D=BLOCK_D,
+    )
+    return dx, dweight, dbias
+
+
+@triton_swish_layer_norm_bwd.register_fake
+def _(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    D = x.shape[1]
+    return (
+        torch.empty_like(x),
+        x.new_empty((D,), dtype=weight.dtype),
+        x.new_empty((D,), dtype=weight.dtype),
+    )
+
+
 class SwishLayerNormFunction(torch.autograd.Function):
     @staticmethod
     # pyre-ignore[14]
@@ -1435,6 +1578,39 @@ class SwishLayerNormFunction(torch.autograd.Function):
         return dx, dweight, dbias, None
 
 
+class TraceableSwishLayerNormFunction(torch.autograd.Function):
+    """``SwishLayerNormFunction`` with the kernels behind custom ops (with fake
+    kernels), so it traces with fake tensors (make_fx / torch.compile). Same
+    kernels and numerics; ``SwishLayerNormFunction`` is kept as is for its
+    existing users."""
+
+    @staticmethod
+    # pyre-ignore[14]
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        x = switch_to_contiguous_if_needed(x)
+        y, mean, rstd = triton_swish_layer_norm_fwd(x, weight, bias, eps)
+        ctx.save_for_backward(x, weight, bias, mean, rstd)
+        ctx.eps = eps
+        return y
+
+    @staticmethod
+    # pyre-ignore[14]
+    def backward(
+        ctx, dy: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], None]:
+        x, weight, bias, mean, rstd = ctx.saved_tensors
+        dx, dweight, dbias = triton_swish_layer_norm_bwd(
+            switch_to_contiguous_if_needed(dy), x, weight, bias, mean, rstd, ctx.eps
+        )
+        return dx, dweight, dbias, None
+
+
 @torch.jit.unused
 @torch.fx.wrap
 def triton_layer_norm(
@@ -1467,3 +1643,15 @@ def triton_swish_layer_norm(
     eps: float,
 ) -> torch.Tensor:
     return SwishLayerNormFunction.apply(x, weight, bias, eps)
+
+
+@torch.jit.unused
+@torch.fx.wrap
+def triton_traceable_swish_layer_norm(
+    x: torch.Tensor,
+    normalized_shape: List[int],
+    weight: Optional[torch.Tensor],
+    bias: Optional[torch.Tensor],
+    eps: float,
+) -> torch.Tensor:
+    return TraceableSwishLayerNormFunction.apply(x, weight, bias, eps)
