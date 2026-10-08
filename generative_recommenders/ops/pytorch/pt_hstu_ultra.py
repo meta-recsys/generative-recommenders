@@ -141,6 +141,7 @@ def pytorch_hstu_ultra_attention(
                 .unsqueeze(1)
                 .to(qk_attn.dtype)
             )
+        # pyrefly: ignore [unsupported-operation]
         qk_attn = F.silu(qk_attn) * attn_scale
     else:
         qk_attn = F.silu(qk_attn) / max_seq_len
