@@ -48,7 +48,7 @@ from generative_recommenders.modules.postprocessors import (
 from generative_recommenders.modules.preprocessors import ContextualPreprocessor
 from generative_recommenders.modules.stu import STU, STULayer, STULayerConfig, STUStack
 from generative_recommenders.ops.jagged_tensors import concat_2D_jagged
-from generative_recommenders.ops.layer_norm import LayerNorm, SwishLayerNorm
+from generative_recommenders.ops.layer_norm import LayerNorm, TraceableSwishLayerNorm
 from torch.autograd.profiler import record_function
 from torchrec import KeyedJaggedTensor
 from torchrec.modules.embedding_configs import EmbeddingConfig
@@ -153,7 +153,7 @@ class DlrmHSTU(HammerModule):
             embedding_dim=hstu_configs.hstu_transducer_embedding_dim,
             prediction_fn=lambda in_dim, num_tasks: torch.nn.Sequential(
                 torch.nn.Linear(in_features=in_dim, out_features=512),
-                SwishLayerNorm(512),
+                TraceableSwishLayerNorm(512),
                 torch.nn.Linear(in_features=512, out_features=num_tasks),
             ).apply(init_mlp_weights_optional_bias),
             causal_multitask_weights=hstu_configs.causal_multitask_weights,
@@ -302,7 +302,7 @@ class DlrmHSTU(HammerModule):
                 * len(self._hstu_configs.item_embedding_feature_names),
                 out_features=512,
             ),
-            SwishLayerNorm(512),
+            TraceableSwishLayerNorm(512),
             torch.nn.Linear(
                 in_features=512,
                 out_features=hstu_configs.hstu_transducer_embedding_dim,

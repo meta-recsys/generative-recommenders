@@ -39,11 +39,13 @@ from generative_recommenders.common import HammerKernel, HammerModule
 from generative_recommenders.ops.triton.triton_layer_norm import (
     triton_layer_norm,
     triton_swish_layer_norm,
+    triton_traceable_swish_layer_norm,
 )
 from torch.fx._symbolic_trace import is_fx_tracing
 
 torch.fx.wrap("triton_layer_norm")
 torch.fx.wrap("triton_swish_layer_norm")
+torch.fx.wrap("triton_traceable_swish_layer_norm")
 torch.fx.wrap("triton_rms_norm")
 
 
@@ -278,3 +280,20 @@ class SwishLayerNorm(HammerModule):
             eps=self._eps,
             kernel=self.hammer_kernel(),
         )
+
+
+class TraceableSwishLayerNorm(SwishLayerNorm):
+    """``SwishLayerNorm`` whose Triton kernel traces with fake tensors (make_fx /
+    torch.compile), e.g. for compilers that trace whole training steps. Same
+    parameters, kernels and numerics; other kernels behave as in
+    ``SwishLayerNorm``."""
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.hammer_kernel() == HammerKernel.TRITON and not torch.jit.is_scripting():
+            return triton_traceable_swish_layer_norm(
+                x, [x.shape[-1]], self.weight, self.bias, self._eps
+            )
+        return super().forward(x)
