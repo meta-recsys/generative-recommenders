@@ -1300,7 +1300,9 @@ def triton_layer_norm_mul_dropout_fwd(
     assert weight.dim() == 1
     assert bias.dim() == 1
     assert weight.numel() == D
-    assert bias.numel() == D
+    # RMSNorm callers pass an empty bias: the kernel's RMSNorm branch never
+    # reads it, and the custom-op schema only requires a Tensor.
+    assert use_rms_norm or bias.numel() == D
 
     if N == 0:
         D = x.shape[1]

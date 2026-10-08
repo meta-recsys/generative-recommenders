@@ -521,3 +521,47 @@ class HSTUComputeTest(unittest.TestCase):
             torch.testing.assert_close(
                 ref_d_uvqk_bias, real_d_uvqk_bias, atol=atol, rtol=rtol
             )
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_layer_norm_mul_dropout_fwd_bias_check(self) -> None:
+        from generative_recommenders.ops.triton.triton_hstu_linear import (
+            triton_layer_norm_mul_dropout_fwd,
+        )
+
+        N, D = 256, 64
+        device = torch.device("cuda")
+        x = torch.randn(N, D, device=device)
+        u = torch.randn(N, D, device=device)
+        weight = torch.rand(D, device=device) + 0.5
+        empty_bias = torch.empty(0, device=device)
+
+        # LayerNorm still requires a (D,) bias, including the empty stand-in
+        # that RMSNorm callers pass.
+        for bad_bias in (torch.zeros(D - 1, device=device), empty_bias):
+            with self.assertRaises(AssertionError):
+                triton_layer_norm_mul_dropout_fwd(
+                    x, u, weight, bad_bias, eps=1e-6, dropout_ratio=0.0, training=False
+                )
+
+        # RMSNorm accepts the empty bias and never reads it.
+        y_empty = triton_layer_norm_mul_dropout_fwd(
+            x,
+            u,
+            weight,
+            empty_bias,
+            eps=1e-6,
+            dropout_ratio=0.0,
+            training=False,
+            use_rms_norm=True,
+        )[0]
+        y_real = triton_layer_norm_mul_dropout_fwd(
+            x,
+            u,
+            weight,
+            torch.randn(D, device=device),
+            eps=1e-6,
+            dropout_ratio=0.0,
+            training=False,
+            use_rms_norm=True,
+        )[0]
+        torch.testing.assert_close(y_empty, y_real, rtol=0, atol=0)
