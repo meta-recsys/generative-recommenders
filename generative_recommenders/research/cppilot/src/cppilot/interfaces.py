@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -24,15 +24,27 @@ class ModelRequest:
     messages: Sequence[RunItem]
     tools: Sequence[ToolDefinition] = ()
     output_schema: dict[str, Any] | None = None
+    system: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
 class ModelResponse:
     items: Sequence[RunItem]
     usage: Usage = field(default_factory=Usage)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ModelCapabilities:
+    streaming: bool = False
+    tools: bool = True
+    structured_output: bool = False
 
 
 class ModelProvider(ABC):
+    capabilities = ModelCapabilities()
+
     @abstractmethod
     async def generate(self, request: ModelRequest) -> ModelResponse: ...
 
@@ -40,13 +52,35 @@ class ModelProvider(ABC):
         response = await self.generate(request)
         for item in response.items:
             yield item
-        yield response.usage
+        yield replace(
+            response.usage, metadata={**response.usage.metadata, **response.metadata}
+        )
+
+
+class RetryableModelError(RuntimeError):
+    """A transient provider error that the runner may retry."""
 
 
 Compactor = Callable[[list[RunItem]], list[RunItem] | Awaitable[list[RunItem]]]
 
 
 class MemoryStore(ABC):
+    async def get_active_agent(self, conversation_id: str) -> str | None:
+        """Optional durable state for stores predating agent handoffs."""
+        return None
+
+    async def set_active_agent(
+        self, conversation_id: str, agent_name: str | None
+    ) -> None:
+        return None
+
+    async def append_turn(
+        self, conversation_id: str, items: Sequence[RunItem], agent_name: str
+    ) -> None:
+        """Stores may override this to atomically commit history and active agent."""
+        await self.append(conversation_id, items)
+        await self.set_active_agent(conversation_id, agent_name)
+
     @abstractmethod
     async def load(self, conversation_id: str) -> list[RunItem]: ...
 
@@ -68,6 +102,7 @@ class Session:
     agent_name: str
     conversation_id: str
     metadata: dict[str, Any] = field(default_factory=dict)
+    active_agent: str | None = None
 
 
 class SessionStore(ABC):
