@@ -30,7 +30,7 @@ from generative_recommenders.common import (
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
-from generative_recommenders.ops.utils import is_sm100_plus
+from generative_recommenders.ops.utils import is_sm100_plus, maybe_register_custom_op
 
 
 def _triton_concat_2D_jagged_internal(
@@ -147,6 +147,134 @@ def _triton_split_2D_jagged_internal(
             IS_DENSE_B=is_dense_b,  # pyre-ignore[6]
             BLOCK_D=BLOCK_D,  # pyre-ignore[6]
         )
+
+
+def _jagged_batch_size(
+    total_len: int,
+    offsets: Optional[torch.Tensor],
+    max_len: Optional[int],
+) -> int:
+    if offsets is not None:
+        return offsets.shape[0] - 1
+    assert max_len is not None
+    return total_len // max_len
+
+
+@maybe_register_custom_op(
+    "generative_recommenders::triton_concat_2D_jagged_fwd", mutates_args=()
+)
+def triton_concat_2D_jagged_fwd(
+    values_a: torch.Tensor,
+    values_b: torch.Tensor,
+    offsets_a: Optional[torch.Tensor],
+    offsets_b: Optional[torch.Tensor],
+    max_seq_len: int,
+    max_len_a: Optional[int],
+    max_len_b: Optional[int],
+    n_prefix_from_B: int,
+) -> torch.Tensor:
+    values_a = switch_to_contiguous_if_needed(values_a)
+    values_b = switch_to_contiguous_if_needed(values_b)
+    total_len_a, D = values_a.shape
+    total_len_b = values_b.shape[0]
+    B = _jagged_batch_size(total_len_b, offsets_b, max_len_b)
+    values_out = torch.empty(
+        (total_len_a + total_len_b, D), device=values_a.device, dtype=values_a.dtype
+    )
+    _triton_concat_2D_jagged_internal(
+        values_a=values_a,
+        values_b=values_b,
+        values_out=values_out,
+        max_seq_len=max_seq_len,
+        B=B,
+        offsets_a=offsets_a,
+        offsets_b=offsets_b,
+        max_len_a=max_len_a,
+        max_len_b=max_len_b,
+        D=D,
+        n_prefix_from_B=n_prefix_from_B,
+        is_dense_a=offsets_a is None,
+        is_dense_b=offsets_b is None,
+        BLOCK_D=triton.next_power_of_2(D),
+    )
+    return values_out
+
+
+@triton_concat_2D_jagged_fwd.register_fake
+def _(
+    values_a: torch.Tensor,
+    values_b: torch.Tensor,
+    offsets_a: Optional[torch.Tensor],
+    offsets_b: Optional[torch.Tensor],
+    max_seq_len: int,
+    max_len_a: Optional[int],
+    max_len_b: Optional[int],
+    n_prefix_from_B: int,
+) -> torch.Tensor:
+    return values_a.new_empty(
+        (values_a.shape[0] + values_b.shape[0], values_a.shape[1])
+    )
+
+
+@maybe_register_custom_op(
+    "generative_recommenders::triton_split_2D_jagged_fwd", mutates_args=()
+)
+def triton_split_2D_jagged_fwd(
+    values: torch.Tensor,
+    offsets_a: Optional[torch.Tensor],
+    offsets_b: Optional[torch.Tensor],
+    max_seq_len: int,
+    max_len_a: Optional[int],
+    max_len_b: Optional[int],
+    total_len_a: int,
+    total_len_b: int,
+    n_prefix_to_B: int,
+    zero_init_a: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    values = switch_to_contiguous_if_needed(values)
+    D = values.shape[1]
+    B = (
+        offsets_a.shape[0] - 1
+        if offsets_a is not None
+        else _jagged_batch_size(total_len_b, offsets_b, max_len_b)
+    )
+    alloc_a = torch.zeros if zero_init_a else torch.empty
+    values_a = alloc_a((total_len_a, D), device=values.device, dtype=values.dtype)
+    values_b = torch.empty((total_len_b, D), device=values.device, dtype=values.dtype)
+    _triton_split_2D_jagged_internal(
+        jagged_in=values,
+        max_seq_len=max_seq_len,
+        B=B,
+        offsets_a=offsets_a,
+        offsets_b=offsets_b,
+        max_len_a=max_len_a,
+        max_len_b=max_len_b,
+        out_a=values_a,
+        out_b=values_b,
+        D=D,
+        n_prefix_to_B=n_prefix_to_B,
+        is_dense_a=offsets_a is None,
+        is_dense_b=offsets_b is None,
+        BLOCK_D=triton.next_power_of_2(D),
+    )
+    return values_a, values_b
+
+
+@triton_split_2D_jagged_fwd.register_fake
+def _(
+    values: torch.Tensor,
+    offsets_a: Optional[torch.Tensor],
+    offsets_b: Optional[torch.Tensor],
+    max_seq_len: int,
+    max_len_a: Optional[int],
+    max_len_b: Optional[int],
+    total_len_a: int,
+    total_len_b: int,
+    n_prefix_to_B: int,
+    zero_init_a: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    D = values.shape[1]
+    return values.new_empty((total_len_a, D)), values.new_empty((total_len_b, D))
 
 
 def _get_concat_split_2d_jagged_multirow_configs():
@@ -543,54 +671,24 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
         offsets_b: Optional[torch.Tensor],
         n_prefix_from_B: int,
     ):
-        values_a = switch_to_contiguous_if_needed(values_a)
-        values_b = switch_to_contiguous_if_needed(values_b)
-        is_dense_a = offsets_a is None
-        is_dense_b = offsets_b is None
-        total_len_a, D = values_a.shape
-        total_len_b, _ = values_b.shape
-        if is_dense_a:
-            assert max_len_a is not None
-            B = total_len_a // max_len_a
-        else:
-            assert offsets_a is not None
-            B = offsets_a.shape[0] - 1
-        if is_dense_b:
-            assert max_len_b is not None
-            B = total_len_b // max_len_b
-        else:
-            assert offsets_b is not None
-            B = offsets_b.shape[0] - 1
-        total_seq_len = total_len_a + total_len_b
-        BLOCK_D = triton.next_power_of_2(D)
-        values_out = torch.empty(
-            (total_seq_len, D), device=values_a.device, dtype=values_a.dtype
-        )
-        _triton_concat_2D_jagged_internal(
-            values_a=values_a,
-            values_b=values_b,
-            values_out=values_out,
-            max_seq_len=max_seq_len,
-            B=B,
-            offsets_a=offsets_a,
-            offsets_b=offsets_b,
-            max_len_a=max_len_a,
-            max_len_b=max_len_b,
-            D=D,
-            n_prefix_from_B=n_prefix_from_B,
-            is_dense_a=is_dense_a,
-            is_dense_b=is_dense_b,
-            BLOCK_D=BLOCK_D,
+        assert offsets_a is not None or max_len_a is not None
+        assert offsets_b is not None or max_len_b is not None
+        values_out = triton_concat_2D_jagged_fwd(
+            values_a,
+            values_b,
+            offsets_a,
+            offsets_b,
+            max_seq_len,
+            max_len_a,
+            max_len_b,
+            n_prefix_from_B,
         )
         ctx.save_for_backward(offsets_a, offsets_b)
         ctx.max_seq_len = max_seq_len
-        ctx.total_len_a = total_len_a
-        ctx.total_len_b = total_len_b
-        ctx.is_dense_a = is_dense_a
-        ctx.is_dense_b = is_dense_b
+        ctx.total_len_a = values_a.shape[0]
+        ctx.total_len_b = values_b.shape[0]
         ctx.max_len_a = max_len_a
         ctx.max_len_b = max_len_b
-        ctx.B = B
         ctx.n_prefix_from_B = n_prefix_from_B
         return values_out
 
@@ -600,30 +698,17 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
         ctx, d_out: torch.Tensor
     ) -> Tuple[None, torch.Tensor, torch.Tensor, None, None, None, None, None]:
         offsets_a, offsets_b = ctx.saved_tensors
-        _, D = d_out.shape
-        BLOCK_D = triton.next_power_of_2(D)
-        d_values_a = torch.zeros(
-            (ctx.total_len_a, D), device=d_out.device, dtype=d_out.dtype
-        )
-        d_values_b = torch.empty(
-            (ctx.total_len_b, D), device=d_out.device, dtype=d_out.dtype
-        )
-        _split_2D_jagged[(ctx.max_seq_len, ctx.B)](
-            JaggedIn=d_out,
-            OffsetsA=offsets_a,
-            OffsetsB=offsets_b,
-            MaxLenA=ctx.max_len_a,
-            MaxLenB=ctx.max_len_b,
-            OutA=d_values_a,
-            OutB=d_values_b,
-            D=D,
-            stride_id=d_out.stride(-2),
-            stride_ad=d_values_a.stride(-2),
-            stride_bd=d_values_b.stride(-2),
-            n_prefix_to_B=ctx.n_prefix_from_B,
-            BLOCK_D=BLOCK_D,
-            IS_DENSE_A=ctx.is_dense_a,
-            IS_DENSE_B=ctx.is_dense_b,
+        d_values_a, d_values_b = triton_split_2D_jagged_fwd(
+            d_out,
+            offsets_a,
+            offsets_b,
+            ctx.max_seq_len,
+            ctx.max_len_a,
+            ctx.max_len_b,
+            ctx.total_len_a,
+            ctx.total_len_b,
+            ctx.n_prefix_from_B,
+            True,
         )
         return None, d_values_a, d_values_b, None, None, None, None, None
 
@@ -643,67 +728,39 @@ class _Split2DJaggedFunction(torch.autograd.Function):
         offsets_b: Optional[torch.Tensor],
         n_prefix_to_B: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        values = switch_to_contiguous_if_needed(values)
-        is_dense_a: bool = offsets_a is None
-        is_dense_b: bool = offsets_b is None
-        total_seq_len, D = values.shape
-        if is_dense_a:
-            assert is_dense_b is False
-            assert offsets_b is not None
-            assert max_len_a is not None
-            B = offsets_b.shape[0] - 1
-            total_len_a = max_len_a * B
+        total_seq_len = values.shape[0]
+        if offsets_a is None:
+            assert offsets_b is not None and max_len_a is not None
+            total_len_a = max_len_a * (offsets_b.shape[0] - 1)
             total_len_b = total_seq_len - total_len_a
-        elif is_dense_b:
-            assert is_dense_a is False
-            assert offsets_a is not None
+        elif offsets_b is None:
             assert max_len_b is not None
-            B = offsets_a.shape[0] - 1
-            total_len_b = max_len_b * B
+            total_len_b = max_len_b * (offsets_a.shape[0] - 1)
             total_len_a = total_seq_len - total_len_b
+        elif total_len_left is not None and total_len_right is not None:
+            assert total_len_left + total_len_right == total_seq_len
+            total_len_a = total_len_left
+            total_len_b = total_len_right
         else:
-            assert offsets_a is not None and offsets_b is not None
-            B = offsets_a.shape[0] - 1
-            if total_len_left is not None and total_len_right is not None:
-                assert total_len_left + total_len_right == total_seq_len
-                total_len_a = total_len_left
-                total_len_b = total_len_right
-            else:
-                total_len_a = int(offsets_a[-1].item())
-                total_len_b = values.size(0) - total_len_a
-        _, D = values.shape
-        BLOCK_D = triton.next_power_of_2(D)
-        values_a = torch.empty(
-            (total_len_a, D), device=values.device, dtype=values.dtype
-        )
-        values_b = torch.empty(
-            (total_len_b, D), device=values.device, dtype=values.dtype
-        )
-        _triton_split_2D_jagged_internal(
-            jagged_in=values,
-            max_seq_len=max_seq_len,
-            B=B,
-            offsets_a=offsets_a,
-            offsets_b=offsets_b,
-            max_len_a=max_len_a,
-            max_len_b=max_len_b,
-            out_a=values_a,
-            out_b=values_b,
-            D=D,
-            n_prefix_to_B=n_prefix_to_B,
-            is_dense_a=is_dense_a,
-            is_dense_b=is_dense_b,
-            BLOCK_D=BLOCK_D,
+            # Data-dependent; pass the totals to keep shapes static.
+            total_len_a = int(offsets_a[-1].item())
+            total_len_b = total_seq_len - total_len_a
+        values_a, values_b = triton_split_2D_jagged_fwd(
+            values,
+            offsets_a,
+            offsets_b,
+            max_seq_len,
+            max_len_a,
+            max_len_b,
+            total_len_a,
+            total_len_b,
+            n_prefix_to_B,
+            False,
         )
         ctx.save_for_backward(offsets_a, offsets_b)
         ctx.max_seq_len = max_seq_len
-        ctx.total_seq_len = total_seq_len
         ctx.max_len_a = max_len_a
         ctx.max_len_b = max_len_b
-        ctx.is_dense_a = is_dense_a
-        ctx.is_dense_b = is_dense_b
-        ctx.B = B
-        ctx.D = D
         ctx.n_prefix_to_B = n_prefix_to_B
         return values_a, values_b
 
@@ -713,29 +770,16 @@ class _Split2DJaggedFunction(torch.autograd.Function):
     ) -> Tuple[None, torch.Tensor, None, None, None, None, None, None, None]:
         offsets_a, offsets_b = ctx.saved_tensors
         d_values_a, d_values_b = d_values
-        BLOCK_D = triton.next_power_of_2(ctx.D)
-        d_jagged_in = torch.empty(
-            (ctx.total_seq_len, ctx.D),
-            device=d_values_a.device,
-            dtype=d_values_a.dtype,
+        d_jagged_in = triton_concat_2D_jagged_fwd(
+            d_values_a,
+            d_values_b,
+            offsets_a,
+            offsets_b,
+            ctx.max_seq_len,
+            ctx.max_len_a,
+            ctx.max_len_b,
+            ctx.n_prefix_to_B,
         )
-        _triton_concat_2D_jagged_internal(
-            values_a=d_values_a,
-            values_b=d_values_b,
-            values_out=d_jagged_in,
-            max_seq_len=ctx.max_seq_len,
-            B=ctx.B,
-            offsets_a=offsets_a,
-            offsets_b=offsets_b,
-            max_len_a=ctx.max_len_a,
-            max_len_b=ctx.max_len_b,
-            D=ctx.D,
-            n_prefix_from_B=ctx.n_prefix_to_B,
-            is_dense_a=ctx.is_dense_a,
-            is_dense_b=ctx.is_dense_b,
-            BLOCK_D=BLOCK_D,
-        )
-
         return None, d_jagged_in, None, None, None, None, None, None, None
 
 

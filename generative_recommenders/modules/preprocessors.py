@@ -29,7 +29,7 @@ from generative_recommenders.common import (
 )
 from generative_recommenders.modules.action_encoder import ActionEncoder
 from generative_recommenders.ops.jagged_tensors import concat_2D_jagged
-from generative_recommenders.ops.layer_norm import LayerNorm, SwishLayerNorm
+from generative_recommenders.ops.layer_norm import LayerNorm, TraceableSwishLayerNorm
 
 
 class InputPreprocessor(HammerModule):
@@ -160,7 +160,7 @@ class ContextualPreprocessor(InputPreprocessor):
                 in_features=self._input_embedding_dim,
                 out_features=self._hidden_dim,
             ),
-            SwishLayerNorm(self._hidden_dim),
+            TraceableSwishLayerNorm(self._hidden_dim),
             torch.nn.Linear(
                 in_features=self._hidden_dim,
                 out_features=self._output_embedding_dim,
@@ -174,7 +174,7 @@ class ContextualPreprocessor(InputPreprocessor):
                 * len(additional_embedding_features),
                 out_features=self._hidden_dim,
             ),
-            SwishLayerNorm(self._hidden_dim),
+            TraceableSwishLayerNorm(self._hidden_dim),
             torch.nn.Linear(
                 in_features=self._hidden_dim,
                 out_features=self._output_embedding_dim,
@@ -196,7 +196,7 @@ class ContextualPreprocessor(InputPreprocessor):
                     in_features=self._action_encoder.output_embedding_dim,
                     out_features=self._hidden_dim,
                 ),
-                SwishLayerNorm(self._hidden_dim),
+                TraceableSwishLayerNorm(self._hidden_dim),
                 torch.nn.Linear(
                     in_features=self._hidden_dim,
                     out_features=self._output_embedding_dim,
