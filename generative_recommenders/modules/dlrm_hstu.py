@@ -393,7 +393,11 @@ class DlrmHSTU(HammerModule):
             ].unsqueeze(-1),
             kernel=self.hammer_kernel(),
         ).squeeze(-1)
-        total_targets = int(num_candidates.sum().item())
+        # One query time per candidate, so this equals num_candidates.sum()
+        # without a device-to-host sync.
+        total_targets = payload_features[
+            self._hstu_configs.candidates_querytime_feature_name
+        ].numel()
         embedding = seq_embeddings[
             self._hstu_configs.uih_post_id_feature_name
         ].embedding
@@ -461,6 +465,8 @@ class DlrmHSTU(HammerModule):
         self,
         uih_features: KeyedJaggedTensor,
         candidates_features: KeyedJaggedTensor,
+        max_uih_len: Optional[int] = None,
+        max_num_candidates: Optional[int] = None,
     ) -> Tuple[
         Dict[str, SequenceEmbedding],
         Dict[str, torch.Tensor],
@@ -470,26 +476,35 @@ class DlrmHSTU(HammerModule):
         torch.Tensor,
     ]:
         # embedding lookup for uih and candidates
-        merged_sparse_features = KeyedJaggedTensor.from_lengths_sync(
-            keys=uih_features.keys() + candidates_features.keys(),
-            values=torch.cat(
-                [uih_features.values(), candidates_features.values()],
-                dim=0,
-            ),
-            lengths=torch.cat(
-                [uih_features.lengths(), candidates_features.lengths()],
-                dim=0,
-            ),
+        keys = uih_features.keys() + candidates_features.keys()
+        values = torch.cat([uih_features.values(), candidates_features.values()], dim=0)
+        lengths = torch.cat(
+            [uih_features.lengths(), candidates_features.lengths()], dim=0
         )
+        uih_length_per_key = uih_features.length_per_key_or_none()
+        candidates_length_per_key = candidates_features.length_per_key_or_none()
+        if uih_length_per_key is not None and candidates_length_per_key is not None:
+            merged_sparse_features = KeyedJaggedTensor(
+                keys=keys,
+                values=values,
+                lengths=lengths,
+                length_per_key=uih_length_per_key + candidates_length_per_key,
+            )
+        else:
+            merged_sparse_features = KeyedJaggedTensor.from_lengths_sync(
+                keys=keys, values=values, lengths=lengths
+            )
         seq_embeddings_dict = self._embedding_collection(merged_sparse_features)
         num_candidates = fx_mark_length_features(
             candidates_features.lengths().view(len(candidates_features.keys()), -1)
         )[0]
-        max_num_candidates = fx_infer_max_len(num_candidates)
+        if max_num_candidates is None:
+            max_num_candidates = fx_infer_max_len(num_candidates)
         uih_seq_lengths = uih_features[
             self._hstu_configs.uih_post_id_feature_name
         ].lengths()
-        max_uih_len = fx_infer_max_len(uih_seq_lengths)
+        if max_uih_len is None:
+            max_uih_len = fx_infer_max_len(uih_seq_lengths)
 
         # prepare payload features
         payload_features: Dict[str, torch.Tensor] = {}
@@ -554,6 +569,7 @@ class DlrmHSTU(HammerModule):
         uih_seq_lengths: torch.Tensor,
         max_num_candidates: int,
         num_candidates: torch.Tensor,
+        candidate_weights: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -562,6 +578,9 @@ class DlrmHSTU(HammerModule):
         Optional[torch.Tensor],
         Optional[torch.Tensor],
     ]:
+        """``candidate_weights`` (``[total_candidates]``), when given, is the
+        supervision weight of every task, e.g. 0 for padding candidates so they
+        drop out of the loss and metrics."""
         # merge uih and candidates embeddings
         for (
             uih_feature_name,
@@ -610,6 +629,9 @@ class DlrmHSTU(HammerModule):
                     task_configs=self._multitask_configs,
                 )
             )
+            if candidate_weights is not None:
+                for task in self._multitask_configs:
+                    supervision_weights[task.task_name] = candidate_weights
             mt_target_preds, mt_target_labels, mt_target_weights, mt_losses = (
                 self._multitask_module(
                     encoded_user_embeddings=candidates_user_embeddings,
@@ -637,6 +659,9 @@ class DlrmHSTU(HammerModule):
         self,
         uih_features: KeyedJaggedTensor,
         candidates_features: KeyedJaggedTensor,
+        max_uih_len: Optional[int] = None,
+        max_num_candidates: Optional[int] = None,
+        candidate_weights: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -656,6 +681,8 @@ class DlrmHSTU(HammerModule):
             ) = self.preprocess(
                 uih_features=uih_features,
                 candidates_features=candidates_features,
+                max_uih_len=max_uih_len,
+                max_num_candidates=max_num_candidates,
             )
 
         with record_function("## main_forward ##"):
@@ -666,4 +693,5 @@ class DlrmHSTU(HammerModule):
                 uih_seq_lengths=uih_seq_lengths,
                 max_num_candidates=max_num_candidates,
                 num_candidates=num_candidates,
+                candidate_weights=candidate_weights,
             )

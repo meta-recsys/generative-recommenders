@@ -274,16 +274,23 @@ class ContextualPreprocessor(InputPreprocessor):
                 contextual_feature_to_min_uih_length=self._contextual_feature_to_min_uih_length,
                 dtype=seq_embeddings.dtype,
             )
-            contextual_embeddings = torch.baddbmm(
-                self._batched_contextual_linear_bias.view(
-                    -1, 1, self._output_embedding_dim
-                ).to(contextual_input_embeddings.dtype),
+            # bmm + broadcast add rather than baddbmm: baddbmm's meta kernel
+            # expands the bias to the batch size, which fails when the batch
+            # size is symbolic (fake-tensor tracing with dynamic shapes). The
+            # bias takes the bmm output dtype, as baddbmm does under autocast.
+            contextual_embeddings = torch.bmm(
                 contextual_input_embeddings.view(
                     -1, self._max_contextual_seq_len, self._input_embedding_dim
                 ).transpose(0, 1),
                 self._batched_contextual_linear_weights.to(
                     contextual_input_embeddings.dtype
                 ),
+            )
+            contextual_embeddings = (
+                contextual_embeddings
+                + self._batched_contextual_linear_bias.view(
+                    -1, 1, self._output_embedding_dim
+                ).to(contextual_embeddings.dtype)
             ).transpose(0, 1)
             output_seq_embeddings = concat_2D_jagged(
                 max_seq_len=self._max_contextual_seq_len + output_max_seq_len,
