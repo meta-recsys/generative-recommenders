@@ -58,6 +58,34 @@ except ImportError:
 
         return decorator
 
+    try:
+        # @manual=//triton:triton
+        from triton.runtime.errors import IntelGPUError  # type: ignore
+
+        class _IntelTolerantAutotuner(Autotuner):
+            """Skip configs that the Intel backend cannot build or load.
+
+            For some tiles (e.g. large blocks with few warps) IGC emits a module
+            without the kernel instead of reporting a register/PTSS overflow, so
+            loading it raises ``IntelGPUError`` rather than ``OutOfResources``.
+            Treat it like ``OutOfResources``: give the config an infinite time.
+            """
+
+            # pyre-ignore
+            def _bench(self, *args, config, **meta):
+                try:
+                    return super()._bench(*args, config=config, **meta)
+                except IntelGPUError:
+                    return [float("inf"), float("inf"), float("inf")]
+
+        _AutotunerCls: type = (
+            _IntelTolerantAutotuner
+            if hasattr(torch, "xpu") and torch.xpu.is_available()
+            else Autotuner
+        )
+    except ImportError:
+        _AutotunerCls = Autotuner
+
     # pyre-ignore
     def triton_autotune(
         configs: List[triton.Config],
@@ -73,7 +101,7 @@ except ImportError:
     ):
         # pyre-ignore
         def decorator(fn):
-            return Autotuner(
+            return _AutotunerCls(
                 fn,
                 fn.arg_names,
                 configs,
@@ -247,6 +275,30 @@ gpu_unavailable: Tuple[bool, str] = (
 )
 
 gpu_available: bool = not gpu_unavailable[0]
+
+xpu_available: bool = hasattr(torch, "xpu") and torch.xpu.is_available()
+if xpu_available:
+    try:
+        import fbgemm_xpu  # noqa: F401  registers XPU kernels for fbgemm ops
+    except ImportError:
+        pass
+
+accelerator_unavailable: Tuple[bool, str] = (
+    not gpu_available and not xpu_available,
+    "No CUDA/HIP/XPU accelerator detected",
+)
+
+
+def get_accelerator_device() -> torch.device:
+    """Device used by device-agnostic tests: CUDA/HIP if present, else XPU."""
+    return torch.device("cuda" if gpu_available else "xpu")
+
+
+def accelerator_supports_bf16() -> bool:
+    if gpu_available:
+        return torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+    return xpu_available and torch.xpu.is_bf16_supported()
+
 
 blackwell_tlx_unavailable: Tuple[bool, str] = (
     not is_sm100_plus() or not HAS_TLX,

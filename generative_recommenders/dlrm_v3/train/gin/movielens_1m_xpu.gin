@@ -1,0 +1,42 @@
+batch_size = 16  # 128 fills the 64 GiB PVC tile with the PYTORCH attention kernel
+dataset = "movielens-1m"
+
+# model parameters
+make_model.dataset = %dataset
+# MovieLens-1M ids are at most 6040 (user_id); the default 10M rows per table
+# need 57 GB of HBM and do not fit the planner's budget for a 64 GiB tile.
+make_model.num_embeddings = 8192
+
+# dense model optimizer
+dense_optimizer_factory_and_class.learning_rate = 0.001
+dense_optimizer_factory_and_class.optimizer_name = "Adam"
+dense_optimizer_factory_and_class.momentum = 0
+dense_optimizer_factory_and_class.weight_decay = 0
+dense_optimizer_factory_and_class.eps = 1e-8
+dense_optimizer_factory_and_class.betas = (0.9, 0.98)
+
+# sparse model optimizer
+sparse_optimizer_factory_and_class.learning_rate = 0.001
+sparse_optimizer_factory_and_class.optimizer_name = "RowWiseAdagrad"
+sparse_optimizer_factory_and_class.momentum = 0
+sparse_optimizer_factory_and_class.weight_decay = 0
+sparse_optimizer_factory_and_class.eps = 1e-8
+sparse_optimizer_factory_and_class.betas = (0.95, 0.999)
+
+# dataloader configs
+make_train_test_dataloaders.batch_size = %batch_size
+make_train_test_dataloaders.dataset_type = %dataset
+make_train_test_dataloaders.train_split_percentage = 0.75
+make_train_test_dataloaders.new_path_prefix = "/opt/dlrmv3/src/generative-recommenders/datasets"
+make_train_test_dataloaders.num_workers = 2
+make_train_test_dataloaders.prefetch_factor = 4
+
+# train-eval loop variables
+train_eval_loop.num_epochs = 4
+train_eval_loop.output_trace = False
+train_eval_loop.metric_log_frequency = 10
+train_eval_loop.eval_frequency = 20  # eval every 100 train batches
+train_eval_loop.num_eval_batches = 20  # without this the eval loop never exits
+
+# logger variables
+MetricsLogger.tensorboard_log_path = "/tmp/tensorboard_log_path.log"

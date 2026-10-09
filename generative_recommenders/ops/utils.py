@@ -62,6 +62,13 @@ def maybe_register_custom_op(op_name, mutates_args):
     return decorator
 
 
+def get_num_sms(device: torch.device) -> int:
+    """Number of streaming multiprocessors (Xe-cores on XPU) of ``device``."""
+    if device.type == "xpu":
+        return torch.xpu.get_device_properties(device).gpu_subslice_count
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
 def is_sm100_plus() -> bool:
     """
     Check if this is a Blackwell Datacenter GPU.

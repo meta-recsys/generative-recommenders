@@ -20,7 +20,12 @@ import unittest
 from typing import Dict, List, Tuple
 
 import torch
-from generative_recommenders.common import gpu_unavailable, set_dev_mode
+from generative_recommenders.common import (
+    accelerator_supports_bf16,
+    accelerator_unavailable,
+    get_accelerator_device,
+    set_dev_mode,
+)
 from generative_recommenders.modules.multitask_module import (
     DefaultMultitaskModule,
     MultitaskTaskType,
@@ -169,11 +174,11 @@ class MultiTaskModuleTest(unittest.TestCase):
         is_inference=st.booleans(),
         dtype=st.sampled_from(
             [torch.float32, torch.bfloat16]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            if accelerator_supports_bf16()
             else [torch.float32]
         ),
     )
-    @unittest.skipIf(*gpu_unavailable)
+    @unittest.skipIf(*accelerator_unavailable)
     @settings(verbosity=Verbosity.verbose, max_examples=50, deadline=None)
     def test_default_multitask_module(
         self,
@@ -183,7 +188,7 @@ class MultiTaskModuleTest(unittest.TestCase):
         dtype: torch.dtype,
     ) -> None:
         set_dev_mode(True)
-        device = torch.device("cuda")
+        device = get_accelerator_device()
 
         L = 200
         embedding_dim = 64

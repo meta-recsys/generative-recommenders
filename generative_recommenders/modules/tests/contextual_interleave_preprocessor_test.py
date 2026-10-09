@@ -19,7 +19,11 @@
 import unittest
 
 import torch
-from generative_recommenders.common import gpu_unavailable
+from generative_recommenders.common import (
+    accelerator_supports_bf16,
+    accelerator_unavailable,
+    get_accelerator_device,
+)
 from generative_recommenders.modules.action_encoder import ActionEncoder
 from generative_recommenders.modules.content_encoder import ContentEncoder
 from generative_recommenders.modules.contextual_interleave_preprocessor import (
@@ -40,11 +44,11 @@ class ContextualInterleavePreprocessorTest(unittest.TestCase):
         is_train=st.sampled_from([True, False]),
         dtype=st.sampled_from(
             [torch.float32, torch.bfloat16]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            if accelerator_supports_bf16()
             else [torch.float32]
         ),
     )
-    @unittest.skipIf(*gpu_unavailable)
+    @unittest.skipIf(*accelerator_unavailable)
     @settings(verbosity=Verbosity.verbose, max_examples=50, deadline=None)
     def test_forward(
         self,
@@ -53,7 +57,7 @@ class ContextualInterleavePreprocessorTest(unittest.TestCase):
         is_train: bool,
         dtype: torch.dtype,
     ) -> None:
-        device = torch.device("cuda")
+        device = get_accelerator_device()
 
         input_embedding_dim = 64
         output_embedding_dim = 32
@@ -322,7 +326,7 @@ class ContextualInterleavePreprocessorTest(unittest.TestCase):
         total_targets = int(num_targets.sum().item())
         seq_lengths = seq_lengths + num_targets
         seq_offsets = torch.zeros(
-            (batch_size + 1,), dtype=torch.int64, device=torch.device("cuda")
+            (batch_size + 1,), dtype=torch.int64, device=device
         )
         seq_offsets[1:] = torch.cumsum(seq_lengths, dim=0)
         total_seq_len = int(torch.sum(seq_lengths).item())

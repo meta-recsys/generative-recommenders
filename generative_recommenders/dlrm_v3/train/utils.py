@@ -13,6 +13,7 @@
 # limitations under the License.
 
 # pyre-strict
+import dataclasses
 import logging
 import os
 from collections.abc import Iterator
@@ -40,6 +41,7 @@ from generative_recommenders.dlrm_v3.configs import (
 )
 from generative_recommenders.dlrm_v3.datasets.dataset import collate_fn, Dataset
 from generative_recommenders.dlrm_v3.utils import get_dataset, MetricsLogger, Profiler
+from generative_recommenders.common import HammerKernel
 from generative_recommenders.modules.dlrm_hstu import DlrmHSTU, DlrmHSTUConfig
 from torch import distributed as dist
 from torch.distributed.optim import (
@@ -48,10 +50,19 @@ from torch.distributed.optim import (
 from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader, Dataset as TorchDataset
 from torch.utils.data.distributed import _T_co, DistributedSampler
-from torchrec.distributed.model_parallel import DistributedModelParallel
+from torchrec.distributed.model_parallel import (
+    DataParallelWrapper,
+    DistributedModelParallel,
+)
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
+from torchrec.distributed.planner.types import ParameterConstraints
 from torchrec.distributed.sharding_plan import get_default_sharders
-from torchrec.distributed.types import ShardedTensor, ShardingEnv
+from torchrec.distributed.types import (
+    ShardedModule,
+    ShardedTensor,
+    ShardingEnv,
+    ShardingType,
+)
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
@@ -68,6 +79,22 @@ TORCHREC_TYPES: Set[Type[Union[EmbeddingBagCollection, EmbeddingCollection]]] = 
     EmbeddingCollection,
 }
 
+def _is_xccl_available() -> bool:
+    try:
+        return dist.is_xccl_available()
+    except (AttributeError, RuntimeError):
+        return False
+
+
+def get_dist_backend(device: torch.device) -> str:
+    """Return the best distributed backend for the given device."""
+    if device.type == "xpu":
+        if _is_xccl_available():
+            return "xccl"
+        logger.warning("XCCL not available, falling back to gloo for XPU")
+    elif device.type == "cuda":
+        return "nccl"
+    return "gloo"
 
 def setup(
     rank: int, world_size: int, master_port: int, device: torch.device
@@ -75,12 +102,12 @@ def setup(
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(master_port)
 
-    BACKEND = dist.Backend.NCCL
+    BACKEND = get_dist_backend(device)
     TIMEOUT = 1800
 
     # initialize the process group
     if not dist.is_initialized():
-        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        dist.init_process_group(BACKEND, rank=rank, world_size=world_size)
 
     pg = dist.new_group(
         backend=BACKEND,
@@ -89,7 +116,10 @@ def setup(
     assert isinstance(pg, dist.ProcessGroup)
 
     # set device
-    torch.cuda.set_device(device)
+    if device.type == "xpu":
+        torch.xpu.set_device(device)
+    elif device.type == "cuda":
+        torch.cuda.set_device(device)
 
     return pg
 
@@ -171,6 +201,7 @@ def make_model(
     dataset: str,
     hstu_ultra_stack_name: Optional[str] = None,
     hstu_fp8_addmm_fwd: bool = False,
+    num_embeddings: Optional[int] = None,
 ) -> Tuple[torch.nn.Module, DlrmHSTUConfig, Dict[str, EmbeddingConfig]]:
     hstu_config = get_hstu_configs(
         dataset,
@@ -178,6 +209,17 @@ def make_model(
         hstu_fp8_addmm_fwd=hstu_fp8_addmm_fwd,
     )
     table_config = get_embedding_table_config(dataset)
+    # Optional row count for every table, for datasets whose ids are far below
+    # the default hash size. It must exceed the largest id of every feature.
+    if num_embeddings is not None:
+        table_config = {
+            name: dataclasses.replace(config, num_embeddings=num_embeddings)
+            for name, config in table_config.items()
+        }
+    # The PYTORCH attention kernel forced below materialises a dense
+    # [B, H, N, N] score tensor; the 16384 default needs ~60 GiB, so keep N small.
+    if torch.xpu.is_available():
+        hstu_config.max_seq_len = 256
 
     model = DlrmHSTU(
         hstu_configs=hstu_config,
@@ -261,6 +303,54 @@ def sparse_optimizer_factory_and_class(
     return optimizer_cls, kwargs, optimizer_factory
 
 
+def _unsharded_tensors(module: torch.nn.Module) -> Iterator[torch.Tensor]:
+    """Parameters and buffers of `module` outside any torchrec ShardedModule."""
+    if isinstance(module, ShardedModule):
+        return
+    yield from module.parameters(recurse=False)
+    yield from module.buffers(recurse=False)
+    for child in module.children():
+        yield from _unsharded_tensors(child)
+
+
+class _XpuGradAveragingDataParallelWrapper(DataParallelWrapper):
+    """XPU replacement for torchrec's default DDP wrapper.
+
+    On XPU, DDP's XCCL gradient allreduce running inside backward, concurrently
+    with torchrec's embedding backward comms, segfaults in oneCCL (a freed SYCL
+    dependency event) at >=4 ranks. This wrapper does what DDP does at
+    construction (move the unsharded modules to the device and broadcast their
+    parameters and buffers from rank 0); gradient averaging happens after
+    backward, in the dense optimizer's step pre-hook (_average_grads_pre_step).
+    """
+
+    def wrap(
+        self,
+        dmp: DistributedModelParallel,
+        env: ShardingEnv,
+        device: torch.device,
+    ) -> None:
+        module = dmp._dmp_wrapped_module.to(device)
+        for t in _unsharded_tensors(module):
+            dist.broadcast(t.data, src=0, group=env.process_group)
+
+
+def _average_grads_pre_step(
+    optimizer: Optimizer, args: Any, kwargs: Any
+) -> None:
+    """Average the optimizer's grads across ranks, like DDP, in one allreduce.
+
+    A missing grad becomes zeros so every rank reduces the same buffer layout.
+    """
+    params = [p for group in optimizer.param_groups for p in group["params"]]
+    grads = [p.grad if p.grad is not None else torch.zeros_like(p) for p in params]
+    flat = torch._utils._flatten_dense_tensors(grads)
+    dist.all_reduce(flat)
+    flat.div_(dist.get_world_size())
+    for p, g in zip(params, torch._utils._unflatten_dense_tensors(flat, grads)):
+        p.grad = g
+
+
 def make_optimizer_and_shard(
     model: torch.nn.Module,
     device: torch.device,
@@ -282,14 +372,41 @@ def make_optimizer_and_shard(
                         sparse_opt_cls, [param], sparse_opt_args
                     )
     sharders = get_default_sharders()
+    # XPU cannot keep tables in host memory yet (no UVM allocation in fbgemm-xpu,
+    # and TorchRec offers fused_uvm* only on CUDA), so plan against the real capacity.
+    hbm_cap = (
+        torch.xpu.get_device_properties(device).total_memory
+        if device.type == "xpu"
+        else 160 * 1024 * 1024 * 1024
+    )
+    
+    constraints = None
+    if device.type == "xpu":
+        constraints = {}
+        for module in model.modules():
+            if type(module) not in TORCHREC_TYPES:
+                continue
+            configs = (
+                module.embedding_configs()
+                if isinstance(module, EmbeddingCollection)
+                else module.embedding_bag_configs()
+            )
+            for config in configs:
+                constraints[config.name] = ParameterConstraints(
+                    sharding_types=[
+                        ShardingType.TABLE_WISE.value,
+                        ShardingType.ROW_WISE.value,
+                    ]
+                )
     planner = EmbeddingShardingPlanner(
         topology=Topology(
             local_world_size=world_size,
             world_size=world_size,
-            compute_device="cuda",
-            hbm_cap=160 * 1024 * 1024 * 1024,
+            compute_device=device.type,
+            hbm_cap=hbm_cap,
             ddr_cap=32 * 1024 * 1024 * 1024,
-        )
+        ),
+        constraints=constraints,
     )
     pg = dist.GroupMember.WORLD
     env = ShardingEnv.from_process_group(pg)  # pyre-ignore [6]
@@ -297,12 +414,24 @@ def make_optimizer_and_shard(
 
     plan = planner.collective_plan(model, sharders, pg)
 
+    # XPU: no DDP (see _XpuGradAveragingDataParallelWrapper). DATA_PARALLEL
+    # tables rely on DDP to sync their weights, so they are not supported here.
+    data_parallel_wrapper = None
+    if device.type == "xpu":
+        assert not any(
+            ps.sharding_type == ShardingType.DATA_PARALLEL.value
+            for module_plan in plan.plan.values()
+            for ps in module_plan.values()
+        ), "DATA_PARALLEL embedding tables need DDP, which is disabled on XPU"
+        data_parallel_wrapper = _XpuGradAveragingDataParallelWrapper()
+
     # Shard model
     model = DistributedModelParallel(
         module=model,
         device=device,
         plan=plan,
         sharders=sharders,
+        data_parallel_wrapper=data_parallel_wrapper,
     )
     # Create keyed optimizer
     all_optimizers = []
@@ -326,12 +455,21 @@ def make_optimizer_and_shard(
         )
 
     if all_params:
+        dense_factory = dense_opt_factory
+        if device.type == "xpu":
+            # Replaces DDP's in-backward allreduce: runs on every step(), i.e.
+            # after backward has returned.
+            def dense_factory(params: Iterable[torch.Tensor]) -> Optimizer:
+                optimizer = dense_opt_factory(params)
+                optimizer.register_step_pre_hook(_average_grads_pre_step)
+                return optimizer
+
         all_optimizers.append(
             (
                 "dense",
                 KeyedOptimizerWrapper(
                     params=all_params,
-                    optim_factory=dense_opt_factory,
+                    optim_factory=dense_factory,
                 ),
             )
         )

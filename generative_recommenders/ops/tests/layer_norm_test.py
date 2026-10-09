@@ -20,7 +20,13 @@ import copy
 import unittest
 
 import torch
-from generative_recommenders.common import gpu_unavailable, HammerKernel, set_dev_mode
+from generative_recommenders.common import (
+    accelerator_supports_bf16,
+    accelerator_unavailable,
+    get_accelerator_device,
+    HammerKernel,
+    set_dev_mode,
+)
 from generative_recommenders.ops.layer_norm import (
     layer_norm,
     LayerNorm,
@@ -31,16 +37,14 @@ from hypothesis import given, settings, strategies as st, Verbosity
 
 
 class LayerNormTest(unittest.TestCase):
-    @unittest.skipIf(*gpu_unavailable)
+    @unittest.skipIf(*accelerator_unavailable)
     # pyre-ignore[56]
     @given(
         N=st.sampled_from([4200000]),
         D=st.sampled_from([512]),
         is_swish=st.sampled_from([False]),
         dtype=st.sampled_from(
-            [torch.bfloat16]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
-            else [torch.float32]
+            [torch.bfloat16] if accelerator_supports_bf16() else [torch.float32]
         ),
     )
     @settings(
@@ -58,7 +62,7 @@ class LayerNormTest(unittest.TestCase):
             skip_comparisons=True,
         )
 
-    @unittest.skipIf(*gpu_unavailable)
+    @unittest.skipIf(*accelerator_unavailable)
     # pyre-ignore[56]
     @given(
         N=st.integers(min_value=0, max_value=10000),
@@ -66,7 +70,7 @@ class LayerNormTest(unittest.TestCase):
         is_swish=st.sampled_from([True, False]),
         dtype=st.sampled_from(
             [torch.bfloat16, torch.float32]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            if accelerator_supports_bf16()
             else [torch.float32]
         ),
     )
@@ -95,20 +99,19 @@ class LayerNormTest(unittest.TestCase):
         skip_comparisons: bool = False,
     ) -> None:
         N = N // 4 * 4
+        device = get_accelerator_device()
         # enable auto-tuning to verify correctness of multi-row kernel
         set_dev_mode(False)
         x = (
-            torch.empty((N, D), dtype=dtype, device=torch.device("cuda"))
+            torch.empty((N, D), dtype=dtype, device=device)
             .normal_(0.0, 1.0)
             .requires_grad_()
         )
         weight = (
-            torch.empty((D,), device=torch.device("cuda"))
-            .uniform_(-1.0, 1.0)
-            .requires_grad_()
+            torch.empty((D,), device=device).uniform_(-1.0, 1.0).requires_grad_()
         )
         bias = (
-            torch.empty((D,), device=torch.device("cuda"))
+            torch.empty((D,), device=device)
             .uniform_(-1.0, 1.0)
             .requires_grad_()
         )
@@ -146,7 +149,7 @@ class LayerNormTest(unittest.TestCase):
         torch.testing.assert_close(ref_dw, opt_dw)
         torch.testing.assert_close(ref_db, opt_db)
 
-    @unittest.skipIf(*gpu_unavailable)
+    @unittest.skipIf(*accelerator_unavailable)
     # pyre-ignore[56]
     @given(
         N=st.integers(min_value=32, max_value=10000),
@@ -154,7 +157,7 @@ class LayerNormTest(unittest.TestCase):
         is_swish=st.sampled_from([True, False]),
         dtype=st.sampled_from(
             [torch.bfloat16, torch.float32]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            if accelerator_supports_bf16()
             else [torch.float32]
         ),
     )
@@ -182,9 +185,10 @@ class LayerNormTest(unittest.TestCase):
         real_kernel: HammerKernel,
         skip_comparisons: bool = False,
     ) -> None:
+        device = get_accelerator_device()
         set_dev_mode(True)
         x = (
-            torch.empty((N, D), dtype=dtype, device=torch.device("cuda"))
+            torch.empty((N, D), dtype=dtype, device=device)
             .normal_(0.0, 1.0)
             .requires_grad_()
         )
@@ -193,13 +197,13 @@ class LayerNormTest(unittest.TestCase):
             ref_layer = SwishLayerNorm(
                 dim=D,
                 eps=1e-6,
-            ).to(device="cuda")
+            ).to(device=device)
             ref_layer._hammer_kernel = ref_kernel
         else:
             ref_layer = LayerNorm(
                 dim=D,
                 eps=1e-6,
-            ).to(device="cuda")
+            ).to(device=device)
             ref_layer._hammer_kernel = ref_kernel
         opt_layer = copy.deepcopy(ref_layer)
         opt_layer._hammer_kernel = real_kernel
