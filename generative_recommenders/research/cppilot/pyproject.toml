@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cppilot"
-version = "0.1.0"
+version = "0.2.0"
 description = "A small, provider-neutral framework for tool-using agents"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -20,11 +20,23 @@ classifiers = [
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40"]
 gemini = ["google-genai>=1.0"]
-telemetry = ["opentelemetry-api>=1.28"]
-podman = ["podman>=5.0"]
-cli = []
+openai = ["openai>=1.58"]
+schema = ["jsonschema>=4.23"]
+tools = ["pydantic>=2.10", "griffe>=1.5", "PyYAML>=6.0"]
+telemetry = ["opentelemetry-api>=1.28", "opentelemetry-sdk>=1.28", "opentelemetry-exporter-otlp>=1.28"]
+sandbox = []
+cli = ["rich>=13.9", "prompt-toolkit>=3.0"]
+server = ["fastapi>=0.115", "uvicorn>=0.32"]
+storage = ["sqlalchemy[asyncio]>=2.0", "aiosqlite>=0.20", "fsspec>=2024.10"]
+postgres = ["sqlalchemy[asyncio]>=2.0", "asyncpg>=0.30"]
+s3 = ["fsspec>=2024.10", "s3fs>=2024.10"]
+kubernetes = ["kubernetes>=31.0"]
+mlflow = ["mlflow>=2.18"]
+prometheus = ["prometheus-client>=0.21"]
+mcp = ["mcp>=1.0"]
+eval = ["numpy>=2.0", "scikit-learn>=1.5", "tqdm>=4.67"]
 dev = ["build>=1.2", "mypy>=1.13", "pytest>=8.3", "pytest-asyncio>=0.24"]
-all = ["anthropic>=0.40", "google-genai>=1.0", "opentelemetry-api>=1.28", "podman>=5.0"]
+all = ["anthropic>=0.40", "google-genai>=1.0", "openai>=1.58", "jsonschema>=4.23", "pydantic>=2.10", "griffe>=1.5", "PyYAML>=6.0", "opentelemetry-api>=1.28", "opentelemetry-sdk>=1.28", "opentelemetry-exporter-otlp>=1.28", "rich>=13.9", "prompt-toolkit>=3.0", "fastapi>=0.115", "uvicorn>=0.32", "sqlalchemy[asyncio]>=2.0", "aiosqlite>=0.20", "asyncpg>=0.30", "fsspec>=2024.10", "s3fs>=2024.10", "mcp>=1.0", "numpy>=2.0", "scikit-learn>=1.5", "tqdm>=4.67", "kubernetes>=31.0", "mlflow>=2.18", "prometheus-client>=0.21"]
 
 [project.scripts]
 cppilot = "cppilot.cli:main"
@@ -39,4 +51,3 @@ testpaths = ["tests"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-
