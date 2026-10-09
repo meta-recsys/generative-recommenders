@@ -152,6 +152,7 @@ class AnthropicProvider(ModelProvider):
         metadata = self._metadata(response)
         items: list[RunItem] = []
         preceding: list[dict[str, Any]] = []
+        # pyrefly: ignore [missing-attribute]
         for block in response.content:
             item_metadata = dict(metadata)
             if preceding:
@@ -184,7 +185,11 @@ class AnthropicProvider(ModelProvider):
                     )
                 )
         return ModelResponse(
-            items, self._usage(_dump(response.usage), metadata), metadata
+            # pyrefly: ignore [missing-attribute]
+            items,
+            # pyrefly: ignore [missing-attribute]
+            self._usage(_dump(response.usage), metadata),
+            metadata,
         )
 
     async def stream(  # noqa: C901
@@ -199,6 +204,7 @@ class AnthropicProvider(ModelProvider):
             stream = await self.client.messages.create(
                 **self._kwargs(request), stream=True
             )
+            # pyrefly: ignore [not-iterable]
             async for event in stream:
                 if event.type == "message_start":
                     metadata.update(self._metadata(event.message))

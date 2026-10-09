@@ -240,11 +240,13 @@ class ToolsTest(unittest.IsolatedAsyncioTestCase):
         skill = SkillLoader._parse(
             path, text='---\nname: safe\ndescription: "Quoted: # literal"\n---\nbody'
         )
+        # pyrefly: ignore [missing-attribute]
         self.assertEqual(skill.description, "Quoted: # literal")
         folded = SkillLoader._parse(
             path,
             text="---\nname: safe\ndescription: >\n  first: text\n  second # text\n---\nbody",
         )
+        # pyrefly: ignore [missing-attribute]
         self.assertEqual(folded.description, "first: text second # text")
         for metadata in (
             "name: a\nname: b\ndescription: x",
@@ -687,6 +689,7 @@ class ToolsTest(unittest.IsolatedAsyncioTestCase):
                 {"mounts": [(root, "/", True)]},
             ):
                 with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                    # pyrefly: ignore [bad-argument-type]
                     ContainerSandbox("image", **kwargs)
 
     async def test_container_start_failure_cleanup(self) -> None:

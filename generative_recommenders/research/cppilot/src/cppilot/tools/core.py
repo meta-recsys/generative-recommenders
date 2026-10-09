@@ -184,6 +184,7 @@ def _json_type(annotation: Any) -> dict[str, Any]:
     if hasattr(annotation, "model_json_schema"):
         return dict(annotation.model_json_schema())
     if inspect.isclass(annotation) and issubclass(annotation, enum.Enum):
+        # pyrefly: ignore [invalid-literal]
         return _json_type(Literal[tuple(member.value for member in annotation)])
     if origin is Literal:
         schemas = {_json_type(type(value)).get("type") for value in args}

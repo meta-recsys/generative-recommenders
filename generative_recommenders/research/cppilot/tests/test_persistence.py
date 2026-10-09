@@ -66,7 +66,9 @@ class PersistenceTest(unittest.IsolatedAsyncioTestCase):
                     loaded = await store.load("a")
                     self.assertEqual(loaded[:4], items)
                     self.assertCountEqual(
-                        [i.content for i in loaded[4:]], [str(i) for i in range(30)]
+                        # pyrefly: ignore [missing-attribute]
+                        [i.content for i in loaded[4:]],
+                        [str(i) for i in range(30)],
                     )
                     self.assertEqual(await store.get_active_agent("a"), "specialist")
                     self.assertEqual(
@@ -106,8 +108,11 @@ class PersistenceTest(unittest.IsolatedAsyncioTestCase):
                     )
                 loaded = await store.load("a")
                 self.assertCountEqual(
-                    [item.content for item in loaded], [str(i) for i in range(16)]
+                    # pyrefly: ignore [missing-attribute]
+                    [item.content for item in loaded],
+                    [str(i) for i in range(16)],
                 )
+                # pyrefly: ignore [missing-attribute]
                 self.assertEqual(await store.get_active_agent("a"), loaded[-1].content)
                 if isinstance(store, SQLiteMemoryStore):
                     await store.close()
@@ -152,6 +157,7 @@ class PersistenceTest(unittest.IsolatedAsyncioTestCase):
                     )
                 )
                 self.assertCountEqual(
+                    # pyrefly: ignore [missing-attribute]
                     [i.content for i in await stores[0].load("a")],
                     [str(i) for i in range(8)],
                 )
@@ -482,6 +488,7 @@ class PostgresContractTest(unittest.IsolatedAsyncioTestCase):
                 )
                 loaded = await memory.load("a")
                 self.assertEqual(len(loaded), 16)
+                # pyrefly: ignore [missing-attribute]
                 self.assertEqual(await memory.get_active_agent("a"), loaded[-1].content)
                 self.assertEqual(
                     await memory.compact("a", lambda history: history[-1:]), loaded[-1:]
@@ -624,6 +631,7 @@ class WorkflowTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual((await flow.run("first")).output, "first")
             saved = await sessions.load(session.id)
+            # pyrefly: ignore [missing-attribute]
             self.assertEqual(saved.active_agent, "specialist")
             resumed = AgentWorkflow(
                 router, memory=memory, sessions=sessions, session=saved
@@ -632,6 +640,7 @@ class WorkflowTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(specialist_provider.requests), 2)
             await resumed.clear()
             self.assertIsNone(await memory.get_active_agent("a"))
+            # pyrefly: ignore [missing-attribute]
             self.assertEqual((await sessions.load(session.id)).active_agent, "router")
 
     async def test_switch_model_preserves_destination_and_original_graph(self) -> None:
@@ -658,7 +667,9 @@ class WorkflowTest(unittest.IsolatedAsyncioTestCase):
             self.assertIs(root.provider, original)
             self.assertIs(specialist.provider, original)
             saved = await sessions.load(session.id)
+            # pyrefly: ignore [missing-attribute]
             self.assertEqual(saved.metadata["model"], "new")
+            # pyrefly: ignore [missing-attribute]
             self.assertEqual(saved.active_agent, "specialist")
 
     async def test_context_cleanup_on_failure_and_reentry(self) -> None:
@@ -687,6 +698,7 @@ class WorkflowTest(unittest.IsolatedAsyncioTestCase):
         flow = AgentWorkflow(agent, context=WorkflowContext(sandbox=sandbox))
         stream = flow.stream("go")
         self.assertIsNotNone(await anext(stream))
+        # pyrefly: ignore [missing-attribute]
         await stream.aclose()
         self.assertEqual(sandbox.stopped, ["sandbox"])
         self.assertIs(agent.context, previous)

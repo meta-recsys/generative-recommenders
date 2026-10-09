@@ -90,6 +90,7 @@ class GeminiProvider(ModelProvider):
             else:
                 continue
             if signature := item.metadata.get("thought_signature"):
+                # pyrefly: ignore [unsupported-operation]
                 part["thought_signature"] = base64.b64decode(signature)
             if not contents or contents[-1]["role"] != role:
                 contents.append({"role": role, "parts": []})
