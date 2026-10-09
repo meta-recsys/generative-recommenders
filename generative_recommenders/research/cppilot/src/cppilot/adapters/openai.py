@@ -253,7 +253,9 @@ class OpenAIProvider(ModelProvider):
             raise
         metadata = self._metadata(response)
         items: list[RunItem] = []
+        # pyrefly: ignore [missing-attribute]
         if response.choices:
+            # pyrefly: ignore [bad-index]
             choice = response.choices[0]
             metadata["finish_reason"] = choice.finish_reason
             message = choice.message
@@ -286,6 +288,7 @@ class OpenAIProvider(ModelProvider):
                 stream=True,
                 stream_options={"include_usage": True},
             )
+            # pyrefly: ignore [not-iterable]
             async for chunk in stream:
                 metadata.update(self._metadata(chunk))
                 if getattr(chunk, "usage", None) is not None:

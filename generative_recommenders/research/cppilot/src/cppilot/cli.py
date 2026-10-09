@@ -13,11 +13,22 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, cast, Sequence
 
+# pyrefly: ignore [missing-import]
 from .agent import Agent
+
+# pyrefly: ignore [missing-import]
 from .interfaces import MemoryStore, SessionStore
+
+# pyrefly: ignore [missing-import]
 from .items import Message, RunItem
+
+# pyrefly: ignore [missing-import]
 from .registry import ModelRegistry
+
+# pyrefly: ignore [missing-import]
 from .settings import Settings
+
+# pyrefly: ignore [missing-import]
 from .workflow import AgentWorkflow, Workflow, WorkflowRegistry
 
 
@@ -260,6 +271,7 @@ async def execute(
             continue
         models.register_configured(name, configuration.pop("provider"), **configuration)
     if command == "info":
+        # pyrefly: ignore [missing-module-attribute]
         from . import __version__
 
         terminal.write(

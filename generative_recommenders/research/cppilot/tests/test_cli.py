@@ -61,6 +61,7 @@ class CLITest(unittest.IsolatedAsyncioTestCase):
             models = ModelRegistry()
             models.register("fake", provider)
             terminal = ScriptedTerminal(["hello", "again", "/session", "/exit"])
+            # pyrefly: ignore [bad-argument-type]
             await execute(args, models=models, terminal=terminal)
             sessions = FileSessionStore(root / "sessions")
             saved = (await sessions.list())[0]
@@ -86,6 +87,7 @@ class CLITest(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             with redirect_stderr(io.StringIO()):
+                # pyrefly: ignore [bad-argument-type]
                 await execute(resume, models=models, terminal=terminal)
             self.assertEqual(len(provider.requests), 3)
             self.assertEqual(
@@ -125,6 +127,7 @@ class CLITest(unittest.IsolatedAsyncioTestCase):
                     "/exit",
                 ]
             )
+            # pyrefly: ignore [bad-argument-type]
             await execute(args, models=models, terminal=terminal)
             self.assertIn("Memory compacted: 8 items retained.\n", terminal.output)
             self.assertIn("Memory cleared.\n", terminal.output)
@@ -146,6 +149,7 @@ class CLITest(unittest.IsolatedAsyncioTestCase):
         await execute(
             parser().parse_args(["info", "--storage", "postgres"]),
             models=models,
+            # pyrefly: ignore [bad-argument-type]
             terminal=terminal,
         )
         self.assertIn("providers: fake", terminal.output[0])
@@ -184,7 +188,12 @@ class CLITest(unittest.IsolatedAsyncioTestCase):
             terminal = ScriptedTerminal()
             with redirect_stderr(io.StringIO()):
                 await execute(
-                    args, models=models, workflows=workflows, terminal=terminal
+                    # pyrefly: ignore [bad-argument-type]
+                    args,
+                    models=models,
+                    workflows=workflows,
+                    # pyrefly: ignore [bad-argument-type]
+                    terminal=terminal,
                 )
             self.assertEqual(terminal.output, ["custom: hello\n"])
             self.assertTrue(custom.closed)
@@ -202,6 +211,7 @@ class CLITest(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             with self.assertRaisesRegex(ValueError, "cannot override saved provider"):
+                # pyrefly: ignore [bad-argument-type]
                 await execute(args, models=models, terminal=terminal)
 
     async def test_default_sqlite_and_saved_model_switch(self) -> None:
@@ -224,6 +234,7 @@ class CLITest(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             args = parser().parse_args(["--provider", "first", "--database", database])
+            # pyrefly: ignore [bad-argument-type]
             await execute(args, models=models, terminal=terminal)
             sessions = SQLiteSessionStore(database)
             memory = SQLiteMemoryStore(database)
@@ -255,6 +266,7 @@ class CLITest(unittest.IsolatedAsyncioTestCase):
                             ["resume", saved.id, "again", "--database", database]
                         ),
                         models=models,
+                        # pyrefly: ignore [bad-argument-type]
                         terminal=terminal,
                     )
                 self.assertEqual(len(second.requests), 2)
@@ -303,6 +315,7 @@ class CLITest(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             with redirect_stderr(io.StringIO()):
+                # pyrefly: ignore [bad-argument-type]
                 await execute(args, models=models, terminal=terminal)
             saved = (await FileSessionStore(root / "sessions").list())[0]
             self.assertEqual(received, [{"model": "small"}])
@@ -327,6 +340,7 @@ class CLITest(unittest.IsolatedAsyncioTestCase):
                         ]
                     ),
                     models=resume_models,
+                    # pyrefly: ignore [bad-argument-type]
                     terminal=terminal,
                 )
             self.assertEqual(received, [{"model": "small"}, {"model": "small"}])
@@ -351,6 +365,7 @@ class CLITest(unittest.IsolatedAsyncioTestCase):
                 ]
             )
             with redirect_stderr(io.StringIO()):
+                # pyrefly: ignore [bad-argument-type]
                 await execute(args, models=models, terminal=terminal)
             self.assertEqual("".join(terminal.output), "reply 1\n")
 
@@ -404,6 +419,7 @@ class CLIParsingTest(unittest.TestCase):
                     ToolResult(str(i), "tool", "ok"),
                 ]
             )
+        # pyrefly: ignore [bad-argument-type]
         compacted = _tail_compactor(items)
         self.assertEqual(compacted, items[3:])
         self.assertEqual(len(compacted), 12)
