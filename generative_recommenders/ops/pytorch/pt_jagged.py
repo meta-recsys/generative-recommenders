@@ -20,6 +20,17 @@ import os
 from typing import Tuple
 
 import torch
+from torchrec.modules.sorted_index_select import maybe_sorted_index_select
+
+
+def _use_sorted_index_select() -> bool:
+    # App-layer opt-in, read at call time (the training launcher may set the env
+    # after import). Guarded for TorchScript: os.environ is not scriptable, and
+    # the sorted path is a training-only backward opt, so scripted publish just
+    # uses the native gather.
+    if torch.jit.is_scripting():
+        return False
+    return os.environ.get("TORCHREC_SORTED_INDEX_SELECT", "0") == "1"
 
 try:
     from torchrec.modules.sorted_index_select import maybe_sorted_index_select
