@@ -171,6 +171,90 @@ class JaggedMultirowParityTest(unittest.TestCase):
             torch.testing.assert_close(grads[1], grads[0], rtol=0, atol=0)
 
     @unittest.skipIf(*gpu_unavailable)
+    # pyre-ignore[56]
+    @given(config=st.sampled_from(_CONFIGS))
+    @settings(verbosity=Verbosity.verbose, max_examples=len(_CONFIGS), deadline=None)
+    @example(config=_CONFIGS[0])
+    @example(config=_CONFIGS[-1])
+    def test_split_skip_left(
+        self, config: Tuple[int, int, torch.dtype, int, int]
+    ) -> None:
+        self._test_split_skip_left(*config)
+
+    def _test_split_skip_left(
+        self,
+        B: int,
+        D: int,
+        dtype: torch.dtype,
+        max_len_a: int,
+        max_len_b: int,
+    ) -> None:
+        """skip_left drops the left output without disturbing anything else.
+
+        Covers the full (multirow, skip_left) matrix. Only the multirow kernels
+        take SKIP_LEFT; the single-row fallbacks still write the full left
+        output, and the caller drops it afterwards. Either way the contract is
+        the same, so the right output and the input gradient must be bit-exact
+        across all four runs and the left output must be a 0-row tensor
+        whenever skip_left is set.
+        """
+        dev = torch.device("cuda")
+        oa, mla = _rand_offsets(B, max_len_a, dev, seed=B + D)
+        ob, mlb = _rand_offsets(B, max_len_b, dev, seed=B + D + 100)
+        cmax = mla + mlb
+        va = torch.randn(int(oa[-1]), D, dtype=dtype, device=dev)
+        vb = torch.randn(int(ob[-1]), D, dtype=dtype, device=dev)
+        values = _ref_concat(va, vb, oa, ob)
+        gb = torch.randn_like(vb)
+        # Split's adjoint is concat, so with a zero left grad the input gradient
+        # must equal concat(0, gb). Comparing against this instead of only
+        # cross-checking the runs catches a backward that is consistently wrong.
+        ref_grad = _ref_concat(torch.zeros_like(va), gb, oa, ob)
+
+        rights: List[torch.Tensor] = []
+        grads: List[torch.Tensor] = []
+        for multirow in (False, True):
+            set_split_concat_2d_jagged_multirow_kernel(multirow)
+            for skip_left in (False, True):
+                v = values.detach().clone().requires_grad_(True)
+                sa, sb = triton_split_2D_jagged(v, cmax, oa, ob, skip_left=skip_left)
+                if skip_left:
+                    self.assertEqual(tuple(sa.shape), (0, D))
+                else:
+                    torch.testing.assert_close(sa, va, rtol=0, atol=0)
+                rights.append(sb.detach())
+                # skip_left means the left output is unused, i.e. its gradient is
+                # zero. Feeding a zero left grad on every run keeps the input
+                # gradients comparable across the matrix.
+                torch.autograd.backward([sa, sb], [torch.zeros_like(sa), gb])
+                assert v.grad is not None
+                grads.append(v.grad)
+
+        torch.testing.assert_close(rights[0], vb, rtol=0, atol=0)
+        torch.testing.assert_close(grads[0], ref_grad, rtol=0, atol=0)
+        for i in range(1, len(rights)):
+            torch.testing.assert_close(rights[i], rights[0], rtol=0, atol=0)
+            torch.testing.assert_close(grads[i], grads[0], rtol=0, atol=0)
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_split_skip_left_rejects_dense_left(self) -> None:
+        # A dense left output promises a (B, dense_size, D) shape, which a 0-row
+        # buffer cannot carry, so the combination must be rejected outright.
+        dev = torch.device("cuda")
+        B, D, dense_size = 8, 16, 4
+        ob, mlb = _rand_offsets(B, 32, dev, seed=7)
+        values = torch.randn(B * dense_size + int(ob[-1]), D, device=dev)
+        with self.assertRaises(AssertionError):
+            triton_split_2D_jagged(
+                values,
+                dense_size + mlb,
+                offsets_a=None,
+                offsets_b=ob,
+                dense_size=dense_size,
+                skip_left=True,
+            )
+
+    @unittest.skipIf(*gpu_unavailable)
     def test_default_selection_matches_singlerow(self) -> None:
         # With no override, the default path must select multirow on sm90+ and
         # stay bit-exact vs the single-row kernel at the prod shape.

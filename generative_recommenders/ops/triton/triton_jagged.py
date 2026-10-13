@@ -167,6 +167,7 @@ def _triton_concat_2D_jagged_internal(
     is_dense_b: bool,
     is_replace: bool,
     BLOCK_D: int,
+    skip_left: bool = False,
 ) -> None:
     use_multirow = _should_use_multirow()
     if n_prefix != 0:
@@ -187,8 +188,17 @@ def _triton_concat_2D_jagged_internal(
                 stride_od=values_out.stride(0),
                 n_prefix_from_B=n_prefix,
                 BLOCK_D=BLOCK_D,
+                SKIP_LEFT=skip_left,
             )
         else:
+            # TODO: teach the single-row kernels SKIP_LEFT so callers stop having
+            # to predict the dispatch; then this assert and the
+            # _should_use_multirow() checks in the autograd Functions can go away.
+            assert not skip_left, (
+                "skip_left=True reached the single-row fallback, which has no "
+                "SKIP_LEFT parameter and always loads seq_len_a rows from ValuesA. "
+                "Callers must pass `skip_left and _should_use_multirow()`."
+            )
             concat_2D_jagged_jagged_w_prefix[(max_seq_len, B)](
                 OffsetsA=offsets_a,
                 ValuesA=values_a,
@@ -224,8 +234,14 @@ def _triton_concat_2D_jagged_internal(
                 IS_DENSE_B=is_dense_b,  # pyre-ignore[6]
                 BLOCK_D=BLOCK_D,  # pyre-ignore[6]
                 IS_REPLACE=is_replace,  # pyre-ignore[6]
+                SKIP_LEFT=skip_left,  # pyre-ignore[6]
             )
         else:
+            assert not skip_left, (
+                "skip_left=True reached the single-row fallback, which has no "
+                "SKIP_LEFT parameter and always loads seq_len_a rows from ValuesA. "
+                "Callers must pass `skip_left and _should_use_multirow()`."
+            )
             concat_2D_jagged[(max_seq_len, B)](
                 OffsetsA=offsets_a,
                 ValuesA=values_a,
@@ -1608,6 +1624,7 @@ def _triton_split_2D_jagged_internal(
     is_dense_b: bool,
     is_replace: bool,
     BLOCK_D: int,
+    skip_left: bool = False,
 ) -> None:
     use_multirow = _should_use_multirow()
     if n_prefix != 0:
@@ -1628,8 +1645,14 @@ def _triton_split_2D_jagged_internal(
                 stride_bd=out_b.stride(0),
                 n_prefix_to_B=n_prefix,
                 BLOCK_D=BLOCK_D,
+                SKIP_LEFT=skip_left,
             )
         else:
+            assert not skip_left, (
+                "skip_left=True reached the single-row fallback, which has no "
+                "SKIP_LEFT parameter and always stores seq_len_a rows into OutA. "
+                "Callers must pass `skip_left and _should_use_multirow()`."
+            )
             split_2D_jagged_jagged_w_prefix[(max_seq_len, B)](
                 JaggedIn=jagged_in,
                 OffsetsA=offsets_a,
@@ -1664,8 +1687,14 @@ def _triton_split_2D_jagged_internal(
                 IS_DENSE_B=is_dense_b,  # pyre-ignore[6]
                 BLOCK_D=BLOCK_D,  # pyre-ignore[6]
                 IS_REPLACE=is_replace,  # pyre-ignore[6]
+                SKIP_LEFT=skip_left,  # pyre-ignore[6]
             )
         else:
+            assert not skip_left, (
+                "skip_left=True reached the single-row fallback, which has no "
+                "SKIP_LEFT parameter and always stores seq_len_a rows into OutA. "
+                "Callers must pass `skip_left and _should_use_multirow()`."
+            )
             split_2D_jagged[(max_seq_len, B)](
                 JaggedIn=jagged_in,
                 DenseSize=dense_size,
@@ -1890,10 +1919,16 @@ class _Split2DJaggedFunction(torch.autograd.Function):
         seq_len_a: Optional[int] = None,
         seq_len_b: Optional[int] = None,
         total_seq_len: Optional[int] = None,
+        skip_left: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         values = switch_to_contiguous_if_needed(values)
         is_dense_a: bool = offsets_a is None
         is_dense_b: bool = offsets_b is None
+        assert not (skip_left and is_dense_a), (
+            "skip_left is not supported for a dense left output: the returned "
+            "0-row buffer cannot carry the (B, dense_size, D) shape that a dense "
+            "left output promises. Pass offsets_a, or leave skip_left False."
+        )
         if is_dense_a:
             L, _ = values.shape
             assert offsets_b is not None
@@ -1944,7 +1979,16 @@ class _Split2DJaggedFunction(torch.autograd.Function):
             assert total_seq_len is not None
             seq_len_a = total_seq_len - values_b.size(0)
         # pyre-ignore[6] Incompatible parameter type
-        values_a = torch.empty((seq_len_a, D), device=values.device, dtype=values.dtype)
+        if skip_left and _should_use_multirow():
+            # Every multirow kernel guards its OutA use behind `if not SKIP_LEFT`,
+            # so a 0-row buffer is never dereferenced: skip the allocation entirely.
+            values_a = torch.empty((0, D), device=values.device, dtype=values.dtype)
+        else:
+            # skip_left without multirow still needs the full buffer: the single-row
+            # fallbacks take no SKIP_LEFT parameter and always store seq_len_a rows.
+            values_a = torch.empty(
+                (seq_len_a, D), device=values.device, dtype=values.dtype
+            )
         _triton_split_2D_jagged_internal(
             jagged_in=values,
             max_seq_len=max_seq_len,
@@ -1960,8 +2004,13 @@ class _Split2DJaggedFunction(torch.autograd.Function):
             is_dense_b=is_dense_b,
             is_replace=False,
             BLOCK_D=BLOCK_D,
+            skip_left=skip_left and _should_use_multirow(),
         )
-        if is_dense_a:
+        if skip_left and not _should_use_multirow():
+            # The fallback wrote the full left output; drop it so the returned
+            # shape does not depend on which kernel was dispatched.
+            values_a = torch.empty((0, D), device=values.device, dtype=values.dtype)
+        if not skip_left and is_dense_a:
             values_a = values_a.reshape(B, dense_size, D)
         if is_dense_b:
             values_b = values_b.reshape(B, dense_size, D)
@@ -1975,30 +2024,46 @@ class _Split2DJaggedFunction(torch.autograd.Function):
         ctx.B = B
         ctx.D = D
         ctx.n_prefix_to_right = n_prefix_to_right
+        ctx.skip_left = skip_left
         return values_a, values_b
 
     @staticmethod
     def backward(
         ctx, *d_values
-    ) -> Tuple[torch.Tensor, None, None, None, None, None, None, None, None]:
+    ) -> Tuple[torch.Tensor, None, None, None, None, None, None, None, None, None]:
         offsets_a, offsets_b = ctx.saved_tensors
         is_dense_a, is_dense_b = ctx.is_dense_a, ctx.is_dense_b
         values_a, values_b = d_values
+        BLOCK_D = triton.next_power_of_2(ctx.D)
+        skip_left = getattr(ctx, "skip_left", False)
+        # Every concat path below writes all of dvalues: the multirow kernel stores
+        # zeros over the left region under SKIP_LEFT, and the single-row fallback
+        # gets a real zero buffer as ValuesA. So an uninitialized buffer is fine.
+        dvalues = torch.empty(
+            (ctx.seq_len_a + ctx.seq_len_b, ctx.D),
+            device=values_a.device if values_a.numel() > 0 else values_b.device,
+            dtype=values_b.dtype,
+        )
+        if skip_left and not _should_use_multirow() and values_a.numel() == 0:
+            # The fallback concat really loads the left region; give it real zeros.
+            concat_values_a = torch.zeros(
+                (ctx.seq_len_a, ctx.D),
+                device=values_b.device,
+                dtype=values_b.dtype,
+            )
+        else:
+            concat_values_a = values_a
+
         if is_dense_a:
-            stride_dense_batch = values_a.stride(0)
+            stride_dense_batch = (
+                concat_values_a.stride(0) if concat_values_a.numel() > 0 else 0
+            )
         elif is_dense_b:
             stride_dense_batch = values_b.stride(0)
         else:
             stride_dense_batch = 0
-
-        BLOCK_D = triton.next_power_of_2(ctx.D)
-        dvalues = torch.empty(
-            (ctx.seq_len_a + ctx.seq_len_b, ctx.D),
-            device=values_a.device,
-            dtype=values_b.dtype,
-        )
         _triton_concat_2D_jagged_internal(
-            values_a=values_a,
+            values_a=concat_values_a,
             values_b=values_b,
             values_out=dvalues,
             max_seq_len=ctx.max_seq_len,
@@ -2013,9 +2078,10 @@ class _Split2DJaggedFunction(torch.autograd.Function):
             is_dense_b=is_dense_b,
             is_replace=False,
             BLOCK_D=BLOCK_D,
+            skip_left=skip_left and _should_use_multirow(),
         )
 
-        return dvalues, None, None, None, None, None, None, None, None
+        return dvalues, None, None, None, None, None, None, None, None, None
 
 
 @torch.jit.unused
@@ -2136,6 +2202,7 @@ def triton_split_2D_jagged(
     seq_len_a: Optional[int] = None,
     seq_len_b: Optional[int] = None,
     total_seq_len: Optional[int] = None,
+    skip_left: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return _Split2DJaggedFunction.apply(
         values,
@@ -2147,6 +2214,7 @@ def triton_split_2D_jagged(
         seq_len_a,
         seq_len_b,
         total_seq_len,
+        skip_left,
     )
 
 
@@ -2186,6 +2254,7 @@ def concat_2D_jagged_w_prefix_multirow(
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IS_REPLACE: tl.constexpr,
+    SKIP_LEFT: tl.constexpr = False,  # pyrefly: ignore [bad-function-definition]
 ):
     off_z = tl.program_id(1)
     off_block_n = tl.program_id(0)
@@ -2235,22 +2304,31 @@ def concat_2D_jagged_w_prefix_multirow(
     to_a_mask = (offs_n < out_seq_b_start) & (offs_n >= n_prefix_from_B) & valid_mask
     to_b_mask = ~to_a_mask & valid_mask
 
-    off_a = offs_n - n_prefix_from_B
-    if IS_DENSE_A:
-        in_a_ptrs = (
-            ValuesA
-            + off_a[:, None].to(tl.int64) * stride_ad
-            + off_z.to(tl.int64) * stride_dense_batch
-            + offs_d[None, :]
+    if not SKIP_LEFT:
+        off_a = offs_n - n_prefix_from_B
+        if IS_DENSE_A:
+            in_a_ptrs = (
+                ValuesA
+                + off_a[:, None].to(tl.int64) * stride_ad
+                + off_z.to(tl.int64) * stride_dense_batch
+                + offs_d[None, :]
+            )
+        else:
+            in_a_ptrs = (
+                ValuesA
+                + (off_a[:, None] + seq_start_a).to(tl.int64) * stride_ad
+                + offs_d[None, :]
+            )
+
+        v_a = tl.load(
+            in_a_ptrs, mask=to_a_mask[:, None] & (offs_d[None, :] < D), other=0.0
         )
     else:
-        in_a_ptrs = (
-            ValuesA
-            + (off_a[:, None] + seq_start_a).to(tl.int64) * stride_ad
-            + offs_d[None, :]
-        )
-
-    v_a = tl.load(in_a_ptrs, mask=to_a_mask[:, None] & (offs_d[None, :] < D), other=0.0)
+        # ValuesA is a 0-row placeholder, but Out spans both halves and the caller
+        # still has to end up with a defined left region. These blocks are launched
+        # either way, so zero-filling here replaces a caller-side memset over the
+        # whole buffer with stores the grid was already going to pay for.
+        v_a = tl.zeros([BLOCK_N, BLOCK_D], dtype=Out.dtype.element_ty)
     tl.store(out_ptrs, v_a, mask=to_a_mask[:, None] & (offs_d[None, :] < D))
 
     prefix_mask = offs_n < n_prefix_from_B
@@ -2296,6 +2374,7 @@ def concat_2D_jagged_multirow(
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IS_REPLACE: tl.constexpr,
+    SKIP_LEFT: tl.constexpr = False,  # pyrefly: ignore [bad-function-definition]
 ):
     concat_2D_jagged_w_prefix_multirow(
         OffsetsA,
@@ -2315,6 +2394,7 @@ def concat_2D_jagged_multirow(
         BLOCK_D,
         BLOCK_N,
         IS_REPLACE,
+        SKIP_LEFT,
     )
 
 
@@ -2336,6 +2416,7 @@ def concat_2D_jagged_jagged_w_prefix_multirow(
     n_prefix_from_B,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    SKIP_LEFT: tl.constexpr = False,  # pyrefly: ignore [bad-function-definition]
 ):
     concat_2D_jagged_w_prefix_multirow(
         OffsetsA,
@@ -2355,6 +2436,7 @@ def concat_2D_jagged_jagged_w_prefix_multirow(
         BLOCK_D=BLOCK_D,
         BLOCK_N=BLOCK_N,
         IS_REPLACE=False,
+        SKIP_LEFT=SKIP_LEFT,
     )
 
 
@@ -2376,6 +2458,7 @@ def split_2D_jagged_w_prefix_multirow(
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IS_REPLACE: tl.constexpr,
+    SKIP_LEFT: tl.constexpr = False,  # pyrefly: ignore [bad-function-definition]
 ):
     off_z = tl.program_id(1)
     off_block_n = tl.program_id(0)
@@ -2430,11 +2513,14 @@ def split_2D_jagged_w_prefix_multirow(
     to_a_mask = (offs_n < out_seq_b_start) & (offs_n >= n_prefix_to_B) & valid_mask
     to_b_mask = ~to_a_mask & valid_mask
 
-    off_a = offs_n - n_prefix_to_B
-    out_a_ptrs = (
-        OutA + (off_a[:, None] + seq_start_a).to(tl.int64) * stride_ad + offs_d[None, :]
-    )
-    tl.store(out_a_ptrs, v, mask=to_a_mask[:, None] & (offs_d[None, :] < D))
+    if not SKIP_LEFT:
+        off_a = offs_n - n_prefix_to_B
+        out_a_ptrs = (
+            OutA
+            + (off_a[:, None] + seq_start_a).to(tl.int64) * stride_ad
+            + offs_d[None, :]
+        )
+        tl.store(out_a_ptrs, v, mask=to_a_mask[:, None] & (offs_d[None, :] < D))
 
     prefix_mask = offs_n < n_prefix_to_B
 
@@ -2466,6 +2552,7 @@ def split_2D_jagged_multirow(
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IS_REPLACE: tl.constexpr,
+    SKIP_LEFT: tl.constexpr = False,  # pyrefly: ignore [bad-function-definition]
 ):
     split_2D_jagged_w_prefix_multirow(
         JaggedIn,
@@ -2484,6 +2571,7 @@ def split_2D_jagged_multirow(
         BLOCK_D,
         BLOCK_N,
         IS_REPLACE,
+        SKIP_LEFT,
     )
 
 
@@ -2505,6 +2593,7 @@ def split_2D_jagged_jagged_w_prefix_multirow(
     n_prefix_to_B,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    SKIP_LEFT: tl.constexpr = False,  # pyrefly: ignore [bad-function-definition]
 ):
     split_2D_jagged_w_prefix_multirow(
         JaggedIn,
@@ -2523,6 +2612,7 @@ def split_2D_jagged_jagged_w_prefix_multirow(
         BLOCK_D=BLOCK_D,
         BLOCK_N=BLOCK_N,
         IS_REPLACE=False,
+        SKIP_LEFT=SKIP_LEFT,
     )
 
 
