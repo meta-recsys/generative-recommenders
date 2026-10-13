@@ -18,7 +18,6 @@ import logging
 
 logging.basicConfig(level=logging.INFO)
 import os
-import sys
 import traceback
 
 import gin
@@ -63,6 +62,9 @@ def _main_func(
     mode: str,
     hstu_ultra: bool,
     hstu_ultra_fp8: bool,
+    dataset_path_prefix: str,
+    checkpoint_path: str,
+    checkpoint_frequency: int | None,
 ) -> None:
     device = torch.device(f"cuda:{rank}")
     logger.info(f"rank: {rank}, world_size: {world_size}, device: {device}")
@@ -74,6 +76,22 @@ def _main_func(
     )
     # parse all arguments
     gin.parse_config_file(gin_file)
+    if dataset_path_prefix:
+        gin.bind_parameter(
+            "make_train_test_dataloaders.new_path_prefix", dataset_path_prefix
+        )
+    if checkpoint_path:
+        gin.bind_parameter("save_dmp_checkpoint.path", checkpoint_path)
+    if checkpoint_frequency is not None:
+        loop_name = {
+            "train": "train_loop",
+            "train-eval": "train_eval_loop",
+            "streaming-train-eval": "streaming_train_eval_loop",
+        }.get(mode)
+        if loop_name is not None:
+            gin.bind_parameter(
+                f"{loop_name}.checkpoint_frequency", checkpoint_frequency
+            )
 
     model, model_configs, embedding_table_configs = make_model(
         hstu_ultra_stack_name=("hstu_ultra" if hstu_ultra else None),
@@ -172,6 +190,21 @@ def get_args():  # pyre-ignore [3]
         choices=["train", "eval", "train-eval", "streaming-train-eval"],
         help="mode",
     )
+    parser.add_argument(
+        "--dataset-path-prefix",
+        default="",
+        help="prefix containing the preprocessed dataset directory",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        default="",
+        help="directory in which training checkpoints are saved",
+    )
+    parser.add_argument(
+        "--checkpoint-frequency",
+        type=int,
+        help="save a checkpoint after this many training steps",
+    )
     args, unknown_args = parser.parse_known_args()
     logger.warning(f"unknown_args: {unknown_args}")
     return args
@@ -200,6 +233,9 @@ def main() -> None:
             args.mode,
             args.hstu_ultra or args.hstu_ultra_fp8,
             args.hstu_ultra_fp8,
+            args.dataset_path_prefix,
+            args.checkpoint_path,
+            args.checkpoint_frequency,
         ),
         nprocs=WORLD_SIZE,
         join=True,

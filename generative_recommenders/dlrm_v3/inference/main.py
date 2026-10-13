@@ -19,6 +19,7 @@ mlperf dlrm_v3 inference benchmarking tool.
 
 import argparse
 import array
+import json
 import logging
 import random
 import threading
@@ -27,6 +28,7 @@ logging.basicConfig(level=logging.INFO)
 import os
 import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import gin
@@ -94,6 +96,33 @@ def get_args():  # pyre-ignore [3]
         "--hstu-ultra-fp8",
         action="store_true",
         help="use FP8 projection GEMMs in the HSTU Ultra stack",
+    )
+    parser.add_argument("--model-path", default="", help="checkpoint directory")
+    parser.add_argument(
+        "--dataset-path-prefix",
+        default="",
+        help="prefix containing the preprocessed dataset directory",
+    )
+    parser.add_argument(
+        "--scenario", choices=SCENARIO_MAP, help="override the Gin scenario"
+    )
+    parser.add_argument("--batch-size", type=int, help="inference batch size")
+    parser.add_argument("--target-qps", type=int, help="LoadGen target QPS")
+    parser.add_argument("--num-queries", type=int, help="number of benchmark queries")
+    parser.add_argument(
+        "--warmup-ratio", type=float, help="fraction of the dataset used for warmup"
+    )
+    parser.add_argument(
+        "--data-producer-threads", type=int, help="number of dataset worker threads"
+    )
+    parser.add_argument(
+        "--compute-eval", action="store_true", help="run LoadGen accuracy mode"
+    )
+    parser.add_argument(
+        "--output-trace", action="store_true", help="capture a GPU trace"
+    )
+    parser.add_argument(
+        "--results-path", help="write benchmark metrics as a JSON document"
     )
     args, unknown_args = parser.parse_known_args()
     logger.warning(f"unknown_args: {unknown_args}")
@@ -192,9 +221,10 @@ class Runner:
                 }
             )
             self.result_batches.append(len(qitem.query_ids))
-        except Exception as ex:  # pylint: disable=broad-except
-            logger.error("thread: failed, %s", ex)
-        finally:
+        except Exception:
+            logger.exception("inference failed")
+            raise
+        else:
             # pyrefly: ignore [unbound-name]
             candidate_size = mt_target_preds.size(1) // len(qitem.query_ids)
             if not self.compute_eval:
@@ -333,7 +363,7 @@ def add_results(
     total_batches = sum(result_batches)
 
     final_results["good"] = len(total_timing)
-    final_results["avg_time"] = np.mean(total_timing)
+    final_results["avg_time"] = float(np.mean(total_timing))
     final_results["percentiles"] = {
         str(k): v for k, v in zip(percentiles, buckets_dict["total"])
     }
@@ -358,6 +388,18 @@ def add_results(
         logger.warning(f"{key}: {buckets_str_dict[key]}")
 
 
+def write_results(final_results: Dict[str, Any], results_path: Optional[str]) -> None:
+    """Write benchmark results to a portable JSON artifact when requested."""
+    if results_path is None:
+        return
+    output_path = Path(results_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(final_results, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def get_num_queries(
     input_size: Optional[int],
     one_pass_size: int,
@@ -378,13 +420,12 @@ def get_num_queries(
     Returns:
         Number of queries to execute in the benchmark run.
     """
+    if input_size is not None:
+        return input_size
     if scenario_name == "Offline":
         # consistent with https://github.com/mlcommons/inference/blob/8999c4d686f6e4a180da14597c97063fce7c9f33/loadgen/test_settings_internal.cc#L147
         return int(1.1 * target_duration / 1000 * offline_target_qps)
-    else:
-        if input_size is None:
-            return one_pass_size
-        return input_size
+    return one_pass_size
 
 
 class StreamingQuerySampler:
@@ -580,7 +621,7 @@ class StreamingQuerySampler:
 
 
 @gin.configurable
-def run(
+def run(  # noqa: C901
     dataset: str = "sampled-streaming-100b",
     model_path: str = "",
     scenario_name: str = "Server",
@@ -599,7 +640,8 @@ def run(
     dataset_percentage: float = 1.0,
     hstu_ultra_stack_name: Optional[str] = None,
     hstu_fp8_addmm_fwd: bool = False,
-) -> None:
+    results_path: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Execute the MLPerf DLRMv3 inference benchmark.
 
@@ -622,8 +664,10 @@ def run(
         numpy_rand_seed: Random seed for reproducibility.
         sparse_quant: Whether to quantize sparse embeddings.
         dataset_percentage: Fraction of dataset to use.
+        results_path: Optional path for machine-readable benchmark metrics.
     """
     set_dev_mode(False)
+    dataset_name = dataset
     if scenario_name not in SCENARIO_MAP:
         raise NotImplementedError("valid scanarios:" + str(list(SCENARIO_MAP.keys())))
     scenario = SCENARIO_MAP[scenario_name]
@@ -656,6 +700,9 @@ def run(
     if target_qps:
         settings.server_target_qps = float(target_qps)
         settings.offline_expected_qps = float(target_qps)
+    if num_queries is not None:
+        settings.min_duration_ms = 0
+        settings.max_duration_ms = 0
 
     model_family = HSTUModelFamily(
         hstu_config=hstu_config,
@@ -749,7 +796,7 @@ def run(
         else:
             warmup_count: int = int(count * warmup_ratio)
         runner.reset_states(num_queries=warmup_count)
-        final_results = {
+        final_results: Dict[str, Any] = {
             "runtime": model_family.name(),
             "version": model_family.version(),
             "time": int(time.time()),
@@ -790,6 +837,8 @@ def run(
     settings.min_query_count = query_size
     settings.max_query_count = query_size
     runner.reset_states(num_queries=query_size if not compute_eval else count)
+    if int(os.environ.get("WORLD_SIZE", 1)) == 1:
+        torch.cuda.reset_peak_memory_stats()
     sut = lg.ConstructSUT(issue_queries, flush_queries)
     qsl = lg.ConstructQSL(
         count,
@@ -813,9 +862,20 @@ def run(
         runner.result_timing,
         runner.result_batches,
     )
+    final_results["dataset"] = dataset_name
+    final_results["batch_size"] = batchsize
+    final_results["target_qps"] = target_qps
+    final_results["hstu_ultra_stack_name"] = hstu_ultra_stack_name
+    final_results["hstu_fp8_addmm_fwd"] = hstu_fp8_addmm_fwd
+    if int(os.environ.get("WORLD_SIZE", 1)) == 1:
+        torch.cuda.synchronize()
+        final_results["peak_gpu_memory_bytes"] = torch.cuda.max_memory_allocated()
+        final_results["gpu_name"] = torch.cuda.get_device_name()
+    write_results(final_results, results_path)
     # If multiple subprocesses are running the model send a signal to stop them
     if int(os.environ.get("WORLD_SIZE", 1)) > 1:
         model_family.predict(None)
+    return final_results
 
 
 def main() -> None:
@@ -824,12 +884,30 @@ def main() -> None:
     logger.info(args)
     gin_path = f"{os.path.dirname(__file__)}/gin/{SUPPORTED_CONFIGS[args.dataset]}"
     gin.parse_config_file(gin_path)
-    run(
-        dataset=args.dataset,
-        hstu_ultra_stack_name=(
+    run_kwargs: Dict[str, Any] = {
+        "dataset": args.dataset,
+        "model_path": args.model_path,
+        "dataset_path_prefix": args.dataset_path_prefix,
+        "compute_eval": args.compute_eval,
+        "output_trace": args.output_trace,
+        "results_path": args.results_path,
+        "hstu_ultra_stack_name": (
             "hstu_ultra" if args.hstu_ultra or args.hstu_ultra_fp8 else None
         ),
-        hstu_fp8_addmm_fwd=args.hstu_ultra_fp8,
+        "hstu_fp8_addmm_fwd": args.hstu_ultra_fp8,
+    }
+    for name, value in (
+        ("scenario_name", args.scenario),
+        ("batchsize", args.batch_size),
+        ("target_qps", args.target_qps),
+        ("num_queries", args.num_queries),
+        ("warmup_ratio", args.warmup_ratio),
+        ("data_producer_threads", args.data_producer_threads),
+    ):
+        if value is not None:
+            run_kwargs[name] = value
+    run(
+        **run_kwargs,
     )
 
 

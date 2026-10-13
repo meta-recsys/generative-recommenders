@@ -123,21 +123,42 @@ model to cache the row-wise quantized projection weights.
 
 The end-to-end integration uses the target-aware HSTU Ultra stack inside
 the existing DLRMv3 data, multitask-loss, optimizer, checkpoint, and eager
-inference paths. Start a BF16 training run with:
+inference paths. The following sequence preprocesses the public KuaiRand-1K
+dataset and saves periodic BF16 checkpoints without editing a Gin file:
 
 ```bash
+mkdir -p data
+python3 generative_recommenders/dlrm_v3/preprocess_public_data.py \
+  --dataset kuairand-1k
+
+DATA_ROOT="$PWD"
+CHECKPOINT_ROOT="$PWD/checkpoints/kuairand-1k-bf16"
 python3 -m generative_recommenders.dlrm_v3.train.train_ranker \
-  --dataset kuairand-1k --hstu-ultra
+  --dataset kuairand-1k --mode train --hstu-ultra \
+  --dataset-path-prefix "$DATA_ROOT" \
+  --checkpoint-path "$CHECKPOINT_ROOT" --checkpoint-frequency 50
 ```
 
 Add ``--hstu-ultra-fp8`` to use FP8 projection GEMMs (it also enables the
-Ultra stack). Eager inference accepts the same flags and prepares the FP8
-weight caches after loading the checkpoint:
+Ultra stack). Eager inference accepts the same flags, prepares the FP8 weight
+caches after loading the checkpoint, and can emit a JSON result artifact. Run
+the command once with ``--hstu-ultra`` and once with ``--hstu-ultra-fp8`` to
+compare BF16 and FP8 under the same LoadGen workload:
 
 ```bash
 python3 -m generative_recommenders.dlrm_v3.inference.main \
-  --dataset debug --hstu-ultra-fp8
+  --dataset kuairand-1k --hstu-ultra-fp8 \
+  --dataset-path-prefix "$DATA_ROOT" \
+  --model-path "$CHECKPOINT_ROOT/50" \
+  --scenario Offline --batch-size 16 --num-queries 10000 \
+  --results-path "$PWD/results/kuairand-1k-fp8.json"
 ```
+
+The JSON artifact includes QPS, latency percentiles, hardware, configuration,
+and peak allocated GPU memory for single-GPU runs. Add ``--compute-eval`` to
+generate the LoadGen accuracy log, then evaluate it with
+``dlrm_v3/inference/accuracy.py``. Tune ``--target-qps`` for Server scenarios;
+an overloaded target measures queueing rather than model latency.
 
 Cached incremental decoding and scripted inference export are not included yet.
 
