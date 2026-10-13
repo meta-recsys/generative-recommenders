@@ -1290,7 +1290,9 @@ class RMSNormFunction(torch.autograd.Function):
         eps: float,
         silu: bool,
     ) -> torch.Tensor:
-        x = switch_to_contiguous_if_needed(x)
+        # Compact action batches can have zero rows. The opaque RMSNorm ops
+        # support them; do not impose the generic helper's positive-row guard.
+        x = x if x.stride(-1) == 1 else x.contiguous()
         y, rstd = triton_weighted_rms_norm_fwd(
             x=x,
             weight=weight,
