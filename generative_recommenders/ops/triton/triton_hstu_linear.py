@@ -587,7 +587,7 @@ def _ln_mul_dropout_bwd_dx_du_rng(
 
     partial_dw = tl.zeros((BLOCK_D,), dtype=tl.float32)
     partial_db = tl.zeros((BLOCK_D,), dtype=tl.float32)
-    w = tl.load(W + cols, mask=mask).to(tl.float32)
+    w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
     if not IS_RMS_NORM:
         # RMSNorm has no bias term; B is unread on that path.
         b = tl.load(B + cols, mask=mask).to(tl.float32)
