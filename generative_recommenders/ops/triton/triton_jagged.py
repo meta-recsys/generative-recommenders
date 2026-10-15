@@ -1986,6 +1986,7 @@ class _Split2DJaggedFunction(torch.autograd.Function):
         else:
             # skip_left without multirow still needs the full buffer: the single-row
             # fallbacks take no SKIP_LEFT parameter and always store seq_len_a rows.
+            # pyrefly: ignore [no-matching-overload]
             values_a = torch.empty(
                 (seq_len_a, D), device=values.device, dtype=values.dtype
             )
