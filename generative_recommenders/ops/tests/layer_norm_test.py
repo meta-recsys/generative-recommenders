@@ -84,6 +84,34 @@ class LayerNormTest(unittest.TestCase):
             real_kernel=HammerKernel.TRITON,
         )
 
+    # The AOT-T (TRITON_INFERENCE) layer norm and swish layer norm, forward only.
+    @unittest.skipIf(*gpu_unavailable)
+    # pyre-ignore[56]
+    @given(
+        N=st.integers(min_value=0, max_value=10000),
+        D=st.integers(min_value=32, max_value=512),
+        is_swish=st.sampled_from([True, False]),
+        dtype=st.sampled_from(
+            [torch.bfloat16, torch.float32]
+            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            else [torch.float32]
+        ),
+    )
+    @settings(
+        deadline=None,
+        verbosity=Verbosity.verbose,
+        max_examples=20,
+    )
+    # pyre-ignore[2]
+    def test_ln_triton_inference(self, *args, **kwargs) -> None:
+        self._test_layernorm(
+            *args,
+            **kwargs,
+            ref_kernel=HammerKernel.PYTORCH,
+            real_kernel=HammerKernel.TRITON_INFERENCE,
+            test_backward=False,
+        )
+
     def _test_layernorm(
         self,
         N: int,
@@ -93,6 +121,7 @@ class LayerNormTest(unittest.TestCase):
         ref_kernel: HammerKernel,
         real_kernel: HammerKernel,
         skip_comparisons: bool = False,
+        test_backward: bool = True,
     ) -> None:
         N = N // 4 * 4
         # enable auto-tuning to verify correctness of multi-row kernel
@@ -133,6 +162,9 @@ class LayerNormTest(unittest.TestCase):
         weight = weight.detach().clone().requires_grad_()
         bias = bias.detach().clone().requires_grad_()
         opt_out = layer_norm_func(x, weight, bias, eps=1e-6, kernel=real_kernel)
+        if not test_backward:
+            torch.testing.assert_close(ref_out, opt_out)
+            return
         dout = dout.detach().clone()
         opt_out.backward(dout)
         # pyrefly: ignore [missing-attribute]
