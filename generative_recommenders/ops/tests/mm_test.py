@@ -96,6 +96,47 @@ class MMlTest(unittest.TestCase):
             kernel_type=HammerKernel.TRITON,
         )
 
+    # Runs the AOT-T addmm wrapper (and its kernel) against the PyTorch
+    # reference, so a drift between it and the op it replaces fails here.
+    # Half precision only: the AOT-T kernel compiles ALLOW_TF32 in from
+    # BACKEND_ALLOW_TF32 (always True) instead of following
+    # torch.backends.cuda.matmul.allow_tf32, so its float32 results carry TF32
+    # error against this test's strict-fp32 reference.
+    @unittest.skipIf(*gpu_unavailable)
+    # pyre-ignore[56]
+    @given(
+        M=st.integers(min_value=100, max_value=300),
+        N=st.sampled_from([16, 48, 128, 144, 256]),
+        K=st.sampled_from([16, 48, 128, 144, 256]),
+        broadcast=st.booleans(),
+        dtype=st.sampled_from(
+            [torch.bfloat16, torch.float16]
+            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            else [torch.float16]
+        ),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=20,
+        deadline=None,
+    )
+    def test_addmm_triton_inference(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        broadcast: bool,
+        dtype: torch.dtype,
+    ) -> None:
+        self._test_addmm(
+            M=M,
+            N=N,
+            K=K,
+            broadcast=broadcast,
+            dtype=dtype,
+            kernel_type=HammerKernel.TRITON_INFERENCE,
+        )
+
     def _test_addmm(
         self,
         M: int,
@@ -146,8 +187,8 @@ class MMlTest(unittest.TestCase):
 
         torch.testing.assert_close(ref_z, real_z, atol=atol, rtol=rtol)
 
-        # triton cc doesn't support backward
-        if kernel_type != HammerKernel.TRITON_CC:
+        # triton cc and AOT-T (TRITON_INFERENCE) are inference-only
+        if kernel_type not in (HammerKernel.TRITON_CC, HammerKernel.TRITON_INFERENCE):
             real_z.backward(dz)
             # pyrefly: ignore [missing-attribute]
             real_dx, x.grad = x.grad.detach().clone(), None
