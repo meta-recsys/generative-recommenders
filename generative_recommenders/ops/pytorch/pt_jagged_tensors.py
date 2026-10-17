@@ -66,7 +66,10 @@ def _concat_2D_jagged_jagged(
         padding_value=0.0,
     )
     # [B, 2 * max_len, D] viewed as 2B padded segments l0, r0, l1, r1, ...
-    interleaved = torch.cat([padded_left, padded_right], dim=1).view(2 * B, max_len, -1)
+    # D is explicit: when every row is empty (max_len == 0) a -1 cannot be inferred.
+    interleaved = torch.cat([padded_left, padded_right], dim=1).view(
+        2 * B, max_len, values_left.shape[-1]
+    )
     return torch.ops.fbgemm.dense_to_jagged(
         interleaved,
         [_interleaved_offsets(offsets_left, offsets_right)],
@@ -144,12 +147,13 @@ def _split_2D_jagged_jagged(
         total_len_right = values.shape[0] - total_len_left
     B = offsets_left.shape[0] - 1
     # 2B padded segments l0, r0, l1, r1, ... viewed as [B, 2 * max_seq_len, D].
+    # D is explicit: an empty batch (B == 0) leaves no elements to infer a -1 from.
     padded = torch.ops.fbgemm.jagged_to_padded_dense(
         values=values,
         offsets=[_interleaved_offsets(offsets_left, offsets_right)],
         max_lengths=[max_seq_len],
         padding_value=0.0,
-    ).view(B, 2 * max_seq_len, -1)
+    ).view(B, 2 * max_seq_len, values.shape[-1])
     left = torch.ops.fbgemm.dense_to_jagged(
         padded[:, :max_seq_len], [offsets_left], total_len_left
     )[0]

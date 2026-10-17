@@ -122,6 +122,44 @@ class PtJaggedTensorsStaticTest(unittest.TestCase):
         torch.testing.assert_close(left, ref_left)
         torch.testing.assert_close(right, ref_right)
 
+    def test_all_rows_empty(self) -> None:
+        # Every row empty on both sides, as in a synthetic publish sample with no
+        # user history: the max_len derived from the offsets is 0.
+        for batch_size in (1, 2):
+            with self.subTest(batch_size=batch_size):
+                offsets = _offsets([0] * batch_size)
+                out = pytorch_concat_2D_jagged(
+                    values_left=torch.randn(0, D),
+                    values_right=torch.randn(0, D),
+                    max_len_left=None,
+                    max_len_right=None,
+                    offsets_left=offsets,
+                    offsets_right=offsets,
+                )
+                self.assertEqual(tuple(out.shape), (0, D))
+                left, right = pytorch_split_2D_jagged(
+                    max_seq_len=4,
+                    values=torch.randn(0, D),
+                    max_len_left=None,
+                    max_len_right=None,
+                    offsets_left=offsets,
+                    offsets_right=offsets,
+                )
+                self.assertEqual(tuple(left.shape), (0, D))
+                self.assertEqual(tuple(right.shape), (0, D))
+
+    def test_split_empty_batch(self) -> None:
+        left, right = pytorch_split_2D_jagged(
+            max_seq_len=4,
+            values=torch.randn(0, D),
+            max_len_left=None,
+            max_len_right=None,
+            offsets_left=_offsets([]),
+            offsets_right=_offsets([]),
+        )
+        self.assertEqual(tuple(left.shape), (0, D))
+        self.assertEqual(tuple(right.shape), (0, D))
+
     def test_fake_trace_has_static_shapes(self) -> None:
         """With totals given, forward + backward trace on fake tensors (any
         data-dependent size would raise)."""
