@@ -27,7 +27,7 @@ from generative_recommenders.common import (
     HammerKernel,
     set_dev_mode,
 )
-from hypothesis import given, settings, strategies as st, Verbosity
+from hypothesis import assume, given, settings, strategies as st, Verbosity
 
 
 class HSTUComputeTest(unittest.TestCase):
@@ -63,6 +63,50 @@ class HSTUComputeTest(unittest.TestCase):
             test_backward=True,
             ref_kernel=HammerKernel.PYTORCH,
             opt_kernel=HammerKernel.TRITON,
+        )
+
+    # The AOT-T (TRITON_INFERENCE) layer/group norm mul dropout + output addmm,
+    # forward only.
+    @unittest.skipIf(*gpu_unavailable)
+    # pyre-ignore[56]
+    @given(
+        N=st.integers(min_value=1000, max_value=1000),
+        D=st.integers(min_value=128, max_value=128),
+        L=st.integers(min_value=512, max_value=512),
+        concat_u=st.booleans(),
+        concat_x=st.booleans(),
+        mul_u_activation_type=st.sampled_from(["silu", "sigmoid", "none"]),
+        group_norm=st.booleans(),
+        num_heads=st.sampled_from([4]),
+        training=st.just(False),
+        recompute_y_in_backward=st.just(False),
+        # bfloat16 only: the output projection goes through the AOT-T addmm,
+        # which always computes float32 in TF32 (see mm_test).
+        dtype=st.just(torch.bfloat16),
+    )
+    @settings(
+        deadline=None,
+        verbosity=Verbosity.verbose,
+        max_examples=20,
+    )
+    # pyre-ignore[2]
+    def test_compute_output_triton_inference(self, *args, **kwargs) -> None:
+        # The AOT-T compute-output path takes a single concat_ux flag, so it
+        # only implements concat_u == concat_x, and its group-norm path
+        # implements no mul_u activation.
+        assume(kwargs["concat_u"] == kwargs["concat_x"])
+        assume(not kwargs["group_norm"] or kwargs["mul_u_activation_type"] == "none")
+        self._test_compute_output(
+            *args,
+            **kwargs,
+            test_backward=False,
+            ref_kernel=HammerKernel.PYTORCH,
+            opt_kernel=HammerKernel.TRITON_INFERENCE,
+            # bf16 rtol with an absolute floor: the reference and the AOT-T
+            # output addmm accumulate in different orders, so outputs near
+            # zero can differ by a bf16 rounding step.
+            atol=1e-4,
+            rtol=1.6e-2,
         )
 
     @unittest.skipIf(*gpu_unavailable)
