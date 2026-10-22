@@ -83,6 +83,34 @@ class LayerNormTest(unittest.TestCase):
             real_kernel=HammerKernel.TRITON,
         )
 
+    # The AOT-T (TRITON_INFERENCE) rms norm, forward only.
+    @unittest.skipIf(*gpu_unavailable)
+    # pyre-ignore[56]
+    @given(
+        N=st.integers(min_value=0, max_value=10000),
+        D=st.integers(min_value=32, max_value=512),
+        dtype=st.sampled_from(
+            [torch.bfloat16, torch.float32]
+            if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
+            else [torch.float32]
+        ),
+        silu=st.booleans(),
+    )
+    @settings(
+        deadline=None,
+        verbosity=Verbosity.verbose,
+        max_examples=20,
+    )
+    # pyre-ignore[2]
+    def test_rms_norm_triton_inference(self, *args, **kwargs) -> None:
+        self._test_rms_norm(
+            *args,
+            **kwargs,
+            ref_kernel=HammerKernel.PYTORCH,
+            real_kernel=HammerKernel.TRITON_INFERENCE,
+            test_backward=False,
+        )
+
     @unittest.skipIf(*gpu_unavailable)
     @unittest.skipUnless(is_sm100_plus(), "Wide RMS autotuning regression for SM100")
     def test_rms_norm_wide(self) -> None:
