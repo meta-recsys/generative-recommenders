@@ -262,14 +262,24 @@ tma_unavailable: Tuple[bool, str] = (
 )
 
 
+# Opt-in (e.g. via AOTI lowering `env_vars`) for models whose jagged tensors can
+# be legitimately empty under export; otherwise the `> 0` hint below becomes a
+# runtime assert that fails on an empty input.
+_ALLOW_EMPTY_ENV = "TRITON_JAGGED_ALLOW_EMPTY_UNDER_COMPILE"
+
+
 def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
     if torch.jit.is_scripting():
         if x.stride(-1) == 1:
             return x
         return x.contiguous()
     if torch.compiler.is_compiling():
-        # Tell Dynamo this data-dependent value is in the range (0, 10**9)
-        torch._check(x.size(0) > 0)
+        # Tell Dynamo this data-dependent value is in the range (0, 10**9),
+        # or [0, 10**9) when empty inputs are allowed.
+        if os.environ.get(_ALLOW_EMPTY_ENV) == "1":
+            torch._check(x.size(0) >= 0)
+        else:
+            torch._check(x.size(0) > 0)
         torch._check(x.size(0) < 10**9)
     # FX cannot trace Python control flow over symbolic stride checks
     # (`x.stride(-1) == 1`). For AOT-T lowering, conservatively emit the
