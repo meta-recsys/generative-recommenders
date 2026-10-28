@@ -264,7 +264,10 @@ def _triton_concat_2D_jagged_internal(
 def _get_split_concat_2d_jagged_multirow_configs() -> List[triton.Config]:
     configs = []
     for BLOCK_N in [1, 2, 4, 8]:
-        for num_warps in [1, 2, 4]:
+        # AOT-T bakes the config autotune picks at a small trace-time shape, where
+        # low-warp configs win on launch overhead. Floor at 4 warps once BLOCK_N > 1.
+        num_warps_range = [1, 2, 4] if BLOCK_N == 1 else [4]
+        for num_warps in num_warps_range:
             configs.append(
                 triton.Config(
                     {"BLOCK_N": BLOCK_N},
