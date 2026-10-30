@@ -16,7 +16,8 @@
 
 # pyre-strict
 
-from typing import Optional, Tuple
+import logging
+from typing import Optional, Set, Tuple
 
 import torch
 from generative_recommenders.common import HammerKernel
@@ -65,6 +66,8 @@ except ImportError:
         )
 
 
+logger: logging.Logger = logging.getLogger(__name__)
+
 torch.fx.wrap("triton_jagged_dense_bmm_add")
 
 try:
@@ -76,13 +79,45 @@ except ImportError:
 
 # Optional for the same reason as TRITON_CC: nvidia-cutlass-dsl is a heavy dependency and
 # the kernel is Blackwell-only, so importing it must not be a hard requirement for every
-# consumer of this module.
+# consumer of this module. The import error is kept for the message raised when CUTEDSL is
+# requested (e.g. an nvidia-cutlass-dsl older than cutedsl_jagged needs).
+_CUTEDSL_IMPORT_ERROR: Optional[ImportError] = None
 try:
     from generative_recommenders.ops.cutedsl.cutedsl_jagged import (
         cutedsl_jagged_dense_bmm_broadcast_add,
+        cutedsl_jagged_dense_bmm_broadcast_add_supported,
     )
-except ImportError:
+except ImportError as e:
+    _CUTEDSL_IMPORT_ERROR = e
     cutedsl_jagged_dense_bmm_broadcast_add = None
+    cutedsl_jagged_dense_bmm_broadcast_add_supported = None
+
+
+_CUTEDSL_FALLBACK_WARNED: Set[str] = set()
+
+
+def _warn_cutedsl_fallback(
+    jagged: torch.Tensor, dense: torch.Tensor, bias: torch.Tensor
+) -> None:
+    """Warn that a CUTEDSL request runs on Triton, and why. Logged once per distinct
+    message, since the op runs every step."""
+    reasons = []
+    dtypes = (jagged.dtype, dense.dtype, bias.dtype)
+    if any(d != torch.bfloat16 for d in dtypes):
+        reasons.append("non-bf16 inputs (jagged={}, dense={}, bias={})".format(*dtypes))
+    k, n = jagged.shape[-1], dense.shape[-1]
+    if k % 8 or n % 8:
+        reasons.append(
+            f"feature dims not divisible by 8 (K=jagged.shape[1]={k}, "
+            f"N=dense.shape[2]={n})"
+        )
+    msg = (
+        "jagged_dense_bmm_broadcast_add: HammerKernel.CUTEDSL requested but falling "
+        "back to the Triton kernel: " + "; ".join(reasons)
+    )
+    if msg not in _CUTEDSL_FALLBACK_WARNED:
+        _CUTEDSL_FALLBACK_WARNED.add(msg)
+        logger.warning(msg)
 
 
 torch.fx.wrap("triton_concat_2D_jagged")
@@ -340,9 +375,25 @@ def jagged_dense_bmm_broadcast_add(
             elementwise=False,
         )
     elif kernel == HammerKernel.CUTEDSL:
-        if cutedsl_jagged_dense_bmm_broadcast_add is None:
+        if (
+            cutedsl_jagged_dense_bmm_broadcast_add is None
+            or cutedsl_jagged_dense_bmm_broadcast_add_supported is None
+        ):
             raise ImportError(
-                "nvidia-cutlass-dsl is required for the CUTEDSL kernel in jagged_dense_bmm_broadcast_add."
+                "The CUTEDSL kernel in jagged_dense_bmm_broadcast_add is unavailable: "
+                f"{_CUTEDSL_IMPORT_ERROR}"
+            ) from _CUTEDSL_IMPORT_ERROR
+        if not cutedsl_jagged_dense_bmm_broadcast_add_supported(jagged, dense, bias):
+            # Non-bf16 inputs or feature dims not divisible by 8, which the CuTeDSL kernels
+            # reject. Triton handles every shape and dtype.
+            _warn_cutedsl_fallback(jagged, dense, bias)
+            return triton_jagged_dense_bmm_add(
+                max_seq_len=max_seq_len,
+                seq_offsets=seq_offsets,
+                jagged=jagged,
+                dense=dense,
+                bias=bias,
+                elementwise=False,
             )
         return cutedsl_jagged_dense_bmm_broadcast_add(
             seq_offsets, jagged, dense, bias, max_seq_len
