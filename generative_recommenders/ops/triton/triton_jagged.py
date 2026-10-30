@@ -1214,6 +1214,56 @@ def triton_jagged_dense_bmm_add_bwd_dense_bias(
     )
 
 
+def triton_jagged_dense_bmm_broadcast_add_bwd_djagged(
+    max_seq_len: int,
+    seq_offsets: torch.Tensor,
+    d_out: torch.Tensor,
+    dense: torch.Tensor,
+    jagged: torch.Tensor,
+) -> torch.Tensor:
+    """Compute d_jagged = d_out @ dense[g].T for each group g.
+
+    Thin public wrapper around the private backward kernel so callers can
+    time or invoke d_jagged in isolation without running d_dense or d_bias.
+    Argument naming follows the forward convention (D = feature dim, K = output dim).
+    """
+    G, D, K_out = dense.shape
+    d_jag = torch.empty_like(jagged)
+    # Internal convention: K=feature_dim(jagged), N=output_dim(forward)
+    return triton_jagged_dense_bmm_add_bwd_jagged(
+        max_seq_len, seq_offsets, d_jag, dense, d_out, K=D, B=G, N=K_out
+    )
+
+
+def triton_jagged_dense_bmm_broadcast_add_bwd_ddense_dbias(
+    max_seq_len: int,
+    seq_offsets: torch.Tensor,
+    jagged: torch.Tensor,
+    d_out: torch.Tensor,
+    dense: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute (d_dense, d_bias) for each group g.
+
+    Thin public wrapper around the private backward kernel so callers can
+    time or invoke d_dense + d_bias in isolation without running d_jagged.
+    Returns (d_dense, d_bias) with the same shapes as the forward inputs.
+    """
+    G, D, K_out = dense.shape
+    d_den = torch.empty_like(dense)
+    return triton_jagged_dense_bmm_add_bwd_dense_bias(
+        max_seq_len,
+        seq_offsets,
+        jagged,
+        d_den,
+        B=G,
+        K=D,
+        N=K_out,
+        d_out=d_out,
+        elementwise=False,
+        use_splitk=get_use_splitk_jagged_dense_bmm_bwd(),
+    )
+
+
 class _JaggedDenseBmmAddFunction(torch.autograd.Function):
     @staticmethod
     # pyre-ignore[14]
