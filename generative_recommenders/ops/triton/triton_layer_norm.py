@@ -126,32 +126,16 @@ def _layer_norm_fwd(
     block_id = tl.program_id(0)
     start_row = block_id * BLOCK_N
 
-    X_block_ptr = tl.make_block_ptr(
-        base=X,
-        shape=(N, D),
-        strides=(stride_x, 1),
-        offsets=(start_row, 0),
-        block_shape=(BLOCK_N, BLOCK_D),
-        order=(1, 0),
-    )
-
-    Y_block_ptr = tl.make_block_ptr(
-        base=Y,
-        shape=(N, D),
-        strides=(stride_y, 1),
-        offsets=(start_row, 0),
-        block_shape=(BLOCK_N, BLOCK_D),
-        order=(1, 0),
-    )
-
-    x_block = tl.load(X_block_ptr, boundary_check=(0, 1), padding_option="zero").to(
-        tl.float32
-    )
-
     cols = tl.arange(0, BLOCK_D)
     col_mask = cols < D
     rows = start_row + tl.arange(0, BLOCK_N)
     row_mask = rows < N
+    mask_2d = row_mask[:, None] & col_mask[None, :]
+    rows_i64 = rows.to(tl.int64)
+
+    x_block = tl.load(
+        X + rows_i64[:, None] * stride_x + cols[None, :], mask=mask_2d, other=0.0
+    ).to(tl.float32)
 
     if COMPUTE_MEAN_AND_RSTD:
         mean = tl.sum(x_block, axis=1) / D
@@ -177,7 +161,11 @@ def _layer_norm_fwd(
     rstd = tl.expand_dims(rstd, 1)
     y = x_mean * rstd
 
-    tl.store(Y_block_ptr, y.to(Y.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(
+        Y + rows_i64[:, None] * stride_y + cols[None, :],
+        y.to(Y.dtype.element_ty),
+        mask=mask_2d,
+    )
 
 
 @triton_autotune(
@@ -213,31 +201,14 @@ def _weighted_layer_norm_fwd(
     w = tl.load(W + cols, mask=col_mask, other=0.0).to(tl.float32)
     b = tl.load(B + cols, mask=col_mask, other=0.0).to(tl.float32)
 
-    # Create block pointers for X and Y
-    X_block_ptr = tl.make_block_ptr(
-        base=X,
-        shape=(N, D),
-        strides=(stride_x, 1),
-        offsets=(start_row, 0),
-        block_shape=(BLOCK_N, BLOCK_D),
-        order=(1, 0),
-    )
-
-    Y_block_ptr = tl.make_block_ptr(
-        base=Y,
-        shape=(N, D),
-        strides=(stride_y, 1),
-        offsets=(start_row, 0),
-        block_shape=(BLOCK_N, BLOCK_D),
-        order=(1, 0),
-    )
-
-    x_block = tl.load(X_block_ptr, boundary_check=(0, 1), padding_option="zero").to(
-        tl.float32
-    )
-
     rows = start_row + tl.arange(0, BLOCK_N)
     row_mask = rows < N
+    mask_2d = row_mask[:, None] & col_mask[None, :]
+    rows_i64 = rows.to(tl.int64)
+
+    x_block = tl.load(
+        X + rows_i64[:, None] * stride_x + cols[None, :], mask=mask_2d, other=0.0
+    ).to(tl.float32)
 
     if COMPUTE_MEAN_AND_RSTD:
         mean = tl.sum(x_block, axis=1) / D
@@ -267,7 +238,11 @@ def _weighted_layer_norm_fwd(
     if IS_SWISH:
         y = tl.sigmoid(y) * x_block
 
-    tl.store(Y_block_ptr, y.to(Y.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(
+        Y + rows_i64[:, None] * stride_y + cols[None, :],
+        y.to(Y.dtype.element_ty),
+        mask=mask_2d,
+    )
 
 
 @triton.jit
@@ -353,44 +328,21 @@ def _weighted_layer_norm_bwd_dx(
         current_block = start_block + idx * tile_num
         start_row = current_block * BLOCK_N
 
-        X_block_ptr = tl.make_block_ptr(
-            base=X,
-            shape=(N, D),
-            strides=(stride_x, 1),
-            offsets=(start_row, 0),
-            block_shape=(BLOCK_N, BLOCK_D),
-            order=(1, 0),
-        )
-
-        DX_block_ptr = tl.make_block_ptr(
-            base=DX,
-            shape=(N, D),
-            strides=(stride_dx, 1),
-            offsets=(start_row, 0),
-            block_shape=(BLOCK_N, BLOCK_D),
-            order=(1, 0),
-        )
-
-        DY_block_ptr = tl.make_block_ptr(
-            base=DY,
-            shape=(N, D),
-            strides=(stride_dy, 1),
-            offsets=(start_row, 0),
-            block_shape=(BLOCK_N, BLOCK_D),
-            order=(1, 0),
-        )
-
-        # Load data blocks
-        x_block = tl.load(X_block_ptr, boundary_check=(0, 1), padding_option="zero").to(
-            tl.float32
-        )
-        dy_block = tl.load(
-            DY_block_ptr, boundary_check=(0, 1), padding_option="zero"
-        ).to(tl.float32)
-
-        # Load mean and rstd for all rows in this block
         rows = start_row + tl.arange(0, BLOCK_N)
         row_mask = rows < N
+        mask_2d = row_mask[:, None] & col_mask[None, :]
+        rows_i64 = rows.to(tl.int64)
+
+        # Load data blocks
+        x_block = tl.load(
+            X + rows_i64[:, None] * stride_x + cols[None, :], mask=mask_2d, other=0.0
+        ).to(tl.float32)
+        dy_block = tl.load(
+            DY + rows_i64[:, None] * stride_dy + cols[None, :], mask=mask_2d, other=0.0
+        ).to(tl.float32)
+        dx_ptrs = DX + rows_i64[:, None] * stride_dx + cols[None, :]
+
+        # Load mean and rstd for all rows in this block
         mean = tl.load(Mean + rows, row_mask, other=0.0)
         rstd = tl.load(Rstd + rows, row_mask, other=0.0)
 
@@ -424,7 +376,7 @@ def _weighted_layer_norm_bwd_dx(
 
             dx = dy_block * sigmoid_layer_norm + dx
             # Write dx
-            tl.store(DX_block_ptr, dx.to(DX.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(dx_ptrs, dx.to(DX.dtype.element_ty), mask=mask_2d)
             partial_dw = tl.sum(dy_block * x_block * xhat * sigmoid_deriv, axis=0)
             partial_db = tl.sum(dy_block * x_block * sigmoid_deriv, axis=0)
         else:
@@ -434,7 +386,7 @@ def _weighted_layer_norm_bwd_dx(
             c2 = tl.expand_dims(c2, 1)
             dx = (wdy - (xhat * c1 + c2)) * rstd
             # Write dx
-            tl.store(DX_block_ptr, dx.to(DX.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(dx_ptrs, dx.to(DX.dtype.element_ty), mask=mask_2d)
             partial_dw = tl.sum(dy_block * xhat, axis=0)
             partial_db = tl.sum(dy_block, axis=0)
 
@@ -877,31 +829,14 @@ def _weighted_rms_norm_fwd(
     col_mask = cols < D
     w = tl.load(W + cols, mask=col_mask, other=0.0).to(tl.float32)
 
-    # Create block pointers for X and Y
-    X_block_ptr = tl.make_block_ptr(
-        base=X,
-        shape=(N, D),
-        strides=(stride_x, 1),
-        offsets=(start_row, 0),
-        block_shape=(BLOCK_N, BLOCK_D),
-        order=(1, 0),
-    )
-
-    Y_block_ptr = tl.make_block_ptr(
-        base=Y,
-        shape=(N, D),
-        strides=(stride_y, 1),
-        offsets=(start_row, 0),
-        block_shape=(BLOCK_N, BLOCK_D),
-        order=(1, 0),
-    )
-
-    x_block = tl.load(X_block_ptr, boundary_check=(0, 1), padding_option="zero").to(
-        tl.float32
-    )
-
     rows = start_row + tl.arange(0, BLOCK_N)
     row_mask = rows < N
+    mask_2d = row_mask[:, None] & col_mask[None, :]
+    rows_i64 = rows.to(tl.int64)
+
+    x_block = tl.load(
+        X + rows_i64[:, None] * stride_x + cols[None, :], mask=mask_2d, other=0.0
+    ).to(tl.float32)
 
     # Compute variance (RMS norm uses x directly, not x - mean)
     x_masked = tl.where(row_mask[:, None] & col_mask[None, :], x_block, 0.0)
@@ -919,7 +854,11 @@ def _weighted_rms_norm_fwd(
         # pyre-ignore[16]: Module `triton.language.math` has no attribute `fast_dividef`
         y = fast_dividef(y, 1.0 + tl.exp(-y))
 
-    tl.store(Y_block_ptr, y.to(Y.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(
+        Y + rows_i64[:, None] * stride_y + cols[None, :],
+        y.to(Y.dtype.element_ty),
+        mask=mask_2d,
+    )
 
 
 @triton.jit
@@ -1025,44 +964,20 @@ def _weighted_rms_norm_bwd(
         current_block = start_block + idx * tile_num
         start_row = current_block * BLOCK_N
 
-        X_block_ptr = tl.make_block_ptr(
-            base=X,
-            shape=(N, D),
-            strides=(stride_x, 1),
-            offsets=(start_row, 0),
-            block_shape=(BLOCK_N, BLOCK_D),
-            order=(1, 0),
-        )
-
-        DX_block_ptr = tl.make_block_ptr(
-            base=DX,
-            shape=(N, D),
-            strides=(stride_dx, 1),
-            offsets=(start_row, 0),
-            block_shape=(BLOCK_N, BLOCK_D),
-            order=(1, 0),
-        )
-
-        DY_block_ptr = tl.make_block_ptr(
-            base=DY,
-            shape=(N, D),
-            strides=(stride_dy, 1),
-            offsets=(start_row, 0),
-            block_shape=(BLOCK_N, BLOCK_D),
-            order=(1, 0),
-        )
+        rows = start_row + tl.arange(0, BLOCK_N)
+        row_mask = rows < N
+        mask_2d = row_mask[:, None] & col_mask[None, :]
+        rows_i64 = rows.to(tl.int64)
 
         # Load data blocks
-        x_block = tl.load(X_block_ptr, boundary_check=(0, 1), padding_option="zero").to(
-            tl.float32
-        )
+        x_block = tl.load(
+            X + rows_i64[:, None] * stride_x + cols[None, :], mask=mask_2d, other=0.0
+        ).to(tl.float32)
         dy_block = tl.load(
-            DY_block_ptr, boundary_check=(0, 1), padding_option="zero"
+            DY + rows_i64[:, None] * stride_dy + cols[None, :], mask=mask_2d, other=0.0
         ).to(tl.float32)
 
         # Load rstd for all rows in this block
-        rows = start_row + tl.arange(0, BLOCK_N)
-        row_mask = rows < N
         rstd = tl.load(Rstd + rows, row_mask, other=0.0)
 
         # Expand dimensions for broadcasting
@@ -1086,7 +1001,11 @@ def _weighted_rms_norm_bwd(
         dx = (wdy - (xhat * c1)) * rstd
 
         # Write dx
-        tl.store(DX_block_ptr, dx.to(DX.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(
+            DX + rows_i64[:, None] * stride_dx + cols[None, :],
+            dx.to(DX.dtype.element_ty),
+            mask=mask_2d,
+        )
 
         # Accumulate partial sums for dw
         # Compute dw for all rows, then sum locally before storing per pid
