@@ -17,7 +17,7 @@
 # pyre-strict
 
 import os
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -168,9 +168,12 @@ def pytorch_concat_2D_jagged_jagged(
     values_right: torch.Tensor,
     is_replace: bool = False,
     n_prefix_from_right: int = 0,
+    output_size: Optional[int] = None,
 ) -> torch.Tensor:
     # is_replace with n_prefix_from_right != 0 is not supported yet (neither in triton)
     if is_replace:
+        if output_size is not None:
+            raise ValueError("output_size is not supported with is_replace=True")
         return pytorch_replace_last_n_with_jagged(
             max_seq_len_left,
             offsets_left,
@@ -188,12 +191,16 @@ def pytorch_concat_2D_jagged_jagged(
         torch.cumsum(output_lengths, dim=0), (1, 0)
     )
 
-    total_len = values_left.shape[0] + values_right.shape[0]
+    total_len = (
+        values_left.shape[0] + values_right.shape[0]
+        if output_size is None
+        else output_size
+    )
     positions = _arange(total_len, device=values_left.device)
     batch_idx = torch.searchsorted(output_offsets[1:], positions, right=True)
     local_pos = positions - output_offsets[batch_idx]
 
-    per_batch_lengths_a = lengths_a[batch_idx]
+    per_batch_lengths_a = torch.nn.functional.pad(lengths_a, (0, 1))[batch_idx]
 
     # Classify each output position into prefix / left / suffix.
     is_prefix = local_pos < n_prefix_from_right
@@ -224,7 +231,12 @@ def pytorch_concat_2D_jagged_jagged(
     left_values = maybe_sorted_index_select(values_left_safe, left_idx, use_sorted)
     right_values = maybe_sorted_index_select(values_right_safe, right_idx, use_sorted)
 
-    return torch.where(is_left.unsqueeze(-1), left_values, right_values)
+    result = torch.where(is_left.unsqueeze(-1), left_values, right_values)
+    if output_size is None:
+        return result
+    return torch.where(
+        (positions < output_offsets[-1]).unsqueeze(-1), result, torch.zeros_like(result)
+    )
 
 
 def pytorch_jagged_remove_first_or_last_1D(
