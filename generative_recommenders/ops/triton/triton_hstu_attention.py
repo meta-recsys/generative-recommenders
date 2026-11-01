@@ -2602,46 +2602,47 @@ def _hstu_attn_bwd(  # noqa C901
     device_desc_dk = None
     device_desc_dv = None
     if ENABLE_TMA:
+        # Fused UVQK views have packed heads but gaps between sequence rows.
         device_desc_q = tl.make_tensor_descriptor(
             Q,
             shape=[seq_len, H * DimQ],
             # pyrefly: ignore [bad-argument-type]
-            strides=[H * DimQ, 1],
+            strides=[stride_qm, 1],
             block_shape=[BLOCK_M, BLOCK_D_Q],
         )
         device_desc_do = tl.make_tensor_descriptor(
             DOut,
             shape=[seq_len, H * DimV],
             # pyrefly: ignore [bad-argument-type]
-            strides=[H * DimV, 1],
+            strides=[stride_dom, 1],
             block_shape=[BLOCK_M, BLOCK_D_V],
         )
         device_desc_k = tl.make_tensor_descriptor(
             K,
             shape=[seq_len, H * DimQ],
             # pyrefly: ignore [bad-argument-type]
-            strides=[H * DimQ, 1],
+            strides=[stride_kn, 1],
             block_shape=[BLOCK_N, BLOCK_D_Q],
         )
         device_desc_dk = tl.make_tensor_descriptor(
             DK,
             shape=[seq_len, H * DimQ],
             # pyrefly: ignore [bad-argument-type]
-            strides=[H * DimQ, 1],
+            strides=[stride_dkn, 1],
             block_shape=[BLOCK_N, BLOCK_D_Q],
         )
         device_desc_v = tl.make_tensor_descriptor(
             V,
             shape=[seq_len, H * DimV],
             # pyrefly: ignore [bad-argument-type]
-            strides=[H * DimV, 1],
+            strides=[stride_vn, 1],
             block_shape=[BLOCK_N, BLOCK_D_V],
         )
         device_desc_dv = tl.make_tensor_descriptor(
             DV,
             shape=[seq_len, H * DimV],
             # pyrefly: ignore [bad-argument-type]
-            strides=[H * DimV, 1],
+            strides=[stride_dvn, 1],
             block_shape=[BLOCK_N, BLOCK_D_V],
         )
     else:
@@ -2798,22 +2799,23 @@ def triton_hstu_attention_fwd(
 
     if enable_tma and tensor_descriptor_tma:
         dummy_block = [1, 1]
+        # Keep the actual row pitch for views into the fused UVQK projection.
         desc_q = TensorDescriptor(
             q,
             shape=[L, H * DimQ],
-            strides=[H * DimQ, 1],
+            strides=[q.stride(0), 1],
             block_shape=dummy_block,
         )
         desc_v = TensorDescriptor(
             v,
             shape=[L, H * DimV],
-            strides=[H * DimV, 1],
+            strides=[v.stride(0), 1],
             block_shape=dummy_block,
         )
         desc_k = TensorDescriptor(
             k,
             shape=[L, H * DimQ],
-            strides=[H * DimQ, 1],
+            strides=[k.stride(0), 1],
             block_shape=dummy_block,
         )
 
