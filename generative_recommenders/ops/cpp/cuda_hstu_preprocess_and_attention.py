@@ -23,6 +23,9 @@ from generative_recommenders.ops.triton.triton_addmm import (
     maybe_triton_addmm_fwd,
     triton_addmm_bwd,
 )
+from generative_recommenders.ops.triton.triton_hstu_preprocess_bwd import (
+    copy_u_grad_and_column_sum,
+)
 from generative_recommenders.ops.triton.triton_layer_norm import (
     compute_BLOCK_D,
     triton_weighted_layer_norm_bwd,
@@ -92,6 +95,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         skip_u: bool = False,
         use_bf16_dq_accum: bool = False,
         use_rms_norm: bool = False,
+        fuse_u_grad_and_bias_grad: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         max_attn_len = max_attn_len or 0
         full_attn_size = full_attn_size or 0
@@ -357,6 +361,14 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         ctx.num_softmax_heads = num_softmax_heads
         ctx.use_bf16_dq_accum = use_bf16_dq_accum
         ctx.use_rms_norm = use_rms_norm
+        ctx.fuse_u_grad_and_bias_grad = (
+            fuse_u_grad_and_bias_grad
+            and not skip_u
+            and not silu_u
+            and uvqk_bias is not None
+            and uvqk_bias.dim() == 1
+            and x.is_cuda
+        )
         # pyrefly: ignore [bad-return]
         return u, out
 
@@ -737,19 +749,30 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         copy_if_different_ptr(dq, _dq)
         copy_if_different_ptr(dk, _dk)
         copy_if_different_ptr(dv, _dv)
-        if not ctx.skip_u:
+        fuse_u_and_bias_grad = (
+            ctx.fuse_u_grad_and_bias_grad
+            and _du is not None
+            and _du.stride(-1) == 1
+            and _du.dtype == duvqk.dtype
+        )
+        if not ctx.skip_u and not fuse_u_and_bias_grad:
             if ctx.silu_u:
                 # pyre-ignore[61]: `du` is always defined in the else branch above
                 torch.ops.aten.silu_backward(_du, u, grad_input=du)
             else:
                 # pyre-ignore[61]: `du` is always defined in the else branch above
                 copy_if_different_ptr(du, _du)
-        d_normed_x, d_uvqk_weight, d_uvqk_bias = triton_addmm_bwd(
-            x=normed_x,
-            w=uvqk_weight,
-            dz=duvqk,
-            is_y_1d=ctx.uvqk_bias_1d and ctx.has_uvqk_bias,
-        )
+        if fuse_u_and_bias_grad:
+            d_uvqk_bias = copy_u_grad_and_column_sum(_du, duvqk)
+            d_uvqk_weight = torch.mm(normed_x.t(), duvqk)
+            d_normed_x = torch.mm(duvqk, uvqk_weight.t())
+        else:
+            d_normed_x, d_uvqk_weight, d_uvqk_bias = triton_addmm_bwd(
+                x=normed_x,
+                w=uvqk_weight,
+                dz=duvqk,
+                is_y_1d=ctx.uvqk_bias_1d and ctx.has_uvqk_bias,
+            )
         if ctx.use_rms_norm:
             # RMSNorm has no bias, so d_norm_bias is None. norm_bias is a
             # non-persistent zero buffer with requires_grad=False on this path.
@@ -804,4 +827,5 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             None,  # skip_u
             None,  # use_bf16_dq_accum
             None,  # use_rms_norm
+            None,
         )
