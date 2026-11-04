@@ -1903,6 +1903,7 @@ class _HelionConcat2DJaggedFunction(torch.autograd.Function):
             dense_size=0,
             total_len_a=ctx.seq_len_a,
             total_len_b=ctx.seq_len_b,
+            skip_left=False,
         )
 
         return None, values_a, values_b, None, None, None, None
@@ -2228,6 +2229,7 @@ def helion_split_2D_jagged(
     offsets_a: Optional[torch.Tensor] = None,
     offsets_b: Optional[torch.Tensor] = None,
     dense_size: int = 0,
+    skip_left: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     return _HelionSplit2DJaggedFunction.apply(
         values,
@@ -2235,6 +2237,7 @@ def helion_split_2D_jagged(
         offsets_a,
         offsets_b,
         dense_size,
+        skip_left,
     )
 
 
@@ -2641,6 +2644,7 @@ def _helion_split_2d_jagged_kernel(
     D: tl.constexpr,
     _BLOCK_SIZE_0: tl.constexpr,
     _BLOCK_SIZE_1: tl.constexpr,
+    SKIP_LEFT: tl.constexpr = False,  # pyrefly: ignore [bad-function-definition]
 ) -> None:
     # Get program ID and decompose to batch and sequence block coordinates
     program_id = tl.program_id(0)
@@ -2685,7 +2689,10 @@ def _helion_split_2d_jagged_kernel(
             -1 + _BLOCK_SIZE_0 + max_seq_len, _BLOCK_SIZE_0
         ),
     )
-    has_work = total_len > seq_offset
+    if SKIP_LEFT:
+        has_work = (seq_offset < total_len) & (seq_offset + _BLOCK_SIZE_0 > len_a)
+    else:
+        has_work = total_len > seq_offset
     if has_work:
         # Generate row indices for this sequence block
         seq_range = tl.arange(0, _BLOCK_SIZE_0)
@@ -2726,20 +2733,25 @@ def _helion_split_2d_jagged_kernel(
             input_row = input_start_i64 + row_subscript
             input_ptrs = values_flat + input_row * D_i64 + feature_indices[None, :]
 
-            # Compute pointers for part A
-            out_a_row = out_a_start_i64 + row_subscript
-            out_a_ptrs = out_a_flat + out_a_row * D_i64 + feature_indices[None, :]
+            # Parts A and B are masked separately, so SKIP_LEFT elides the left
+            # read too; out_a_flat is 0-row and never dereferenced.
+            if not SKIP_LEFT:
+                # Compute pointers for part A
+                out_a_row = out_a_start_i64 + row_subscript
+                out_a_ptrs = out_a_flat + out_a_row * D_i64 + feature_indices[None, :]
 
-            mask_a = is_part_a[:, None] & valid_mask[:, None] & feature_mask[None, :]
+                mask_a = (
+                    is_part_a[:, None] & valid_mask[:, None] & feature_mask[None, :]
+                )
 
-            # Load and store part A data
-            slice_a = tl.load(
-                input_ptrs,
-                mask_a,
-                other=0,
-                eviction_policy="evict_first",
-            )
-            tl.store(out_a_ptrs, slice_a, mask_a)
+                # Load and store part A data
+                slice_a = tl.load(
+                    input_ptrs,
+                    mask_a,
+                    other=0,
+                    eviction_policy="evict_first",
+                )
+                tl.store(out_a_ptrs, slice_a, mask_a)
 
             # Compute pointers for part B
             row_minus_len_a = row_subscript - tl.cast(len_a_i32, tl.int64)
@@ -2768,8 +2780,14 @@ class _HelionSplit2DJaggedFunction(torch.autograd.Function):
         offsets_a: torch.Tensor,
         offsets_b: torch.Tensor,
         dense_size: int = 0,  # noqa: F841
+        skip_left: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         values = switch_to_contiguous_if_needed(values)
+        assert not (skip_left and (offsets_a is None or dense_size != 0)), (
+            "skip_left needs a jagged left side, got "
+            f"offsets_a={'None' if offsets_a is None else 'tensor'} "
+            f"dense_size={dense_size}"
+        )
         B = offsets_a.shape[0] - 1
         D = values.size(1)
 
@@ -2785,6 +2803,7 @@ class _HelionSplit2DJaggedFunction(torch.autograd.Function):
             dense_size=dense_size,
             total_len_a=seq_len_a,
             total_len_b=seq_len_b,
+            skip_left=skip_left,
         )
 
         ctx.save_for_backward(offsets_a, offsets_b)
@@ -2792,23 +2811,43 @@ class _HelionSplit2DJaggedFunction(torch.autograd.Function):
         ctx.seq_len_a = seq_len_a
         ctx.seq_len_b = seq_len_b
         ctx.dense_size = dense_size
+        ctx.skip_left = skip_left
         ctx.B = B
         ctx.D = D
         return values_a, values_b
 
     @staticmethod
-    def backward(ctx, *d_values) -> Tuple[torch.Tensor, None, None, None, None]:
+    def backward(ctx, *d_values) -> Tuple[torch.Tensor, None, None, None, None, None]:
         offsets_a, offsets_b = ctx.saved_tensors
-        values_a, values_b = d_values
+        # The concat kernels index rows by stride(-2), so a non-contiguous grad
+        # silently reads the wrong memory (`.sum()` hands back a stride-0 view).
+        values_a = switch_to_contiguous_if_needed(d_values[0])
+        values_b = switch_to_contiguous_if_needed(d_values[1])
         BLOCK_D = triton.next_power_of_2(ctx.D)
+        skip_left = ctx.skip_left
+        # Read the global once: it is mutable at runtime, and two disagreeing
+        # reads would drop the zero buffer while telling the kernel to expect one.
+        use_multirow = _should_use_multirow()
 
+        # Every concat path writes all of dvalues (multirow zero-fills the left
+        # under SKIP_LEFT; the fallback gets a real zero buffer), so empty is safe.
         dvalues = torch.empty(
             (ctx.seq_len_a + ctx.seq_len_b, ctx.D),
-            device=values_a.device,
-            dtype=values_a.dtype,
+            device=values_b.device,
+            dtype=values_b.dtype,
         )
+        if skip_left and not use_multirow:
+            # The fallback concat really loads the left region; hand it real zeros.
+            concat_values_a = torch.zeros(
+                (ctx.seq_len_a, ctx.D),
+                device=values_b.device,
+                dtype=values_b.dtype,
+            )
+        else:
+            concat_values_a = values_a
+
         _triton_concat_2D_jagged_internal(
-            values_a=values_a,
+            values_a=concat_values_a,
             values_b=values_b,
             values_out=dvalues,
             max_seq_len=ctx.max_seq_len,
@@ -2823,8 +2862,9 @@ class _HelionSplit2DJaggedFunction(torch.autograd.Function):
             is_dense_b=False,
             is_replace=False,
             BLOCK_D=BLOCK_D,
+            skip_left=skip_left and use_multirow,
         )
-        return dvalues, None, None, None, None
+        return dvalues, None, None, None, None, None
 
 
 def _helion_split_2D_jagged_impl(
@@ -2835,6 +2875,7 @@ def _helion_split_2D_jagged_impl(
     dense_size: int = 0,  # noqa: F841
     total_len_a: Optional[int] = None,
     total_len_b: Optional[int] = None,
+    skip_left: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     D = values.size(1)
 
@@ -2864,6 +2905,7 @@ def _helion_split_2D_jagged_impl(
         num_stages=num_stages,
         total_len_a=total_len_a,
         total_len_b=total_len_b,
+        skip_left=skip_left,
     )
 
 
@@ -2879,6 +2921,7 @@ def _helion_split_2d_jagged(
     num_stages: int = 4,
     total_len_a: Optional[int] = None,
     total_len_b: Optional[int] = None,
+    skip_left: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     values = values.contiguous()
     num_batches = offsets_a.size(0) - 1
@@ -2888,7 +2931,9 @@ def _helion_split_2d_jagged(
         total_len_a = int(offsets_a[-1].item())
     if total_len_b is None:
         total_len_b = int(offsets_b[-1].item())
-    out_a = torch.empty([total_len_a, D], dtype=values.dtype, device=values.device)
+    out_a = torch.empty(
+        [0 if skip_left else total_len_a, D], dtype=values.dtype, device=values.device
+    )
     out_b = torch.empty([total_len_b, D], dtype=values.dtype, device=values.device)
     values_flat = values.view(-1)
     out_a_flat = out_a.view(-1)
@@ -2909,6 +2954,8 @@ def _helion_split_2d_jagged(
         block_size_0,
         # pyrefly: ignore [bad-argument-type]
         block_size_1,
+        # pyrefly: ignore [bad-argument-type]
+        SKIP_LEFT=skip_left,
         # pyrefly: ignore [unexpected-keyword]
         num_warps=num_warps,
         # pyrefly: ignore [unexpected-keyword]
