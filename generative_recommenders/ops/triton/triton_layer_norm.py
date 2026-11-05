@@ -27,6 +27,7 @@ import triton
 # @manual=//triton:triton
 import triton.language as tl
 from generative_recommenders.common import (
+    prev_power_of_2,
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
@@ -310,7 +311,10 @@ def _layer_norm_bwd_dx(
 
 @triton_autotune(
     configs=_get_layer_norm_fwd_configs(),
-    key=["BLOCK_D"],
+    # The same kernel runs on very different row counts (e.g. ~8K target rows and ~1.5M UIH
+    # rows at D=256). Keyed on BLOCK_D alone, whichever N a process tunes first fixes the
+    # config for all N, so ranks end up with different, sometimes 2x slower, configs.
+    key=["BLOCK_D", "AUTOTUNE_N"],
 )
 @triton.jit
 def _weighted_layer_norm_bwd_dx(
@@ -332,6 +336,7 @@ def _weighted_layer_norm_bwd_dx(
     N,
     BLOCK_D: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    AUTOTUNE_N=0,
 ):
     pid = tl.program_id(0)
     tile_num = tl.num_programs(0)
@@ -649,6 +654,7 @@ def _triton_weighted_layer_norm_bwd_impl(
             eps,
             IS_SWISH=False,
             N=N,
+            AUTOTUNE_N=prev_power_of_2(N),
             BLOCK_D=BLOCK_D,
         )
 
@@ -1427,6 +1433,7 @@ def triton_swish_layer_norm_bwd(
         eps,
         IS_SWISH=True,
         N=N,
+        AUTOTUNE_N=prev_power_of_2(N),
         BLOCK_D=triton.next_power_of_2(D),
     )
 
@@ -1558,6 +1565,7 @@ class SwishLayerNormFunction(torch.autograd.Function):
             ctx.eps,
             IS_SWISH=True,
             N=N,
+            AUTOTUNE_N=prev_power_of_2(N),
             BLOCK_D=ctx.BLOCK_D,
         )
 
