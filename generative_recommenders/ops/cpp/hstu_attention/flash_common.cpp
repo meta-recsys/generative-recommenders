@@ -622,9 +622,6 @@ std::tuple<at::Tensor, std::optional<at::Tensor>> hstu_mha_fwd(
                            .sub(seq_offsets_.slice(0, 0, -1))
                            .sub(num_targets_);
     TORCH_CHECK(
-        (uih_lengths.gt(0)).sum().item<int64_t>() == num_targets_.size(0),
-        "some uih seqlen is 0");
-    TORCH_CHECK(
         (uih_lengths.greater_equal(contextual_seq_len)).sum().item<int64_t>() ==
             num_targets_.size(0),
         "some uih seqlen is less than contextual_seq_len");

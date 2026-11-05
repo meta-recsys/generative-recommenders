@@ -632,6 +632,7 @@ struct CollectiveMainloopFwdSm90 {
       int min_full_attn_seq_len,
       int contextual_seq_len,
       int uihlen,
+      int seqlen,
       int m_block) {
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
@@ -643,6 +644,15 @@ struct CollectiveMainloopFwdSm90 {
     if constexpr (Has_targets) {
       int m_idx_max = (m_block + 1) * kBlockM;
       if (m_idx_max > uihlen) {
+        if (uihlen == 0) {
+          // No history: the history range would be empty, and the block handled
+          // before the loop, n_block_max - 1, would be block -1: the previous
+          // example's last keys. Return the last target block instead;
+          // get_target_n_block_min_max leaves it out of the target range.
+          int const n_block =
+              cute::ceil_div(std::min(m_idx_max, seqlen), kBlockN) - 1;
+          return {n_block, n_block + 1};
+        }
         return {0, cute::ceil_div(uihlen, kBlockN)};
       }
     }
@@ -690,9 +700,14 @@ struct CollectiveMainloopFwdSm90 {
       return {n_block_max, n_block_max};
     } else { // Target part
       int m_idx_min = m_block * kBlockM;
-      return {
-          std::max(n_block_max, m_idx_min / kBlockN),
-          cute::ceil_div(std::min(m_idx_max, seqlen), kBlockN)};
+      int target_n_block_max =
+          cute::ceil_div(std::min(m_idx_max, seqlen), kBlockN);
+      if (uihlen == 0) {
+        // No history: get_n_block_min_max returns the last target block, which
+        // is handled before the loop, so the target range stops before it.
+        return {m_idx_min / kBlockN, target_n_block_max - 1};
+      }
+      return {std::max(n_block_max, m_idx_min / kBlockN), target_n_block_max};
     }
   }
 
@@ -791,18 +806,18 @@ struct CollectiveMainloopFwdSm90 {
           min_full_attn_seq_len_,
           contextual_seq_len_,
           seqlen_info.uihlen_q,
+          seqlen_info.seqlen_kv,
           m_block);
       n_block_min = get<0>(n_block_min_max);
       n_block_max = get<1>(n_block_min_max);
     }
-#ifdef HSTU_FLASH_ATTN_DEBUG_INFO
+    // Empty key range (cross attention: an example without keys, or with
+    // causal, a tile of queries that all come before the first key). Load
+    // nothing; the consumer writes zero output for this tile.
     if (n_block_max <= n_block_min) {
-      std::printf(
-          "mainloop_fwd_sm90: n_block_max <= n_block_min not expected.");
       scheduler_prefetch();
       return;
     }
-#endif
 
     Tensor sQ = make_tensor(
         make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()),
@@ -1264,18 +1279,15 @@ struct CollectiveMainloopFwdSm90 {
           min_full_attn_seq_len_,
           contextual_seq_len_,
           seqlen_info.uihlen_q,
+          seqlen_info.seqlen_kv,
           m_block);
       n_block_min = get<0>(n_block_min_max);
       n_block_max = get<1>(n_block_min_max);
     }
 
-#ifdef HSTU_FLASH_ATTN_DEBUG_INFO
     if (n_block_max <= n_block_min) {
-      std::printf(
-          "mainloop_fwd_sm90: n_block_max <= n_block_min not expected.");
       return false;
     }
-#endif
 
     Tensor sQ = make_tensor(
         make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()),
@@ -1758,18 +1770,15 @@ struct CollectiveMainloopFwdSm90 {
           min_full_attn_seq_len_,
           contextual_seq_len_,
           seqlen_info.uihlen_q,
+          seqlen_info.seqlen_kv,
           m_block);
       n_block_min = get<0>(n_block_min_max);
       n_block_max = get<1>(n_block_min_max);
     }
 
-#ifdef HSTU_FLASH_ATTN_DEBUG_INFO
     if (n_block_max <= n_block_min) {
-      std::printf(
-          "mainloop_fwd_sm90: n_block_max <= n_block_min not expected.");
       return false;
     }
-#endif
 
     Tensor sQ = make_tensor(
         make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()),

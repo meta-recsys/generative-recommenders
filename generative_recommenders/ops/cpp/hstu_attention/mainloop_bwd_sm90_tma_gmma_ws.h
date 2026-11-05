@@ -876,6 +876,14 @@ struct CollectiveMainloopBwdSm90 {
     int const full_m_block_max = get<1>(full_m_block_min_max);
     int contexual_m_block_max = get_contexual_m_block_max(
         seqlen_info.uihlen_q, contextual_seq_len_, m_block_min, n_block);
+    // Cross attention, keys of an example without queries: there is no tile of
+    // queries to go through. Load nothing; the consumer writes zero dK and dV.
+    if constexpr (Cross) {
+      if (m_block_max <= m_block_min) {
+        scheduler_prefetch();
+        return;
+      }
+    }
 
     Tensor sQ = make_tensor(
         make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()),
@@ -1434,6 +1442,11 @@ struct CollectiveMainloopBwdSm90 {
     int const full_m_block_max = get<1>(full_m_block_min_max);
     int contexual_m_block_max = get_contexual_m_block_max(
         seqlen_info.uihlen_q, contextual_seq_len_, m_block_min, n_block);
+    if constexpr (Cross) {
+      if (m_block_max <= m_block_min) {
+        return false;
+      }
+    }
 
     Tensor sQ = make_tensor(
         make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()),
@@ -2324,6 +2337,11 @@ struct CollectiveMainloopBwdSm90 {
     int const full_m_block_max = get<1>(full_m_block_min_max);
     int contexual_m_block_max = get_contexual_m_block_max(
         seqlen_info.uihlen_q, contextual_seq_len_, m_block_min, n_block);
+    if constexpr (Cross) {
+      if (m_block_max <= m_block_min) {
+        return false;
+      }
+    }
 
     Tensor sQ = make_tensor(
         make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()),
