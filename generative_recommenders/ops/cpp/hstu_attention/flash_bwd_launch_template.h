@@ -128,8 +128,8 @@ void run_flash_bwd(hstu::Flash_bwd_params& params, cudaStream_t stream) {
       static_cast<float*>(params.softmax_lse),
       {_1{},
        seqlen_q,
-       !Jagged ? params.num_softmax_heads * params.max_q_len_rounded
-               : 0}, // stride_LSE
+       // The forward writes the dense LSE as [b, h, max_q_len], unpadded.
+       !Jagged ? params.num_softmax_heads * seqlen_q : 0}, // stride_LSE
       static_cast<float*>(params.softmax_lse_log2),
       {_1{},
        seqlen_q_rounded,
