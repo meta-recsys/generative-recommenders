@@ -32,7 +32,11 @@ from generative_recommenders.ops.triton.triton_layer_norm import (
     triton_weighted_rms_norm_bwd,
     triton_weighted_rms_norm_fwd,
 )
-from generative_recommenders.ops.utils import copy_if_different_ptr, is_sm100_plus
+from generative_recommenders.ops.utils import (
+    copy_if_different_ptr,
+    is_sm100_plus,
+    maybe_register_custom_op,
+)
 from torch.nn import functional as F
 
 try:
@@ -58,6 +62,198 @@ try:
     )
 except Exception as ex:
     print(f"Library importing error when importing library: {ex}")
+
+
+def _fill_duvqk_impl(
+    duvqk: torch.Tensor,
+    _du: Optional[torch.Tensor],
+    u: Optional[torch.Tensor],
+    dout: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_out: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    num_targets: Optional[torch.Tensor],
+    attn_scale: Optional[torch.Tensor],
+    softmax_lse: Optional[torch.Tensor],
+    q_cos_weights: Optional[torch.Tensor],
+    q_sin_weights: Optional[torch.Tensor],
+    k_cos_weights: Optional[torch.Tensor],
+    k_sin_weights: Optional[torch.Tensor],
+    max_seq_len: int,
+    alpha: float,
+    max_attn_len: int,
+    full_attn_size: int,
+    contextual_seq_len: int,
+    sort_by_length: bool,
+    num_softmax_heads: int,
+    use_bf16_dq_accum: bool,
+    has_rotary_weights: bool,
+    skip_u: bool,
+    silu_u: bool,
+    num_heads: int,
+    attn_dim: int,
+    hidden_dim: int,
+) -> None:
+    """Writes du (if _du is given), dv, dq and dk into their column slices of
+    duvqk. Eager calls it directly; under torch.compile it runs as the custom op
+    _fill_duvqk. No argument may be named `out`: Inductor would treat the call
+    as an out= mutation and stop merging common subexpressions across it."""
+    if skip_u:
+        dv, dq, dk = duvqk.split(
+            [
+                hidden_dim * num_heads,
+                attn_dim * num_heads,
+                attn_dim * num_heads,
+            ],
+            dim=1,
+        )
+    else:
+        du, dv, dq, dk = duvqk.split(
+            [
+                hidden_dim * num_heads,
+                hidden_dim * num_heads,
+                attn_dim * num_heads,
+                attn_dim * num_heads,
+            ],
+            dim=1,
+        )
+    dq = dq.view(-1, num_heads, attn_dim)
+    dk = dk.view(-1, num_heads, attn_dim)
+    dv = dv.view(-1, num_heads, hidden_dim)
+    # Note: the two operations below update duvqk in place
+    if is_sm100_plus():
+        _dq, _dk, _dv = torch.ops.bw_hstu.bw_hstu_mha_bwd(
+            max_seq_len,
+            alpha,
+            dout,
+            q,
+            k,
+            v,
+            dq,
+            dk,
+            dv,
+            seq_offsets,
+            True,  # causal
+            num_targets,
+            attn_scale,
+            max_attn_len,
+            full_attn_size,
+            contextual_seq_len,
+            sort_by_length,
+            False,  # deterministic
+            0,  # sm_margin
+            max_seq_len,  # max_q_len,
+            None,  # seq_offsets_q,
+            None,  # max_seq_len_tensor,
+            None,  # contextual_seq_len_tensor,
+            None,  # max_attn_len_tensor,
+            None,  # min_full_attn_seq_len_tensor,
+            1,  # num_groups
+            num_softmax_heads,  # num_softmax_heads
+            attn_out,  # out
+            softmax_lse,  # lse
+        )
+    else:
+        _dq, _dk, _dv = torch.ops.hstu.hstu_mha_bwd(
+            max_seq_len,
+            alpha,
+            dout,
+            q,
+            k,
+            v,
+            dq,
+            dk,
+            dv,
+            attn_out,
+            seq_offsets,
+            True,  # causal
+            num_targets,
+            attn_scale,
+            max_attn_len,
+            full_attn_size,
+            contextual_seq_len,
+            sort_by_length,
+            False,  # deterministic
+            0,  # sm_margin
+            0,  # max_q_len,
+            None,  # seq_offsets_q,
+            num_softmax_heads,  # num_softmax_heads,
+            softmax_lse,
+            use_bf16_dq_accum=use_bf16_dq_accum,
+        )
+    if has_rotary_weights:
+        _dq = triton_apply_rope_bwd(
+            grad=_dq,
+            N=max_seq_len,
+            seq_offsets=seq_offsets,
+            # pyrefly: ignore [bad-argument-type]
+            cos_rope=q_cos_weights,
+            # pyrefly: ignore [bad-argument-type]
+            sin_rope=q_sin_weights,
+        )
+        _dk = triton_apply_rope_bwd(
+            grad=_dk,
+            N=max_seq_len,
+            seq_offsets=seq_offsets,
+            # pyrefly: ignore [bad-argument-type]
+            cos_rope=k_cos_weights,
+            # pyrefly: ignore [bad-argument-type]
+            sin_rope=k_sin_weights,
+        )
+    copy_if_different_ptr(dq, _dq)
+    copy_if_different_ptr(dk, _dk)
+    copy_if_different_ptr(dv, _dv)
+    if _du is not None:
+        if silu_u:
+            # pyre-ignore[61]: `du` is always defined in the else branch above
+            torch.ops.aten.silu_backward(_du, u, grad_input=du)
+        else:
+            # pyre-ignore[61]: `du` is always defined in the else branch above
+            copy_if_different_ptr(du, _du)
+
+
+_fill_duvqk = maybe_register_custom_op(
+    "generative_recommenders::cuda_hstu_preprocess_and_attention_fill_duvqk",
+    mutates_args=("duvqk",),
+)(_fill_duvqk_impl)
+
+
+@maybe_register_custom_op(
+    "generative_recommenders::cuda_hstu_preprocess_and_attention_recompute_uvqk",
+    mutates_args=(),
+)
+def _recompute_uvqk(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    y: Optional[torch.Tensor],
+) -> torch.Tensor:
+    return maybe_triton_addmm_fwd(x, w, y)
+
+
+@_recompute_uvqk.register_fake
+def _recompute_uvqk_fake(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    y: Optional[torch.Tensor],
+) -> torch.Tensor:
+    return torch.empty((x.size(0), w.size(1)), device=x.device, dtype=x.dtype)
+
+
+def _uvqk_for_backward(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    y: Optional[torch.Tensor],
+    optimize_compiled_backward: bool,
+) -> torch.Tensor:
+    """Under torch.compile with optimize_compiled_backward, the recompute goes
+    through a separately named op so Inductor cannot merge it into the identical
+    forward GEMM; merged, uvqk is saved for backward instead of recomputed and
+    costs activation memory."""
+    if torch.compiler.is_compiling() and optimize_compiled_backward:
+        return _recompute_uvqk(x, w, y)
+    return maybe_triton_addmm_fwd(x, w, y)
 
 
 class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
@@ -96,6 +292,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         use_bf16_dq_accum: bool = False,
         use_rms_norm: bool = False,
         fuse_u_grad_and_bias_grad: bool = False,
+        optimize_compiled_backward: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         max_attn_len = max_attn_len or 0
         full_attn_size = full_attn_size or 0
@@ -369,6 +566,7 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             and uvqk_bias.dim() == 1
             and x.is_cuda
         )
+        ctx.optimize_compiled_backward = optimize_compiled_backward
         # pyrefly: ignore [bad-return]
         return u, out
 
@@ -407,6 +605,8 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
         None,  # skip_u
         None,  # use_bf16_dq_accum
         None,  # use_rms_norm
+        None,  # fuse_u_grad_and_bias_grad
+        None,  # optimize_compiled_backward
     ]:
         saved_tensors = ctx.saved_tensors
         x, norm_weight, norm_bias, x_mean, x_rstd, uvqk_weight, seq_offsets, out = (
@@ -473,8 +673,11 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                     )
                     idx += 2
                 else:
-                    vqk = maybe_triton_addmm_fwd(
-                        normed_x, uvqk_weight, uvqk_bias
+                    vqk = _uvqk_for_backward(
+                        normed_x,
+                        uvqk_weight,
+                        uvqk_bias,
+                        ctx.optimize_compiled_backward,
                     ).contiguous()
             else:
                 vqk = ctx.saved_tensors[idx]
@@ -532,8 +735,11 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                     )
                     idx += 2
                 else:
-                    vqk = maybe_triton_addmm_fwd(
-                        normed_x, vqk_weight, vqk_bias
+                    vqk = _uvqk_for_backward(
+                        normed_x,
+                        vqk_weight,
+                        vqk_bias,
+                        ctx.optimize_compiled_backward,
                     ).contiguous()
                 # Split vqk into v, q, k components
                 v, q, k = vqk.split(
@@ -561,8 +767,11 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                     )
                     idx += 2
                 else:
-                    uvqk = maybe_triton_addmm_fwd(
-                        normed_x, uvqk_weight, uvqk_bias
+                    uvqk = _uvqk_for_backward(
+                        normed_x,
+                        uvqk_weight,
+                        uvqk_bias,
+                        ctx.optimize_compiled_backward,
                     ).contiguous()
                 # Split uvqk into u, v, q, k components
                 u, v, q, k = uvqk.split(
@@ -609,14 +818,6 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 device=x.device,
                 dtype=x.dtype,
             )
-            dv, dq, dk = duvqk.split(
-                [
-                    ctx.hidden_dim * ctx.num_heads,
-                    ctx.attn_dim * ctx.num_heads,
-                    ctx.attn_dim * ctx.num_heads,
-                ],
-                dim=1,
-            )
         else:
             duvqk = torch.empty(
                 [
@@ -627,21 +828,9 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 device=x.device,
                 dtype=x.dtype,
             )
-            du, dv, dq, dk = duvqk.split(
-                [
-                    ctx.hidden_dim * ctx.num_heads,
-                    ctx.hidden_dim * ctx.num_heads,
-                    ctx.attn_dim * ctx.num_heads,
-                    ctx.attn_dim * ctx.num_heads,
-                ],
-                dim=1,
-            )
         q = q.view(-1, ctx.num_heads, ctx.attn_dim)
         k = k.view(-1, ctx.num_heads, ctx.attn_dim)
         v = v.view(-1, ctx.num_heads, ctx.hidden_dim)
-        dq = dq.view(-1, ctx.num_heads, ctx.attn_dim)
-        dk = dk.view(-1, ctx.num_heads, ctx.attn_dim)
-        dv = dv.view(-1, ctx.num_heads, ctx.hidden_dim)
         if (
             ctx.recompute_uvqk_in_backward and ctx.has_rotary_weights
         ):  # recompute ROPE on qk
@@ -663,105 +852,53 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
                 # pyrefly: ignore [bad-argument-type]
                 sin_rope=k_sin_weights,
             )
-        dq = dq.view(-1, ctx.num_heads, ctx.attn_dim)
-        dk = dk.view(-1, ctx.num_heads, ctx.attn_dim)
-        dv = dv.view(-1, ctx.num_heads, ctx.hidden_dim)
-        # Note: the two operations below update duvqk in place
-        if is_sm100_plus():
-            _dq, _dk, _dv = torch.ops.bw_hstu.bw_hstu_mha_bwd(
-                ctx.max_seq_len,
-                ctx.alpha,
-                dout,
-                q,
-                k,
-                v,
-                dq,
-                dk,
-                dv,
-                seq_offsets,
-                True,  # causal
-                num_targets,
-                attn_scale,
-                ctx.max_attn_len,
-                ctx.full_attn_size,
-                ctx.contextual_seq_len,
-                ctx.sort_by_length,
-                False,  # deterministic
-                0,  # sm_margin
-                ctx.max_seq_len,  # max_q_len,
-                None,  # seq_offsets_q,
-                None,  # max_seq_len_tensor,
-                None,  # contextual_seq_len_tensor,
-                None,  # max_attn_len_tensor,
-                None,  # min_full_attn_seq_len_tensor,
-                1,  # num_groups
-                ctx.num_softmax_heads,  # num_softmax_heads
-                out,  # out
-                softmax_lse,  # lse
-            )
-        else:
-            _dq, _dk, _dv = torch.ops.hstu.hstu_mha_bwd(
-                ctx.max_seq_len,
-                ctx.alpha,
-                dout,
-                q,
-                k,
-                v,
-                dq,
-                dk,
-                dv,
-                out,
-                seq_offsets,
-                True,  # causal
-                num_targets,
-                attn_scale,
-                ctx.max_attn_len,
-                ctx.full_attn_size,
-                ctx.contextual_seq_len,
-                ctx.sort_by_length,
-                False,  # deterministic
-                0,  # sm_margin
-                0,  # max_q_len,
-                None,  # seq_offsets_q,
-                ctx.num_softmax_heads,  # num_softmax_heads,
-                softmax_lse,
-                use_bf16_dq_accum=ctx.use_bf16_dq_accum,
-            )
-        if ctx.has_rotary_weights:
-            _dq = triton_apply_rope_bwd(
-                grad=_dq,
-                N=ctx.max_seq_len,
-                seq_offsets=seq_offsets,
-                # pyrefly: ignore [bad-argument-type]
-                cos_rope=q_cos_weights,
-                # pyrefly: ignore [bad-argument-type]
-                sin_rope=q_sin_weights,
-            )
-            _dk = triton_apply_rope_bwd(
-                grad=_dk,
-                N=ctx.max_seq_len,
-                seq_offsets=seq_offsets,
-                # pyrefly: ignore [bad-argument-type]
-                cos_rope=k_cos_weights,
-                # pyrefly: ignore [bad-argument-type]
-                sin_rope=k_sin_weights,
-            )
-        copy_if_different_ptr(dq, _dq)
-        copy_if_different_ptr(dk, _dk)
-        copy_if_different_ptr(dv, _dv)
+        # Under torch.compile with optimize_compiled_backward, duvqk is filled
+        # through an op that declares it mutates duvqk, so the attention kernel
+        # writes dq/dk/dv straight into their slices as in eager.
+        fill_duvqk = (
+            _fill_duvqk
+            if torch.compiler.is_compiling() and ctx.optimize_compiled_backward
+            else _fill_duvqk_impl
+        )
         fuse_u_and_bias_grad = (
             ctx.fuse_u_grad_and_bias_grad
             and _du is not None
             and _du.stride(-1) == 1
             and _du.dtype == duvqk.dtype
         )
-        if not ctx.skip_u and not fuse_u_and_bias_grad:
-            if ctx.silu_u:
-                # pyre-ignore[61]: `du` is always defined in the else branch above
-                torch.ops.aten.silu_backward(_du, u, grad_input=du)
-            else:
-                # pyre-ignore[61]: `du` is always defined in the else branch above
-                copy_if_different_ptr(du, _du)
+        fill_duvqk(
+            duvqk=duvqk,
+            # With fuse_u_and_bias_grad, copy_u_grad_and_column_sum below writes du.
+            _du=None if ctx.skip_u or fuse_u_and_bias_grad else _du,
+            u=u,
+            dout=dout,
+            q=q,
+            k=k,
+            v=v,
+            attn_out=out,
+            seq_offsets=seq_offsets,
+            num_targets=num_targets,
+            attn_scale=attn_scale,
+            softmax_lse=softmax_lse,
+            q_cos_weights=q_cos_weights,
+            q_sin_weights=q_sin_weights,
+            k_cos_weights=k_cos_weights,
+            k_sin_weights=k_sin_weights,
+            max_seq_len=ctx.max_seq_len,
+            alpha=ctx.alpha,
+            max_attn_len=ctx.max_attn_len,
+            full_attn_size=ctx.full_attn_size,
+            contextual_seq_len=ctx.contextual_seq_len,
+            sort_by_length=ctx.sort_by_length,
+            num_softmax_heads=ctx.num_softmax_heads,
+            use_bf16_dq_accum=ctx.use_bf16_dq_accum,
+            has_rotary_weights=ctx.has_rotary_weights,
+            skip_u=ctx.skip_u,
+            silu_u=ctx.silu_u,
+            num_heads=ctx.num_heads,
+            attn_dim=ctx.attn_dim,
+            hidden_dim=ctx.hidden_dim,
+        )
         if fuse_u_and_bias_grad:
             d_uvqk_bias = copy_u_grad_and_column_sum(_du, duvqk)
             d_uvqk_weight = torch.mm(normed_x.t(), duvqk)
@@ -827,5 +964,6 @@ class _HSTUPreprocessAndAttentionFunction(torch.autograd.Function):
             None,  # skip_u
             None,  # use_bf16_dq_accum
             None,  # use_rms_norm
-            None,
+            None,  # fuse_u_grad_and_bias_grad
+            None,  # optimize_compiled_backward
         )
