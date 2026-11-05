@@ -57,6 +57,39 @@ class PositionEmbeddingsTest(unittest.TestCase):
             real_kernel=HammerKernel.TRITON,
         )
 
+    # The AOT-T (TRITON_INFERENCE) position embeddings, forward only.
+    @unittest.skipIf(*gpu_unavailable)
+    # pyre-ignore
+    @given(
+        alpha=st.sampled_from([0.5]),
+        max_uih_len=st.integers(50, 500),
+        max_contextual_seq_len=st.sampled_from([10]),
+        interleave_targets=st.sampled_from([True, False]),
+        batch_size=st.integers(16, 32),
+        D=st.integers(20, 200),
+        max_targets=st.sampled_from([10, 20]),
+        time_bucket_fn=st.sampled_from(["log"]),
+        dtype=st.sampled_from([torch.float32, torch.bfloat16, torch.float16]),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=20,
+        deadline=None,
+    )
+    # pyre-ignore[2]
+    def test_add_timestamp_positional_embeddings_triton_inference(
+        self,
+        *args,  # pyre-ignore[2]
+        **kwargs,  # pyre-ignore[2]
+    ) -> None:
+        self._test_add_timestamp_positional_embeddings(
+            *args,
+            **kwargs,
+            test_backward=False,
+            ref_kernel=HammerKernel.PYTORCH,
+            real_kernel=HammerKernel.TRITON_INFERENCE,
+        )
+
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore
     @given(

@@ -33,7 +33,7 @@ from generative_recommenders.ops.jagged_tensors import (
     split_2D_jagged_multirow,
 )
 from generative_recommenders.ops.utils import is_sm100_plus
-from hypothesis import given, settings, strategies as st, Verbosity
+from hypothesis import assume, given, settings, strategies as st, Verbosity
 
 
 class JaggedTensorsTest(unittest.TestCase):
@@ -189,6 +189,70 @@ class JaggedTensorsTest(unittest.TestCase):
             test_backward=True,
             ref_kernel=HammerKernel.PYTORCH,
             real_kernel=HammerKernel.TRITON,
+        )
+
+    # The AOT-T (TRITON_INFERENCE) jagged concat and split, forward only.
+    @unittest.skipIf(*gpu_unavailable)
+    # pyre-ignore
+    @given(
+        batch_size=st.integers(2, 8),
+        max_len_a=st.integers(20, 100),
+        max_len_b=st.integers(20, 100),
+        D=st.integers(10, 30),
+        is_dense_a=st.sampled_from([True, False]),
+        is_dense_b=st.sampled_from([True, False]),
+        dtype=st.sampled_from(
+            [torch.bfloat16, torch.float32]
+            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            else [torch.float32]
+        ),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=20,
+        deadline=None,
+    )
+    # pyre-ignore[2]
+    def test_concat_2D_jagged_triton_inference(self, *args, **kwargs) -> None:
+        # The AOT-T concat requires at least one jagged side; with both sides
+        # dense it raises rather than computing.
+        assume(not (kwargs["is_dense_a"] and kwargs["is_dense_b"]))
+        self._test_concat_2D_jagged(
+            *args,
+            **kwargs,
+            test_backward=False,
+            ref_kernel=HammerKernel.PYTORCH,
+            real_kernel=HammerKernel.TRITON_INFERENCE,
+        )
+
+    @unittest.skipIf(*gpu_unavailable)
+    # pyre-ignore
+    @given(
+        batch_size=st.integers(2, 8),
+        max_len_a=st.integers(20, 100),
+        max_len_b=st.integers(20, 100),
+        D=st.integers(10, 30),
+        is_dense_a=st.sampled_from([True, False]),
+        is_dense_b=st.sampled_from([True, False]),
+        dtype=st.sampled_from(
+            [torch.bfloat16, torch.float32]
+            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            else [torch.float32]
+        ),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=20,
+        deadline=None,
+    )
+    # pyre-ignore[2]
+    def test_split_2D_jagged_triton_inference(self, *args, **kwargs) -> None:
+        self._test_split_2D_jagged(
+            *args,
+            **kwargs,
+            test_backward=False,
+            ref_kernel=HammerKernel.PYTORCH,
+            real_kernel=HammerKernel.TRITON_INFERENCE,
         )
 
     @unittest.skipIf(*gpu_unavailable)

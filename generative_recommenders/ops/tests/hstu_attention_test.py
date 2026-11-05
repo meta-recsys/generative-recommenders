@@ -355,6 +355,130 @@ class HSTUAttentionTest(unittest.TestCase):
             real_kernel=HammerKernel.TRITON,
         )
 
+    # TRITON_INFERENCE runs the AOT-T wrappers -- the launch code the AOT-T
+    # compile records and rewrites -- through Triton's JIT. Comparing it against
+    # the PyTorch reference catches drift between those wrappers and the shared
+    # kernel (a new kernel argument, a dropped option) in the diff that causes
+    # it. AOT-T is inference-only, so these compare the forward pass.
+    @unittest.skipIf(*gpu_unavailable)
+    # pyre-ignore
+    @given(
+        batch_size=st.integers(4, 8),
+        heads=st.integers(1, 4),
+        max_uih_len=st.sampled_from([20, 100, 128, 256]),
+        max_targets=st.sampled_from([20, 512]),
+        attn_dim=st.sampled_from([16, 32, 64, 128]),
+        hidden_dim=st.sampled_from([16, 32, 64, 128]),
+        causal=st.sampled_from([True]),
+        has_multiple_targets=st.sampled_from([True, False]),
+        dtype=st.sampled_from(
+            [torch.bfloat16, torch.float32]
+            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            else [torch.float32]
+        ),
+        has_max_attn_len=st.sampled_from([True, False]),
+        contextual_seq_len=st.sampled_from([0, 10]),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=50,
+        deadline=None,
+    )
+    # pyre-ignore[2]
+    def test_attn_triton_inference(self, *args, **kwargs) -> None:
+        test_attn(
+            *args,
+            **kwargs,
+            test_backward=False,
+            ref_kernel=HammerKernel.PYTORCH,
+            real_kernel=HammerKernel.TRITON_INFERENCE,
+        )
+
+    @unittest.skipIf(*gpu_unavailable)
+    # pyre-ignore
+    @given(
+        batch_size=st.integers(4, 8),
+        heads=st.integers(1, 4),
+        max_uih_len=st.sampled_from([100, 128, 256]),
+        max_targets=st.sampled_from([20, 512]),
+        delta_size=st.sampled_from([20, 512]),
+        attn_dim=st.sampled_from([16, 32, 64, 128]),
+        hidden_dim=st.sampled_from([16, 32, 64, 128]),
+        has_multiple_targets=st.sampled_from([True, False]),
+        dtype=st.sampled_from(
+            [torch.bfloat16, torch.float32]
+            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+            else [torch.float32]
+        ),
+        has_max_attn_len=st.sampled_from([False, True]),
+        # The AOT-T cached kernel has no contextual_seq_len parameter; the
+        # non-zero case is covered by the rejection test below.
+        contextual_seq_len=st.just(0),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=50,
+        deadline=None,
+    )
+    # pyre-ignore[2]
+    def test_delta_attn_triton_inference(self, *args, **kwargs) -> None:
+        test_delta_attn(
+            *args,
+            **kwargs,
+            ref_kernel=HammerKernel.PYTORCH,
+            real_kernel=HammerKernel.TRITON_INFERENCE,
+        )
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_delta_attn_triton_inference_rejects_contextual_seq_len(self) -> None:
+        # An option the AOT-T kernel cannot honour must fail, not be dropped.
+        with self.assertRaisesRegex(
+            AssertionError, "contextual_seq_len is not implemented"
+        ):
+            test_delta_attn(
+                batch_size=4,
+                heads=2,
+                max_uih_len=100,
+                max_targets=20,
+                delta_size=20,
+                attn_dim=32,
+                hidden_dim=32,
+                has_multiple_targets=True,
+                has_max_attn_len=False,
+                dtype=torch.bfloat16,
+                ref_kernel=HammerKernel.PYTORCH,
+                real_kernel=HammerKernel.TRITON_INFERENCE,
+                contextual_seq_len=10,
+            )
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_attn_triton_inference_rejects_softmax_heads(self) -> None:
+        from generative_recommenders.ops.hstu_attention import hstu_mha
+
+        heads, attn_dim, seq_len = 2, 32, 32
+        seq_offsets = torch.tensor(
+            [0, seq_len, 2 * seq_len], dtype=torch.int64, device=torch.device("cuda")
+        )
+        q, k, v = (
+            torch.randn(
+                (2 * seq_len, heads, attn_dim),
+                dtype=torch.bfloat16,
+                device=torch.device("cuda"),
+            )
+            for _ in range(3)
+        )
+        with self.assertRaisesRegex(AssertionError, "num_softmax_heads"):
+            hstu_mha(
+                max_seq_len=seq_len,
+                alpha=1.0 / (attn_dim**0.5),
+                q=q,
+                k=k,
+                v=v,
+                seq_offsets=seq_offsets,
+                num_softmax_heads=heads,
+                kernel=HammerKernel.TRITON_INFERENCE,
+            )
+
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore
     @given(
