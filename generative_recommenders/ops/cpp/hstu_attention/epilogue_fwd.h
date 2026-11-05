@@ -514,6 +514,14 @@ struct CollectiveEpilogueFwd {
         params.stride_O_packed)(_, _, bidh, !Jagged ? bidb : 0, split_idx);
 
     static_assert(kBlockM <= NumEpilogueThreads);
+    int const row = m_block * kBlockM + thread_idx;
+    if (params.ptr_lse != nullptr && thread_idx < kBlockM && row < seqlen_o) {
+      Tensor mLSE = make_tensor(
+          make_gmem_ptr(params.ptr_lse + offset_o * get<0>(params.stride_lse)),
+          params.shape_lse_packed,
+          params.stride_lse_packed)(_, bidh, !Jagged ? bidb : 0, 0);
+      mLSE(row) = -INFINITY;
+    }
     if constexpr (!Clear_O) {
       return;
     }

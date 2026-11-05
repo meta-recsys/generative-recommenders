@@ -320,7 +320,9 @@ class FlashAttnBwdPreprocess {
           make_coord(m_block));
       if (thread_idx < seqlen_rounded - m_block * kBlockM &&
           thread_idx < kBlockM) {
-        gLSElog2(thread_idx) = lse * float(M_LOG2E);
+        // A query that sees no key has LSE -inf. With 0 instead, its weights
+        // are P = exp2(-inf - 0) = 0, not exp2(-inf - (-inf)) = NaN.
+        gLSElog2(thread_idx) = lse == -INFINITY ? 0.f : lse * float(M_LOG2E);
       }
     }
     if constexpr (Clear_dQaccum) {
