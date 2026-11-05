@@ -28,6 +28,7 @@ import torch
 import triton
 from generative_recommenders.ops.utils import is_sm100_plus, is_sm90_plus
 from torch.fx._symbolic_trace import is_fx_tracing
+from torch.fx.experimental.symbolic_shapes import statically_known_true
 from torch.utils._python_dispatch import _get_current_dispatch_mode_stack
 
 # @manual=//triton:triton
@@ -268,9 +269,11 @@ def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
             return x
         return x.contiguous()
     if torch.compiler.is_compiling():
-        # Tell Dynamo this data-dependent value is in the range (0, 10**9)
-        torch._check(x.size(0) > 0)
-        torch._check(x.size(0) < 10**9)
+        # Let the compiler assume a symbolic size is in (0, 10**9). Empty tensors
+        # are supported: skip the checks when the size is known to be 0.
+        if not statically_known_true(x.size(0) == 0):
+            torch._check(x.size(0) > 0)
+            torch._check(x.size(0) < 10**9)
     # FX cannot trace Python control flow over symbolic stride checks
     # (`x.stride(-1) == 1`). For AOT-T lowering, conservatively emit the
     # contiguous op instead of branching on a symbolic value.
