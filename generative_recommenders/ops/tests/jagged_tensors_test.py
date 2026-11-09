@@ -17,7 +17,7 @@
 # pyre-strict
 
 import unittest
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from generative_recommenders.common import (
@@ -34,6 +34,43 @@ from generative_recommenders.ops.jagged_tensors import (
 )
 from generative_recommenders.ops.utils import is_sm100_plus
 from hypothesis import given, settings, strategies as st, Verbosity
+
+
+# Kernels jagged_dense_bmm_broadcast_add tests run against the PyTorch reference.
+# CuTeDSL (tcgen05, cta_group=2) is Blackwell-only.
+_JDBBA_KERNELS: List[HammerKernel] = [HammerKernel.TRITON] + (
+    [HammerKernel.CUTEDSL] if is_sm100_plus() else []
+)
+
+
+def _jdbba_inputs(kernel: HammerKernel) -> st.SearchStrategy[Dict[str, Any]]:
+    """Inputs each kernel computes itself. CuTeDSL takes bf16 with feature dims that are
+    multiples of 8 (TMA's 16-byte rows); anything else falls back to Triton."""
+    if kernel == HammerKernel.CUTEDSL:
+        return st.fixed_dictionaries(
+            {
+                "real_kernel": st.just(kernel),
+                # Not multiples of the 256-wide tiles, plus single-k-block (64) and
+                # longer-than-production (832) contractions.
+                "D": st.sampled_from([64, 136, 256, 520]),
+                "K": st.sampled_from([64, 200, 256, 832]),
+                "dtype": st.just(torch.bfloat16),
+                "contiguous": st.booleans(),
+            }
+        )
+    return st.fixed_dictionaries(
+        {
+            "real_kernel": st.just(kernel),
+            "D": st.integers(20, 200),
+            "K": st.integers(30, 200),
+            "dtype": st.sampled_from(
+                [torch.float32, torch.bfloat16, torch.float16]
+                if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
+                else [torch.float32]
+            ),
+            "contiguous": st.booleans(),
+        }
+    )
 
 
 class JaggedTensorsTest(unittest.TestCase):
@@ -550,30 +587,25 @@ class JaggedTensorsTest(unittest.TestCase):
     @given(
         batch_size=st.integers(4, 8),
         max_seq_len=st.integers(50, 500),
-        D=st.integers(20, 200),
-        K=st.integers(30, 200),
-        dtype=st.sampled_from(
-            [torch.float32, torch.bfloat16, torch.float16]
-            if torch.cuda.get_device_capability(torch.device("cuda"))[0] >= 8
-            else [torch.float32]
-        ),
-        contiguous=st.booleans(),
+        case=st.sampled_from(_JDBBA_KERNELS).flatmap(_jdbba_inputs),
     )
     @settings(
         verbosity=Verbosity.verbose,
-        max_examples=20,
+        # About 20 per kernel.
+        max_examples=20 * len(_JDBBA_KERNELS),
         deadline=None,
     )
-    # pyre-ignore[2]
-    def test_jagged_dense_bmm_broadcast_add_triton(self, *args, **kwargs) -> None:
+    def test_jagged_dense_bmm_broadcast_add(
+        self, batch_size: int, max_seq_len: int, case: Dict[str, Any]
+    ) -> None:
         self._test_jagged_dense_bmm_broadcast_add(
-            *args,
-            **kwargs,
+            batch_size=batch_size,
+            max_seq_len=max_seq_len,
+            **case,
             test_backward=True,
             atol=None,
             rtol=None,
             ref_kernel=HammerKernel.PYTORCH,
-            real_kernel=HammerKernel.TRITON,
         )
 
     @unittest.skipIf(*gpu_unavailable)
@@ -606,84 +638,6 @@ class JaggedTensorsTest(unittest.TestCase):
             ref_kernel=HammerKernel.TRITON,
             real_kernel=HammerKernel.TRITON,
         )
-
-    # tcgen05 MMA with cta_group=2 is Blackwell-only.
-    @unittest.skipIf(not is_sm100_plus(), "CuTeDSL kernel requires sm_100+ (Blackwell)")
-    @unittest.skipIf(*gpu_unavailable)
-    # pyrefly: ignore [bad-argument-type]
-    @given(
-        batch_size=st.integers(4, 8),
-        max_seq_len=st.integers(50, 500),
-        D=st.sampled_from([64, 128, 256, 512]),
-        K=st.sampled_from([64, 128, 256, 512]),
-        # bf16 only by scope. fp16 is close to free later (ab_dtype is a parameter);
-        # fp32 needs a tf32 MMA path.
-        dtype=st.just(torch.bfloat16),
-        contiguous=st.just(True),
-    )
-    @settings(
-        verbosity=Verbosity.verbose,
-        max_examples=20,
-        deadline=None,
-    )
-    # pyrefly: ignore [bad-argument-type]
-    def test_jagged_dense_bmm_broadcast_add_cutedsl(self, *args, **kwargs) -> None:
-        """Blackwell tcgen05 CuTeDSL kernel, forward only."""
-        self._test_jagged_dense_bmm_broadcast_add(
-            *args,
-            **kwargs,
-            test_backward=False,
-            atol=None,
-            rtol=None,
-            ref_kernel=HammerKernel.PYTORCH,
-            real_kernel=HammerKernel.CUTEDSL,
-        )
-
-    # tcgen05 MMA with cta_group=2 is Blackwell-only.
-    @unittest.skipIf(not is_sm100_plus(), "CuTeDSL kernel requires sm_100+ (Blackwell)")
-    @unittest.skipIf(*gpu_unavailable)
-    def test_jagged_dense_bmm_broadcast_add_cutedsl_shapes(self) -> None:
-        DEEP_K_ATOL = 1e-3
-
-        # (name, batch_size, lengths, max_seq_len, D_contraction, K_output, atol)
-        cases = [
-            # No skipped tiles at a length spanning many M tiles: the deadlock regime.
-            ("no_skipped_tiles", 8, [2048] * 8, 2048, 2176, 768, DEEP_K_ATOL),
-            # Same, deeper persistent loop (20 M tiles per group).
-            ("long_groups_no_skip", 8, [5120] * 8, 5120, 256, 256, None),
-            # Production dims, plus an empty group, a single-row group and a partial tile.
-            ("production_dims", 4, [3000, 5000, 1, 0], 8192, 2176, 768, DEEP_K_ATOL),
-            # Empty-group position matters: leading, interior, and all-but-one.
-            ("empty_first", 4, [0, 501, 501, 501], 512, 256, 256, None),
-            ("empty_middle", 4, [501, 0, 501, 501], 512, 256, 256, None),
-            ("only_one_nonempty", 4, [0, 0, 0, 1007], 1024, 256, 256, None),
-            # One group far longer than the rest.
-            ("skewed", 4, [8009, 149, 149, 149], 8192, 256, 256, None),
-            ("single_group", 1, [2023], 2048, 256, 256, None),
-            # Group shorter than one 128-row M tile.
-            ("short_group", 4, [17, 501, 501, 501], 512, 256, 256, None),
-            # N tiling: 320 is one full 256 tile plus a partial, 832 is three plus a
-            # partial. Both exercise the per-element epilogue fallback, which the
-            # vectorised store path never takes.
-            ("n_one_full_one_partial", 4, [501] * 4, 512, 256, 320, None),
-            ("n_multi_tile_partial_tail", 4, [501] * 4, 512, 256, 832, None),
-        ]
-        for name, batch_size, lengths, max_seq_len, d, k, atol in cases:
-            with self.subTest(case=name):
-                self._test_jagged_dense_bmm_broadcast_add(
-                    batch_size=batch_size,
-                    max_seq_len=max_seq_len,
-                    D=d,
-                    K=k,
-                    dtype=torch.bfloat16,
-                    contiguous=True,
-                    test_backward=False,
-                    atol=atol,
-                    rtol=None if atol is None else 1.6e-2,
-                    ref_kernel=HammerKernel.PYTORCH,
-                    real_kernel=HammerKernel.CUTEDSL,
-                    lengths=torch.tensor(lengths, dtype=torch.int64),
-                )
 
     def _test_jagged_dense_bmm_broadcast_add(
         self,
