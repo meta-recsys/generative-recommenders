@@ -460,7 +460,10 @@ def _hstu_attn_fwd_one_block(  # noqa: C901
             (offs_m[:, None] == 0) & (offs_n[None, :] < max_ids)
         )
     scale = tl.where(invalid_mask, (1.0 / MAX_SEQ_LEN), 0.0)
-    silu = fast_dividef(qk, 1.0 + fast_expf(-qk)) * scale
+    # fast_dividef is only accurate for denominators up to 2**126; above that,
+    # returns NaN for some numerators, e.g. qk = -128. Capping the exponent
+    # at 87 keeps 1 + exp(.) under the bound.
+    silu = fast_dividef(qk, 1.0 + fast_expf(tl.minimum(-qk, 87.0))) * scale
     v = None
     if ENABLE_TMA:
         v = V.load(
@@ -1998,7 +2001,11 @@ def _hstu_attn_bwd_one_block(  # noqa C901
             other=0.0,
         )
     qk_trans = tl.dot(k, q_trans, allow_tf32=ALLOW_TF32) * alpha
-    sig_trans = fast_dividef(1.0, 1.0 + tl.exp(-qk_trans))
+    # fast_dividef is only accurate for denominators up to 2**126; above that,
+    # returns NaN with a numerator of 1.0. Capping the exponent at 87 keeps
+    # 1 + exp(.) under the bound and changes sigmoid only where it is below
+    # 1.7e-38.
+    sig_trans = fast_dividef(1.0, 1.0 + tl.exp(tl.minimum(-qk_trans, 87.0)))
     silu_trans = qk_trans * sig_trans * (1.0 / MAX_SEQ_LEN)
     pos_offs_m_minus_n = pos_offs_m[None, :] - pos_offs_n[:, None]
     invalid_mask_trans = invalid_mask_trans | (pos_offs_m_minus_n > 0)

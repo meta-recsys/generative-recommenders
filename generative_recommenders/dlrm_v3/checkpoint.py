@@ -225,6 +225,10 @@ def load_nonsparse_checkpoint(
             m.load_state_dict(regression_metric_state_dict["train"][i])
         for i, m in enumerate(metric_logger.regression_metrics["eval"]):
             m.load_state_dict(regression_metric_state_dict["eval"][i])
+        # States were loaded with map_location=device; the metrics may live elsewhere.
+        for metrics in metric_logger.all_metrics.values():
+            for m in metrics:
+                m.to(metric_logger.device)
 
 
 @gin.configurable
