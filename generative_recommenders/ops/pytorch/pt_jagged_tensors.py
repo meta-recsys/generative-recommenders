@@ -102,21 +102,15 @@ def pytorch_concat_2D_jagged(
         )
     else:
         offsets_right_non_optional = offsets_right
+    lengths_left = offsets_left_non_optional[1:] - offsets_left_non_optional[:-1]
+    lengths_right = offsets_right_non_optional[1:] - offsets_right_non_optional[:-1]
     max_len_left = (
-        int(
-            (offsets_left_non_optional[1:] - offsets_left_non_optional[:-1])
-            .max()
-            .item()
-        )
+        int(torch.cat([lengths_left, lengths_left.new_zeros(1)]).max().item())
         if max_len_left is None
         else max_len_left
     )
     max_len_right = (
-        int(
-            (offsets_right_non_optional[1:] - offsets_right_non_optional[:-1])
-            .max()
-            .item()
-        )
+        int(torch.cat([lengths_right, lengths_right.new_zeros(1)]).max().item())
         if max_len_right is None
         else max_len_right
     )
