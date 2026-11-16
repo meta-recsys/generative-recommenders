@@ -16,6 +16,7 @@
 
 # pyre-strict
 
+import itertools
 import unittest
 from typing import Optional
 
@@ -31,6 +32,10 @@ from generative_recommenders.ops.jagged_tensors import (
     concat_2D_jagged_multirow,
     split_2D_jagged,
     split_2D_jagged_multirow,
+)
+from generative_recommenders.ops.triton.triton_jagged import (
+    set_split_concat_2d_jagged_multirow_kernel,
+    triton_split_2D_jagged,
 )
 from generative_recommenders.ops.utils import is_sm100_plus
 from hypothesis import given, settings, strategies as st, Verbosity
@@ -160,6 +165,135 @@ class JaggedTensorsTest(unittest.TestCase):
             # pyrefly: ignore [missing-attribute]
             real_d_values = values.grad.clone()
             torch.testing.assert_close(ref_d_values, real_d_values)
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_split_2D_jagged_backward_no_host_sync(self) -> None:
+        # The lengths arrive as device tensors, as they do from callers that
+        # pass `lengths.sum()`. The backward must size its outputs without
+        # reading them back to the host.
+        device = torch.device("cuda")
+        batch_size, prefix_len, max_len_b, D = 16, 8, 64, 32
+        lengths_a = torch.full(
+            (batch_size,), prefix_len, dtype=torch.int64, device=device
+        )
+        lengths_b = torch.randint(
+            1, max_len_b + 1, (batch_size,), dtype=torch.int64, device=device
+        )
+        offsets_a = torch.zeros((batch_size + 1,), dtype=torch.int64, device=device)
+        offsets_b = torch.zeros((batch_size + 1,), dtype=torch.int64, device=device)
+        offsets_a[1:] = torch.cumsum(lengths_a, dim=0)
+        offsets_b[1:] = torch.cumsum(lengths_b, dim=0)
+        total_len_a = int(offsets_a[-1].item())
+        total_len_b = int(offsets_b[-1].item())
+        # skip_left with the single-row kernel takes the backward's zero-fill
+        # path; the multirow kernel skips it.
+        self.addCleanup(set_split_concat_2d_jagged_multirow_kernel, None)
+        # A jagged right part gets its lengths as device tensors, the left one
+        # directly or through total_seq_len. A dense right part takes both
+        # lengths from shapes, so it only checks the zero-fill sizing.
+        cases = [(False, False), (False, True), (True, False)]
+        for case, use_multirow, skip_left in itertools.product(
+            cases, [False, True], [False, True]
+        ):
+            is_dense_b, use_total_seq_len = case
+            set_split_concat_2d_jagged_multirow_kernel(use_multirow)
+            num_rows_b = batch_size * max_len_b if is_dense_b else total_len_b
+            values = torch.randn(
+                (total_len_a + num_rows_b, D), device=device, requires_grad=True
+            )
+            _, values_b = triton_split_2D_jagged(
+                values,
+                prefix_len + max_len_b,
+                offsets_a,
+                None if is_dense_b else offsets_b,
+                dense_size=max_len_b if is_dense_b else 0,
+                seq_len_a=None if use_total_seq_len else lengths_a.sum(),
+                seq_len_b=None if is_dense_b else lengths_b.sum(),
+                total_seq_len=total_len_a + num_rows_b if use_total_seq_len else None,
+                skip_left=skip_left,
+            )
+            d_values_b = torch.randn_like(values_b)
+            torch.cuda.synchronize()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                torch.autograd.backward([values_b], [d_values_b])
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+            ref_values = values.detach().clone().requires_grad_()
+            _, ref_values_b = split_2D_jagged(
+                max_seq_len=prefix_len + max_len_b,
+                values=ref_values,
+                max_len_left=None,
+                max_len_right=max_len_b if is_dense_b else None,
+                offsets_left=offsets_a,
+                offsets_right=None if is_dense_b else offsets_b,
+                kernel=HammerKernel.PYTORCH,
+            )
+            # The PyTorch reference returns a dense right part flat.
+            ref_values_b.backward(d_values_b.reshape(ref_values_b.shape))
+            torch.testing.assert_close(values.grad, ref_values.grad)
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_split_2D_jagged_rejects_uncovered_rows(self) -> None:
+        device = torch.device("cuda")
+        offsets_a = torch.tensor([0, 2, 4], device=device)
+        offsets_b = torch.tensor([0, 3, 5], device=device)
+        values = torch.randn((10, 8), device=device, requires_grad=True)
+        with self.assertRaisesRegex(AssertionError, "values has 10 rows"):
+            triton_split_2D_jagged(
+                values, 8, offsets_a, offsets_b, seq_len_a=4, seq_len_b=5
+            )
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_split_2D_jagged_backward_compiled_caller(self) -> None:
+        # Called from compiled code, the forward keeps the lengths as device
+        # tensors (it reads the last offsets with index_select); the backward
+        # runs eagerly and must still give the reference gradient without a
+        # host sync.
+        device = torch.device("cuda")
+        batch_size, prefix_len, max_len_b, D = 16, 8, 64, 32
+        max_seq_len = prefix_len + max_len_b
+        lengths_a = torch.full(
+            (batch_size,), prefix_len, dtype=torch.int64, device=device
+        )
+        lengths_b = torch.randint(
+            1, max_len_b + 1, (batch_size,), dtype=torch.int64, device=device
+        )
+        offsets_a = torch.zeros((batch_size + 1,), dtype=torch.int64, device=device)
+        offsets_b = torch.zeros((batch_size + 1,), dtype=torch.int64, device=device)
+        offsets_a[1:] = torch.cumsum(lengths_a, dim=0)
+        offsets_b[1:] = torch.cumsum(lengths_b, dim=0)
+        total_len = int(offsets_a[-1].item()) + int(offsets_b[-1].item())
+
+        @torch.compile
+        def right_part(v: torch.Tensor) -> torch.Tensor:
+            _, values_b = triton_split_2D_jagged(v, max_seq_len, offsets_a, offsets_b)
+            return values_b * 2.0
+
+        # The first backward also compiles, so only the second one is checked.
+        for check_sync in [False, True]:
+            values = torch.randn((total_len, D), device=device, requires_grad=True)
+            out = right_part(values)
+            d_out = torch.randn_like(out)
+            torch.cuda.synchronize()
+            if check_sync:
+                torch.cuda.set_sync_debug_mode("error")
+            try:
+                out.backward(d_out)
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+            ref_values = values.detach().clone().requires_grad_()
+            _, ref_values_b = split_2D_jagged(
+                max_seq_len=max_seq_len,
+                values=ref_values,
+                max_len_left=None,
+                max_len_right=None,
+                offsets_left=offsets_a,
+                offsets_right=offsets_b,
+                kernel=HammerKernel.PYTORCH,
+            )
+            (ref_values_b * 2.0).backward(d_out)
+            torch.testing.assert_close(values.grad, ref_values.grad)
 
     @unittest.skipIf(*gpu_unavailable)
     # pyre-ignore

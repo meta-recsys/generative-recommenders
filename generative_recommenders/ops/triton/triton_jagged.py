@@ -1982,6 +1982,13 @@ class _Split2DJaggedFunction(torch.autograd.Function):
             # so this is SymInt arithmetic — no new unbacked SymInt.
             assert total_seq_len is not None
             seq_len_a = total_seq_len - values_b.size(0)
+        if isinstance(seq_len_a, int) and isinstance(seq_len_b, int):
+            # The backward sizes the input gradient from values.size(0), so the
+            # two parts must cover every input row.
+            assert values.size(0) == seq_len_a + seq_len_b, (
+                f"values has {values.size(0)} rows, but the split covers "
+                f"{seq_len_a} + {seq_len_b}"
+            )
         # pyre-ignore[6] Incompatible parameter type
         if skip_left and _should_use_multirow():
             # Every multirow kernel guards its OutA use behind `if not SKIP_LEFT`,
@@ -2020,8 +2027,8 @@ class _Split2DJaggedFunction(torch.autograd.Function):
             values_b = values_b.reshape(B, dense_size, D)
         ctx.save_for_backward(offsets_a, offsets_b)
         ctx.max_seq_len = max_seq_len
-        ctx.seq_len_a = seq_len_a
-        ctx.seq_len_b = seq_len_b
+        # From a shape: stays an int even when seq_len_a/b are device tensors.
+        ctx.num_rows = values.size(0)
         ctx.is_dense_a = is_dense_a
         ctx.is_dense_b = is_dense_b
         ctx.dense_size = dense_size
@@ -2044,14 +2051,14 @@ class _Split2DJaggedFunction(torch.autograd.Function):
         # zeros over the left region under SKIP_LEFT, and the single-row fallback
         # gets a real zero buffer as ValuesA. So an uninitialized buffer is fine.
         dvalues = torch.empty(
-            (ctx.seq_len_a + ctx.seq_len_b, ctx.D),
+            (ctx.num_rows, ctx.D),
             device=values_a.device if values_a.numel() > 0 else values_b.device,
             dtype=values_b.dtype,
         )
         if skip_left and not _should_use_multirow() and values_a.numel() == 0:
             # The fallback concat really loads the left region; give it real zeros.
             concat_values_a = torch.zeros(
-                (ctx.seq_len_a, ctx.D),
+                (ctx.num_rows - values_b.numel() // ctx.D, ctx.D),
                 device=values_b.device,
                 dtype=values_b.dtype,
             )
