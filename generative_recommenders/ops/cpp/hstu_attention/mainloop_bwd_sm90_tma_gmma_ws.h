@@ -2062,6 +2062,22 @@ struct CollectiveMainloopBwdSm90 {
           for (; m_block < m_block_max_before_local_mask; ++m_block) {
             bwd_step(m_block, mask_fn);
           }
+        } else if constexpr (Causal && Contexual_mask) {
+          // Must visit the query blocks in the order load() loads them, which
+          // also steps with get_next_m_block.
+          int const num_m_block = m_block_max - m_block_min +
+              contexual_m_block_max + full_m_block_max - full_m_block_min;
+          CUTLASS_PRAGMA_NO_UNROLL
+          for (int i = 0; i < num_m_block; ++i) {
+            bwd_step(m_block, mask_fn);
+            m_block = get_next_m_block(
+                m_block,
+                m_block_min,
+                m_block_max,
+                contexual_m_block_max,
+                full_m_block_min,
+                full_m_block_max);
+          }
         } else {
           int num_m_block = m_block_max - m_block_min;
           CUTLASS_PRAGMA_NO_UNROLL
@@ -2184,6 +2200,22 @@ struct CollectiveMainloopBwdSm90 {
       CUTLASS_PRAGMA_NO_UNROLL
       for (; m_block < m_block_max_before_local_mask; ++m_block) {
         bwd_step(m_block, mask_fn);
+      }
+    } else if constexpr (Causal && Contexual_mask) {
+      // Must visit the query blocks in the order load() loads them, which also
+      // steps with get_next_m_block.
+      int const num_m_block = m_block_max - m_block_min +
+          contexual_m_block_max + full_m_block_max - full_m_block_min;
+      CUTLASS_PRAGMA_NO_UNROLL
+      for (int i = 0; i < num_m_block; ++i) {
+        bwd_step(m_block, mask_fn);
+        m_block = get_next_m_block(
+            m_block,
+            m_block_min,
+            m_block_max,
+            contexual_m_block_max,
+            full_m_block_min,
+            full_m_block_max);
       }
     } else {
       int num_m_block = m_block_max - m_block_min;
