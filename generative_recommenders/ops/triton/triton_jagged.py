@@ -33,6 +33,15 @@ from generative_recommenders.common import (
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
+from generative_recommenders.ops.triton.tlx_jagged_gfx950 import (
+    can_use_tlx_jagged_packing,
+    launch_tlx_jagged_packing,
+)
+from generative_recommenders.ops.triton.tlx_jagged_projection_gfx950 import (
+    can_use_tlx_jagged_projection,
+    launch_tlx_jagged_projection,
+    launch_tlx_jagged_weight_grad,
+)
 from generative_recommenders.ops.utils import is_sm90, is_sm90_plus
 from torch._inductor.runtime import triton_helpers
 
@@ -168,8 +177,33 @@ def _triton_concat_2D_jagged_internal(
     is_replace: bool,
     BLOCK_D: int,
     skip_left: bool = False,
+    is_backward: bool = False,
 ) -> None:
     use_multirow = _should_use_multirow()
+    if not skip_left and can_use_tlx_jagged_packing(
+        values_a,
+        values_b,
+        values_out,
+        is_forward=not is_backward,
+        use_multirow=use_multirow,
+        is_normal_jagged=not (is_replace or n_prefix or is_dense_a or is_dense_b),
+    ):
+        launch_tlx_jagged_packing(
+            values_a,
+            values_b,
+            values_out,
+            offsets_a,
+            offsets_b,
+            max_seq_len=max_seq_len,
+            batch_size=B,
+            dense_size=dense_size,
+            dense_stride=stride_dense_batch,
+            n_prefix=n_prefix,
+            is_dense_a=is_dense_a,
+            is_dense_b=is_dense_b,
+            is_replace=is_replace,
+        )
+        return
     if n_prefix != 0:
         if use_multirow:
 
@@ -998,6 +1032,14 @@ def triton_jagged_dense_bmm_add_fwd(
     B, _, N = dense.shape
     out = torch.empty((L, N), dtype=jagged.dtype, device=jagged.device)
 
+    if not elementwise and can_use_tlx_jagged_projection(
+        "FWD", seq_offsets, jagged, dense, bias, out
+    ):
+        launch_tlx_jagged_projection(
+            seq_offsets, jagged, dense, bias, out, max_seq_len=max_seq_len
+        )
+        return out, B, K, N
+
     grid = lambda meta: (  # noqa E731
         triton.cdiv(N, meta["BLOCK_N"]),
         triton.cdiv(max_seq_len, meta["BLOCK_M"]),
@@ -1037,6 +1079,22 @@ def triton_jagged_dense_bmm_add_bwd_jagged(
     B: int,
     N: int,
 ) -> torch.Tensor:
+    # The production K224/N512 input-gradient route is faster on the captured
+    # metadata shapes. Its weight/bias gradients retain independent TLX dispatch.
+    if (K, N) != (224, 512) and can_use_tlx_jagged_projection(
+        "BWD", seq_offsets, d_out, dense, d_jagged
+    ):
+        launch_tlx_jagged_projection(
+            seq_offsets,
+            d_out,
+            dense,
+            None,
+            d_jagged,
+            max_seq_len=max_seq_len,
+            transpose=True,
+        )
+        return d_jagged
+
     grid = lambda meta: (  # noqa E731
         triton.cdiv(K, meta["BLOCK_N"]),
         triton.cdiv(max_seq_len, meta["BLOCK_M"]),
@@ -1077,6 +1135,18 @@ def _triton_jagged_dense_bmm_add_bwd_dense_bias_base(
     elementwise: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     d_bias = torch.empty((B, N), device=d_out.device, dtype=d_out.dtype)
+
+    if (
+        not elementwise
+        and d_dense.is_contiguous()
+        and can_use_tlx_jagged_projection(
+            "BWD", seq_offsets, jagged, d_out, d_dense, d_bias
+        )
+    ):
+        launch_tlx_jagged_weight_grad(
+            seq_offsets, jagged, d_out, d_dense, d_bias, max_seq_len=max_seq_len
+        )
+        return d_dense, d_bias
 
     grid = lambda meta: (  # noqa E731
         triton.cdiv(K, meta["BLOCK_M"]),
@@ -1628,8 +1698,35 @@ def _triton_split_2D_jagged_internal(
     is_replace: bool,
     BLOCK_D: int,
     skip_left: bool = False,
+    is_backward: bool = False,
 ) -> None:
     use_multirow = _should_use_multirow()
+    if not skip_left and can_use_tlx_jagged_packing(
+        out_a,
+        out_b,
+        jagged_in,
+        is_forward=not is_backward,
+        use_multirow=use_multirow,
+        is_normal_jagged=False,
+    ):
+        launch_tlx_jagged_packing(
+            out_a,
+            out_b,
+            jagged_in,
+            offsets_a,
+            offsets_b,
+            max_seq_len=max_seq_len,
+            batch_size=B,
+            dense_size=dense_size,
+            dense_stride=dense_size
+            * (out_a.stride(0) if is_dense_a else out_b.stride(0)),
+            n_prefix=n_prefix,
+            is_dense_a=is_dense_a,
+            is_dense_b=is_dense_b,
+            is_replace=is_replace,
+            split=True,
+        )
+        return
     if n_prefix != 0:
         if use_multirow:
 
@@ -1812,7 +1909,12 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
             B = offsets_a.shape[0] - 1
         _, D = d_out.shape
         BLOCK_D = triton.next_power_of_2(D)
-        values_a = torch.zeros(
+        # TLX writes retained rows and zeros the replaced tail in the split.
+        writes_all_a = can_use_tlx_jagged_packing(d_out) and (
+            not is_replace or ctx.n_prefix_from_right == 0
+        )
+        allocate_a = torch.empty if writes_all_a else torch.zeros
+        values_a = allocate_a(
             (ctx.seq_len_a, D), device=d_out.device, dtype=d_out.dtype
         )
         values_b = torch.empty(
@@ -1833,6 +1935,7 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
             is_dense_b=is_dense_b,
             is_replace=is_replace,
             BLOCK_D=BLOCK_D,
+            is_backward=True,
         )
 
         if is_dense_a:
@@ -2090,6 +2193,7 @@ class _Split2DJaggedFunction(torch.autograd.Function):
             is_replace=False,
             BLOCK_D=BLOCK_D,
             skip_left=skip_left and _should_use_multirow(),
+            is_backward=True,
         )
 
         return dvalues, None, None, None, None, None, None, None, None, None
