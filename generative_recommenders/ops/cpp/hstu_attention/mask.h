@@ -215,6 +215,11 @@ struct Mask {
       } else { // Causal_mask or Local_mask
         int const causal_row_offset = 1 - n_block * BlockN - thread_kdim_offset;
         if constexpr (Causal_mask) {
+          // A contextual row (row_idx < contextual_seq_len) attends to every
+          // key before max_uih_len, so it differs from a causal row only in
+          // its right column limit.
+          int const contexual_row_limit =
+              contextual_seq_len - m_block * BlockM - thread_qdim_offset;
 #pragma unroll
           for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
             if constexpr (Seqlenq_mask) {
@@ -222,29 +227,18 @@ struct Mask {
                 continue;
               }
             }
-            if constexpr (Contexual_mask) {
-              if (int(get<Qdim>(t0ScS_rowcol(m, _0{}))) <
-                  contextual_seq_len - m_block * BlockM - thread_qdim_offset) {
-#pragma unroll
-                for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
-                  int const t0_col_idx = int(get<Kdim>(t0ScS_rowcol(_0{}, n)));
-                  if (t0_col_idx >= uihlen_k_limit) {
-                    if constexpr (Softmax) {
-                      tSrS_rowcol(m, n) = -INFINITY;
-                    } else {
-                      tSrS_rowcol(m, n) = 0.0f;
-                    }
-                  }
-                }
-                continue;
-              }
-            }
+            [[maybe_unused]] bool const contexual_row = Contexual_mask &&
+                int(get<Qdim>(t0ScS_rowcol(m, _0{}))) < contexual_row_limit;
             int const row_idx = get<Qdim>(t0ScS_rowcol(m, _0{})) +
                 m_block * BlockM + thread_qdim_offset;
             if constexpr (!Target_mask) {
-              int const col_limit_right = !Seqlenk_mask
+              int col_limit_right = !Seqlenk_mask
                   ? row_idx + causal_row_offset
                   : __viaddmin_s32(row_idx, causal_row_offset, seqlen_k_limit);
+              if constexpr (Contexual_mask) {
+                col_limit_right =
+                    contexual_row ? uihlen_k_limit : col_limit_right;
+              }
 #pragma unroll
               for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
                 int const t0_col_idx = int(get<Kdim>(t0ScS_rowcol(_0{}, n)));
@@ -257,14 +251,21 @@ struct Mask {
                 }
               }
             } else {
+              int const uih_col_limit =
+                  contexual_row ? uihlen_k_limit : row_idx + causal_row_offset;
+              bool const uih_row = contexual_row || row_idx < max_uih_len;
 #pragma unroll
               for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
                 int const t0_col_idx = int(get<Kdim>(t0ScS_rowcol(_0{}, n)));
                 int const col_idx =
                     t0_col_idx + n_block * BlockN + thread_kdim_offset;
-                bool const uih_cond =
-                    (t0_col_idx >= row_idx + causal_row_offset) &&
-                    (row_idx < max_uih_len);
+                // Both forms agree when contexual_row is false. Kernels without
+                // contextual rows keep the original second form: it compiles to
+                // the same code as before, while the first form would not.
+                bool const uih_cond = Contexual_mask
+                    ? (t0_col_idx >= uih_col_limit) && uih_row
+                    : (t0_col_idx >= row_idx + causal_row_offset) &&
+                        (row_idx < max_uih_len);
                 bool const target_cond = (row_idx != col_idx) &&
                     (row_idx >= max_uih_len) && (col_idx >= max_uih_len);
                 bool const seqlen_k_cond = (t0_col_idx >= seqlen_k_limit);
