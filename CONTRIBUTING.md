@@ -38,3 +38,7 @@ outlined on that page and do not file a public issue.
 ## License
 By contributing to meta-recsys/generative-recommenders, you agree that your contributions will be licensed
 under the LICENSE file in the root directory of this source tree.
+Contributions to the Composable Kernel HSTU attention kernels in
+`generative_recommenders/ops/ck/hstu_attention/` are an exception: files under the MIT license there
+(see their headers and `generative_recommenders/ops/ck/hstu_attention/LICENSE`) are contributed under
+the MIT license.

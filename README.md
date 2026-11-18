@@ -104,6 +104,8 @@ python3 run_fractal_expansion.py --input-csv-file tmp/ml-20m/ratings.csv --write
 
 ``ops/triton`` contains triton kernels needed for efficiency experiments. ``ops/cpp`` contains efficient CUDA kernels. In particular, ``ops/cpp/hstu_attention`` contains the attention implementation based on [FlashAttention V3](https://github.com/Dao-AILab/flash-attention) with state-of-the-art efficiency on H100 GPUs.
 
+``ops/ck`` contains the HSTU attention forward and backward kernels for AMD GPUs (MI300X/MI350X), built on [Composable Kernel](https://github.com/ROCm/composable_kernel). See ``generative_recommenders/ops/ck/README.md`` for build instructions.
+
 #### HSTU Ultra attention benchmark
 
 ``ops/hstu_ultra.py`` provides named, model-derived HSTU Ultra self-attention
@@ -259,6 +261,10 @@ LOCAL_WORLD_SIZE=4 WORLD_SIZE=4 python3 generative_recommenders/dlrm_v3/inferenc
 
 ## License
 This codebase is Apache 2.0 licensed, as found in the [LICENSE](LICENSE) file.
+The Composable Kernel HSTU attention kernels in
+`generative_recommenders/ops/ck/hstu_attention/` come from AMD and are MIT
+licensed; see [their LICENSE](generative_recommenders/ops/ck/hstu_attention/LICENSE)
+and `generative_recommenders/ops/ck/README.md`.
 
 ## Contributors
 The overall project is made possible thanks to the joint work from many technical contributors (listed in alphabetical order):
