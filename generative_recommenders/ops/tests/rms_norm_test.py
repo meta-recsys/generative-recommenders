@@ -257,6 +257,67 @@ class LayerNormTest(unittest.TestCase):
         )
 
 
+class StridedGradTest(unittest.TestCase):
+    """The backward kernels read dy rows with a unit column stride."""
+
+    def _grads(
+        self,
+        name: str,
+        x0: torch.Tensor,
+        w0: torch.Tensor,
+        b0: torch.Tensor,
+        dy: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        x = x0.clone().requires_grad_(True)
+        w = w0.clone().requires_grad_(True)
+        if name == "rms":
+            y = triton_layer_norm.triton_rms_norm(x, w, 1e-6)
+        elif name == "layer":
+            y = triton_layer_norm.triton_layer_norm(x, w, b0, 1e-6)
+        else:
+            y = triton_layer_norm.triton_swish_layer_norm(x, [x.shape[-1]], w, b0, 1e-6)
+        y.backward(dy)
+        return x.grad, w.grad
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_strided_dy(self) -> None:
+        torch.manual_seed(0)
+        n, d = 1000, 256
+        for dtype in (torch.float32, torch.bfloat16):
+            x0 = torch.randn(n, d, device="cuda", dtype=dtype)
+            w0 = torch.rand(d, device="cuda", dtype=dtype) + 0.5
+            b0 = torch.randn(d, device="cuda", dtype=dtype)
+            dy0 = torch.randn(n, d, device="cuda", dtype=dtype)
+            strided = {
+                "transposed": dy0.t().contiguous().t(),
+                "col_stride_2": torch.stack([dy0, torch.full_like(dy0, 9.0)], -1)[
+                    ..., 0
+                ],
+                "expanded": dy0[:1, :1].expand(n, d),
+                "row_broadcast": dy0[:1].expand(n, d),
+            }
+            for name in ("rms", "layer", "swish_layer"):
+                for layout, dy in strided.items():
+                    with self.subTest(name=name, dtype=dtype, layout=layout):
+                        ref = self._grads(name, x0, w0, b0, dy.contiguous())
+                        got = self._grads(name, x0, w0, b0, dy)
+                        torch.testing.assert_close(got[0], ref[0])
+                        torch.testing.assert_close(got[1], ref[1])
+
+    @unittest.skipIf(*gpu_unavailable)
+    def test_layer_norm_transposed_x(self) -> None:
+        torch.manual_seed(0)
+        n, d = 1000, 256
+        x0 = torch.randn(n, d, device="cuda")
+        w0 = torch.rand(d, device="cuda") + 0.5
+        b0 = torch.randn(d, device="cuda")
+        dy = torch.randn(n, d, device="cuda")
+        ref = self._grads("layer", x0, w0, b0, dy)
+        got = self._grads("layer", x0.t().contiguous().t(), w0, b0, dy)
+        torch.testing.assert_close(got[0], ref[0])
+        torch.testing.assert_close(got[1], ref[1])
+
+
 class RMSNormAutotuneTest(unittest.TestCase):
     def test_narrow_configs_unchanged(self) -> None:
         with mock.patch.object(triton_layer_norm, "is_sm100_plus", return_value=True):

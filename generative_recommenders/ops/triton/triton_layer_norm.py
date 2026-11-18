@@ -762,6 +762,7 @@ class LayerNormFunction(torch.autograd.Function):
         bias: Optional[torch.Tensor],
         eps: float,
     ) -> torch.Tensor:
+        x = x if x.stride(-1) == 1 else x.contiguous()
         y, mean, rstd = triton_weighted_layer_norm_fwd(
             x=x,
             weight=weight,
@@ -789,6 +790,7 @@ class LayerNormFunction(torch.autograd.Function):
         else:
             x, mean, rstd = ctx.saved_tensors
             weight, bias = None, None
+        dy = dy if dy.stride(-1) == 1 else dy.contiguous()
         dx, dweight, dbias = triton_weighted_layer_norm_bwd(
             dy=dy,
             x=x,
@@ -1219,6 +1221,7 @@ def triton_weighted_rms_norm_bwd(
     Returns (dx, dweight). RMSNorm has no bias, so there is no dbias: the
     caller must return None for the bias grad.
     """
+    dy = dy if dy.stride(-1) == 1 else dy.contiguous()
     N, D = x.shape
     dx = torch.empty_like(x)
     dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
@@ -1528,6 +1531,7 @@ class SwishLayerNormFunction(torch.autograd.Function):
         ctx, dy: torch.Tensor
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], None]:
         x, weight, bias, mean, rstd = ctx.saved_tensors
+        dy = dy if dy.stride(-1) == 1 else dy.contiguous()
         N, D = x.shape
         dx = torch.empty_like(x)
         sms = torch.cuda.get_device_properties(x.device).multi_processor_count
