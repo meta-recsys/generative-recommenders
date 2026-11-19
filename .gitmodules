@@ -1,3 +1,7 @@
 [submodule "generative_recommenders/ops/cpp/cutlass"]
 	path = generative_recommenders/ops/cpp/cutlass
 	url = https://github.com/NVIDIA/cutlass.git
+[submodule "generative_recommenders/ops/ck/composable_kernel"]
+	path = generative_recommenders/ops/ck/composable_kernel
+	url = https://github.com/ROCm/composable_kernel.git
+	branch = hstu_attention_fwd_bwd

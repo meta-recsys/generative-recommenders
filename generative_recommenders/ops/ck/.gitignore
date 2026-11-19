@@ -1,0 +1,6 @@
+# Build outputs of setup.py.
+build/
+*.egg-info/
+# Hipified copies written next to the sources by PyTorch's ROCm extension build.
+*_hip.hpp
+*_hip.hip
