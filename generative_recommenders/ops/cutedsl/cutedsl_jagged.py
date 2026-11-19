@@ -3,7 +3,10 @@
     out[s:e] = jagged[s:e] @ dense[g] + bias[g]      s, e = seq_offsets[g], [g + 1]
 
 The CuTeDSL backend for `generative_recommenders.ops.jagged_tensors
-.jagged_dense_bmm_broadcast_add`, reached through `HammerKernel.CUTEDSL`. Forward only.
+.jagged_dense_bmm_broadcast_add`, reached through `HammerKernel.CUTEDSL`. Forward
+(`cutedsl_jagged_dense_bmm_broadcast_add`) and backward
+(`_cutedsl_jagged_dense_bmm_broadcast_add_djagged`,
+`_cutedsl_jagged_dense_bmm_broadcast_add_ddense_dbias`).
 
 Blackwell-native: tcgen05 MMA with `cta_group=2` over a 2x1 cluster, TMA bulk-tensor
 loads into swizzled shared memory, an fp32 accumulator in tensor memory, the bias folded
@@ -11,13 +14,15 @@ into the epilogue, and warp specialisation (4 epilogue + 1 MMA + 1 TMA warp, 192
 threads). Persistent grid-stride loop with N-fast rasterisation.
 
 Correctness gates live in generative_recommenders/ops/tests/jagged_tensors_test.py
-(test_jagged_dense_bmm_broadcast_add_cutedsl and ..._cutedsl_shapes).
+(test_jagged_dense_bmm_broadcast_add* with the CUTEDSL kernel, and
+JaggedDenseBmmBroadcastAddCuTeDSLTest).
 
 """
 
 import functools
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 
 # pyrefly: ignore [missing-import]  # cuda-bindings ships no type stubs
 import cuda.bindings.driver as cuda
@@ -26,8 +31,30 @@ import cutlass.cute as cute
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from generative_recommenders.ops.utils import is_sm100_plus
+
+
+_MIN_CUTLASS_DSL_VERSION = (4, 5, 2)
+
+
+def _check_cutlass_dsl_version(version: str) -> None:
+    nums = [int(x) for x in re.findall(r"\d+", version)[:3]]
+    found = tuple(nums + [0] * (3 - len(nums)))
+    if found < _MIN_CUTLASS_DSL_VERSION:
+        raise ImportError(
+            f"cutedsl_jagged needs nvidia-cutlass-dsl >= 4.5.2, found {version}. In fbcode, "
+            "add constraint_overrides = ["
+            '"ovr_config//third-party/pypi/nvidia-cutlass-dsl/constraints:4.5.2", '
+            '"ovr_config//third-party/cuda/constraints:13.3"] to the binary or test target.'
+        )
+
+
+@functools.lru_cache(maxsize=1)
+def _require_cutlass_dsl_version() -> None:
+    """Version gate for the entry points, run on first use rather than at import (an
+    import-time call is incompatible with lazy imports)."""
+    _check_cutlass_dsl_version(getattr(cutlass, "__version__", "0"))
 
 
 def _env_int(name: str, default: int) -> int:
@@ -52,6 +79,12 @@ class Cfg:
     epi_n: int = _env_int("KA_EPI_N", 64)
     # 3 stages. This keeps dynamic smem at 98.4 KB
     stages: int = _env_int("KA_STAGES", 3)
+    # Tile scheduling of all three kernels (fwd, d_jagged, d_dense + d_bias). 1: Cluster Launch Control -- one cluster
+    # per tile, running clusters claim tiles of clusters that have not launched, so tiles
+    # move to whichever SMs are free. 0: persistent
+    # grid of max active clusters with a fixed round-robin tile assignment, which leaves the
+    # tiles of CTAs that cannot get an SM waiting for them.
+    clc: bool = bool(_env_int("KA_CLC", 1))
 
     @property
     def cta_tile_m(self) -> int:
@@ -88,6 +121,18 @@ MMA_WARP_ID = 4
 TMA_WARP_ID = 5
 THREADS = 32 * (len(EPILOGUE_WARP_ID) + 2)  # 192
 EPILOGUE_THREADS = 32 * len(EPILOGUE_WARP_ID)  # 128
+# With Cfg.clc a fourth role, as in the upstream dense_gemm_persistent_dynamic example:
+#   6    sched    -- first CTA of each cluster only; asks the hardware for the next tile.
+SCHED_WARP_ID = 6
+THREADS_CLC = THREADS + 32  # 224
+# CUDA gridDim.y limit. The fwd and d_jagged CLC grids put real row tiles on y, so above
+# ~16.7M rows their dispatchers fall back to the static schedule.
+# TODO(follow-up): linearize those grids to 1D, x = (row tile, n tile, cta) with the n tile
+# fastest, decoded in the kernel. CLC claims x in order, so the n-fast order and its L2 reuse
+# are unchanged, and gridDim.x allows 2^31 - 1 CTAs. (CUTLASS's linearized raster puts the
+# cluster count on z, which has the same 65535 cap, so it cannot be used.) With that, index
+# the d_jagged tensormap slots by SM instead of by grid CTA, and delete the static schedule.
+_MAX_GRID_Y = 65535
 
 # NamedBarrier ids. 0 collides with __syncthreads(); 1 is the reference's epilogue sync.
 TMEM_ALLOC_BAR_ID = 2
@@ -116,6 +161,96 @@ def _ab_stages(cfg: Cfg, ab_dtype, occupancy: int = 1) -> int:
     return max(2, (cap // occupancy - mbar_helpers_bytes) // per_stage)
 
 
+def _static_work_tile(t, n_tiles, m_tiles, atom_thr, mma_v, total_tiles):
+    """Tile t of the static persistent schedule (n fastest, then m, then group rank) as a
+    WorkTileInfo in the CLC scheduler's coordinates: (CTA m = mma tile * atom_thr + this
+    CTA's v, n tile, group rank). Module level with explicit arguments because the DSL
+    rejects closures called inside dynamic control flow."""
+    return cutlass.utils.WorkTileInfo(
+        (
+            ((t // n_tiles) % m_tiles) * atom_thr + mma_v,
+            t % n_tiles,
+            (t // n_tiles) // m_tiles,
+        ),
+        t < total_tiles,
+    )
+
+
+def _static_work_tile_mfast(t, m_tiles, n_tiles, atom_thr, mma_v, total_tiles):
+    """As _static_work_tile, for the M-fastest order of the d_jagged static schedule
+    (m tile fastest, then n tile, then group)."""
+    return cutlass.utils.WorkTileInfo(
+        (
+            (t % m_tiles) * atom_thr + mma_v,
+            (t // m_tiles) % n_tiles,
+            (t // m_tiles) // n_tiles,
+        ),
+        t < total_tiles,
+    )
+
+
+def _jagged_row_tile(sTileOff, r, g_static):
+    """(group, m tile within the group, valid) of real row tile r, where sTileOff[g] is the
+    number of row tiles in groups < g (sTileOff[G] = all of them). Branch-free binary search
+    for the largest g < G with sTileOff[g] <= r; empty groups repeat their neighbour's
+    offset, so the search lands on the non-empty group that owns r."""
+    lo = cutlass.Int32(0)
+    hi = cutlass.Int32(g_static)
+    for _ in range(max(1, int(g_static).bit_length())):
+        mid = (lo + hi) // 2
+        le = sTileOff[mid] <= r
+        lo = cutlass.Int32(cutlass.select_(le, mid, lo))
+        hi = cutlass.Int32(cutlass.select_(le, hi, mid))
+    return lo, r - sTileOff[lo], r < sTileOff[g_static]
+
+
+@cute.jit
+def _build_row_tile_offsets(
+    sTileOff,
+    sLaneTot,
+    mSeq,
+    tidx,
+    warp_idx,
+    g_static: cutlass.Constexpr,
+    threads: cutlass.Constexpr,
+    mma_tile_m: cutlass.Constexpr,
+):
+    """sTileOff[g] = row tiles (of mma_tile_m rows) in groups < g, for _jagged_row_tile.
+    Every thread of the CTA must call it. Tile counts in parallel, then warp 0 scans: each
+    lane a contiguous chunk, lane 0 the 32 chunk totals, then each lane adds its chunk's
+    base. A few us per CTA at G=128."""
+    for i in cutlass.range(tidx, g_static, threads, unroll=1):
+        sTileOff[i + 1] = cutlass.Int32(
+            (mSeq[i + 1] - mSeq[i] + mma_tile_m - 1) // mma_tile_m
+        )
+    cute.arch.sync_threads()
+    if warp_idx == 0:
+        lane = tidx % 32
+        chunk = (g_static + 31) // 32
+        acc = cutlass.Int32(0)
+        for j in cutlass.range(chunk, unroll=1):
+            idx = lane * chunk + j + 1
+            if idx <= g_static:
+                acc = acc + sTileOff[idx]
+                sTileOff[idx] = acc
+        sLaneTot[lane] = acc
+        cute.arch.sync_warp()
+        if lane == 0:
+            run = cutlass.Int32(0)
+            for ln in cutlass.range(32, unroll=1):
+                lane_tot = sLaneTot[ln]
+                sLaneTot[ln] = run
+                run = run + lane_tot
+            sTileOff[0] = cutlass.Int32(0)
+        cute.arch.sync_warp()
+        base = sLaneTot[lane]
+        for j in cutlass.range(chunk, unroll=1):
+            idx = lane * chunk + j + 1
+            if idx <= g_static:
+                sTileOff[idx] = sTileOff[idx] + base
+    cute.arch.sync_threads()
+
+
 class JaggedDenseBmmBroadcastAdd:
     """The compiled kernel object, named to match the public op deliberately.
 
@@ -129,6 +264,7 @@ class JaggedDenseBmmBroadcastAdd:
         self.ab_dtype = ab_dtype
         self.acc_dtype = acc_dtype
         self.cfg = cfg
+        self.threads = THREADS_CLC if cfg.clc else THREADS
         self.cta_group = tcgen05.CtaGroup.TWO if cfg.two_cta else tcgen05.CtaGroup.ONE
         # Major mode is about which mode is CONTIGUOUS IN MEMORY, not which one we
         # contract over.
@@ -148,7 +284,7 @@ class JaggedDenseBmmBroadcastAdd:
         mBias,
         mC,
         mSeq,
-        max_seq_len: cutlass.Constexpr,
+        max_seq_len: cutlass.Int32,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -215,15 +351,21 @@ class JaggedDenseBmmBroadcastAdd:
         # m_tiles is sized by max_seq_len (the PADDED bound), matching Triton
         # (triton_jagged.py:347 `if start_m >= seq_len: return`). Tiles
         # past a group's real length are skipped at runtime.
-        #
         n_tiles = cute.ceil_div(n, cfg.tile_n)
-        # pyrefly: ignore [unsupported-operation]  # max_seq_len is a
-        # cutlass.Constexpr, which erases to Unknown for the type checker
         m_tiles = (max_seq_len + cfg.mma_tile_m - 1) // cfg.mma_tile_m
         total_clusters = m_tiles * n_tiles * g
-        # pyrefly: ignore [bad-specialization]  # Constexpr has no ordering bound
-        n_persist = min(max_active_clusters, total_clusters)
-        grid = (cfg.cluster_shape_mn[0] * n_persist, 1, 1)
+        atom_thr = cute.size(tiled_mma.thr_id.shape)
+        r_max = (cute.size(mA, mode=[0]) + cfg.mma_tile_m - 1) // cfg.mma_tile_m + g
+        tile_sched_params = cutlass.utils.ClcDynamicPersistentTileSchedulerParams(
+            (n_tiles * atom_thr, r_max, 1), (*cfg.cluster_shape_mn, 1)
+        )
+        if cutlass.const_expr(cfg.clc):
+            grid = cutlass.utils.ClcDynamicPersistentTileScheduler.get_grid_shape(
+                tile_sched_params
+            )
+        else:
+            n_persist = cutlass.max(cutlass.min(max_active_clusters, total_clusters), 1)
+            grid = (cfg.cluster_shape_mn[0] * n_persist, 1, 1)
         self.kernel(
             tiled_mma,
             tma_atom_a,
@@ -242,9 +384,11 @@ class JaggedDenseBmmBroadcastAdd:
             n_tiles,
             m_tiles,
             total_clusters,
+            tile_sched_params,
+            g,
         ).launch(
             grid=grid,
-            block=[THREADS, 1, 1],
+            block=[self.threads, 1, 1],
             cluster=(*cfg.cluster_shape_mn, 1),
             stream=stream,
         )
@@ -273,6 +417,8 @@ class JaggedDenseBmmBroadcastAdd:
         n_tiles,
         m_tiles,
         total_clusters,
+        tile_sched_params,
+        g_static: cutlass.Constexpr,
     ):
         cfg = self.cfg
         tidx, _, _ = cute.arch.thread_idx()
@@ -307,6 +453,14 @@ class JaggedDenseBmmBroadcastAdd:
         tmem_holding_buf = smem.allocate_array(cutlass.Int32, 1)
         # Freeing tmem in a 2-CTA pair needs a cross-CTA mbarrier, not just a NamedBarrier.
         tmem_dealloc_mbar = smem.allocate_array(cutlass.Int64, 1)
+        if cutlass.const_expr(cfg.clc):
+            clc_mbar = smem.allocate_array(cutlass.Int64, 2)
+            clc_response = smem.allocate_array(cutlass.Int32, 4, byte_alignment=16)
+            # Row-tile prefix sum over groups (G + 1 entries) and per-lane scan totals.
+            sTileOff = smem.allocate_tensor(
+                cutlass.Int32, cute.make_layout(g_static + 1), 16
+            )
+            sLaneTot = smem.allocate_tensor(cutlass.Int32, cute.make_layout(32), 16)
 
         # One thread issues the TMA; one arrival consumes each full barrier.
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
@@ -350,6 +504,25 @@ class JaggedDenseBmmBroadcastAdd:
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=cfg.two_cta,
         )
+
+        if cutlass.const_expr(cfg.clc):
+            # Consumers: the sched warp, plus TMA, MMA and the 4 epilogue warps of every
+            # CTA in the cluster (CTA1's idle MMA warp too, or the pipeline never drains).
+            cluster_size = cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1]
+            clc_pipeline = cutlass.pipeline.PipelineClcFetchAsync.create(
+                barrier_storage=clc_mbar,
+                num_stages=1,
+                producer_group=cutlass.pipeline.CooperativeGroup(
+                    cutlass.pipeline.Agent.Thread
+                ),
+                consumer_group=cutlass.pipeline.CooperativeGroup(
+                    cutlass.pipeline.Agent.Thread,
+                    32 * (1 + cluster_size * (len(EPILOGUE_WARP_ID) + 2)),
+                ),
+                tx_count=16,
+                cta_layout_vmnk=cluster_layout_vmnk,
+                defer_sync=cfg.two_cta,
+            )
 
         # Accumulator lives in tensor memory. With specialised warps the allocating warp
         # has to be named, as in the upstream CUTLASS Blackwell dense_gemm_persistent example: epilogue warp 0 allocates, and
@@ -435,6 +608,43 @@ class JaggedDenseBmmBroadcastAdd:
         if cutlass.const_expr(cfg.two_cta):
             cutlass.pipeline.pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
+        if cutlass.const_expr(cfg.clc):
+            _build_row_tile_offsets(
+                sTileOff,
+                sLaneTot,
+                mSeq,
+                tidx,
+                warp_idx,
+                g_static,
+                self.threads,
+                cfg.mma_tile_m,
+            )
+            tile_sched = cutlass.utils.ClcDynamicPersistentTileScheduler.create(
+                tile_sched_params,
+                cute.arch.block_idx(),
+                cute.arch.grid_dim(),
+                clc_response,
+            )
+            clc_consumer_state = cutlass.pipeline.make_pipeline_state(
+                cutlass.pipeline.PipelineUserType.Consumer, 1
+            )
+            if warp_idx == SCHED_WARP_ID and cta_rank == 0:
+                clc_producer_state = cutlass.pipeline.make_pipeline_state(
+                    cutlass.pipeline.PipelineUserType.ProducerConsumer, 1
+                )
+                work = tile_sched.initial_work_tile_info()
+                while work.is_valid_tile:
+                    clc_pipeline.producer_acquire(clc_producer_state)
+                    tile_sched.advance_to_next_work(
+                        clc_pipeline.producer_get_barrier(clc_producer_state)
+                    )
+                    clc_producer_state.advance()
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
+                clc_pipeline.producer_tail(clc_producer_state)
+
         #
         # TMA warp -- issues loads and nothing else.
         #
@@ -442,18 +652,28 @@ class JaggedDenseBmmBroadcastAdd:
         # ahead structurally, bounded only by `stages` empty buffers.
         #
         if warp_idx == TMA_WARP_ID:
-            for t in cutlass.range(cluster_id, total_clusters, n_clusters, unroll=1):
-                # Decode one linear tile index. This block is IDENTICAL in all three
-                # warp roles -- if one warp skips a tile another does not, the A/B
-                # pipeline desyncs and hangs.
-                n_tile = t % n_tiles
-                rest = t // n_tiles
-                mtile = rest % m_tiles
-                bz = rest // m_tiles
+            t = cutlass.Int32(cluster_id)
+            if cutlass.const_expr(cfg.clc):
+                work = tile_sched.initial_work_tile_info()
+            else:
+                work = _static_work_tile(
+                    t, n_tiles, m_tiles, atom_thr_size, mma_tile_coord_v, total_clusters
+                )
+            while work.is_valid_tile:
+                # Decode one tile.
+                if cutlass.const_expr(cfg.clc):
+                    n_tile = work.tile_idx[0] // atom_thr_size
+                    bz, mtile, active = _jagged_row_tile(
+                        sTileOff, work.tile_idx[1], g_static
+                    )
+                else:
+                    n_tile = work.tile_idx[1]
+                    mtile = work.tile_idx[0] // atom_thr_size
+                    bz = work.tile_idx[2]
                 seq_start = mSeq[bz]
                 seq_len = mSeq[bz + 1] - seq_start
-                # Tiles past this group's length -- and every tile of an EMPTY group.
-                active = mtile * cfg.mma_tile_m < seq_len
+                if cutlass.const_expr(not cfg.clc):
+                    active = mtile * cfg.mma_tile_m < seq_len
                 if active:
                     # A's TMA view shifted to this group's first row. domain_offset must
                     # be applied to the rank-3 (M,K,L) view BEFORE local_tile.
@@ -493,6 +713,21 @@ class JaggedDenseBmmBroadcastAdd:
                             tma_bar_ptr=producer_handle.barrier,
                             mcast_mask=b_mcast_mask,
                         )
+                if cutlass.const_expr(cfg.clc):
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
+                else:
+                    t = t + n_clusters
+                    work = _static_work_tile(
+                        t,
+                        n_tiles,
+                        m_tiles,
+                        atom_thr_size,
+                        mma_tile_coord_v,
+                        total_clusters,
+                    )
             ab_producer.tail()
 
         #
@@ -511,21 +746,30 @@ class JaggedDenseBmmBroadcastAdd:
                 acc_producer_state = cutlass.pipeline.make_pipeline_state(
                     cutlass.pipeline.PipelineUserType.Producer, NUM_ACC_STAGE
                 )
-                for t in cutlass.range(
-                    cluster_id, total_clusters, n_clusters, unroll=1
-                ):
-                    # Decode one linear tile index. This block is IDENTICAL in all three
-                    # warp roles -- if one warp skips a tile another does not, the A/B
-                    # pipeline desyncs and hangs.
-                    n_tile = t % n_tiles
-                    rest = t // n_tiles
-                    mtile = rest % m_tiles
-                    bz = rest // m_tiles
-                    seq_start = mSeq[bz]
-                    seq_len = mSeq[bz + 1] - seq_start
-                    # Tiles past this group's length -- and every tile of an EMPTY group.
-                    active = mtile * cfg.mma_tile_m < seq_len
-                    # (the MMA warp reads A/B from SMEM, so it needs no jagged offset)
+                t = cutlass.Int32(cluster_id)
+                if cutlass.const_expr(cfg.clc):
+                    work = tile_sched.initial_work_tile_info()
+                else:
+                    work = _static_work_tile(
+                        t,
+                        n_tiles,
+                        m_tiles,
+                        atom_thr_size,
+                        mma_tile_coord_v,
+                        total_clusters,
+                    )
+                while work.is_valid_tile:
+                    # Same decode as the TMA warp (the MMA warp reads A/B from SMEM, so
+                    # it needs only whether the tile is real).
+                    if cutlass.const_expr(cfg.clc):
+                        _, _, active = _jagged_row_tile(
+                            sTileOff, work.tile_idx[1], g_static
+                        )
+                    else:
+                        mtile = work.tile_idx[0] // atom_thr_size
+                        bz = work.tile_idx[2]
+                        seq_len = mSeq[bz + 1] - mSeq[bz]
+                        active = mtile * cfg.mma_tile_m < seq_len
                     if active:
                         tCtAcc = tCtAcc_base[
                             (None, None, None, acc_producer_state.index)
@@ -545,8 +789,33 @@ class JaggedDenseBmmBroadcastAdd:
 
                         acc_pipeline.producer_commit(acc_producer_state)
                         acc_producer_state.advance()
+                    if cutlass.const_expr(cfg.clc):
+                        clc_pipeline.consumer_wait(clc_consumer_state)
+                        work = tile_sched.get_current_work()
+                        clc_pipeline.consumer_release(clc_consumer_state)
+                        clc_consumer_state.advance()
+                    else:
+                        t = t + n_clusters
+                        work = _static_work_tile(
+                            t,
+                            n_tiles,
+                            m_tiles,
+                            atom_thr_size,
+                            mma_tile_coord_v,
+                            total_clusters,
+                        )
 
                 acc_pipeline.producer_tail(acc_producer_state)
+            else:
+                # CTA1's MMA warp idles (the leader's UMMAs cover both CTAs) but under CLC
+                # still consumes every response, which the pipeline counts.
+                if cutlass.const_expr(cfg.clc):
+                    work = tile_sched.initial_work_tile_info()
+                    while work.is_valid_tile:
+                        clc_pipeline.consumer_wait(clc_consumer_state)
+                        work = tile_sched.get_current_work()
+                        clc_pipeline.consumer_release(clc_consumer_state)
+                        clc_consumer_state.advance()
 
         #
         # Epilogue warps -- tmem -> registers, broadcast bias, vectorised store with a
@@ -569,14 +838,28 @@ class JaggedDenseBmmBroadcastAdd:
                 barrier_id=EPI_SYNC_BAR_ID, num_threads=EPILOGUE_THREADS
             )
 
-            for t in cutlass.range(cluster_id, total_clusters, n_clusters, unroll=1):
-                n_tile = t % n_tiles
-                rest = t // n_tiles
-                mtile = rest % m_tiles
-                bz = rest // m_tiles
+            t = cutlass.Int32(cluster_id)
+            if cutlass.const_expr(cfg.clc):
+                work = tile_sched.initial_work_tile_info()
+            else:
+                work = _static_work_tile(
+                    t, n_tiles, m_tiles, atom_thr_size, mma_tile_coord_v, total_clusters
+                )
+            while work.is_valid_tile:
+                # Same decode as the TMA warp.
+                if cutlass.const_expr(cfg.clc):
+                    n_tile = work.tile_idx[0] // atom_thr_size
+                    bz, mtile, active = _jagged_row_tile(
+                        sTileOff, work.tile_idx[1], g_static
+                    )
+                else:
+                    n_tile = work.tile_idx[1]
+                    mtile = work.tile_idx[0] // atom_thr_size
+                    bz = work.tile_idx[2]
                 seq_start = mSeq[bz]
                 seq_len = mSeq[bz + 1] - seq_start
-                active = mtile * cfg.mma_tile_m < seq_len
+                if cutlass.const_expr(not cfg.clc):
+                    active = mtile * cfg.mma_tile_m < seq_len
                 if active:
                     acc_pipeline.consumer_wait(acc_consumer_state)
                     epi_tile = (cfg.cta_tile_m, cfg.epi_n)
@@ -674,6 +957,21 @@ class JaggedDenseBmmBroadcastAdd:
                     with cute.arch.elect_one():
                         acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
+                if cutlass.const_expr(cfg.clc):
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
+                else:
+                    t = t + n_clusters
+                    work = _static_work_tile(
+                        t,
+                        n_tiles,
+                        m_tiles,
+                        atom_thr_size,
+                        mma_tile_coord_v,
+                        total_clusters,
+                    )
 
             tmem_dealloc_barrier.arrive_and_wait()
             tmem.relinquish_alloc_permit()
@@ -684,28 +982,68 @@ _COMPILED = {}
 _MAX_CLUSTERS: dict = {}
 
 
-def _max_active_clusters() -> int:
-    """CTAs the machine holds at once -- this sizes the persistent grid.
+def _max_active_clusters(cluster_size: int = 1) -> int:
+    """Clusters of `cluster_size` CTAs the machine holds at once -- this sizes the
+    persistent grid.
 
     Cached because the query is a driver call on the hot path, but keyed PER DEVICE: it
     is a device property, and a single global would size the grid for whichever GPU
     happened to be current first on a multi-GPU host.
     """
-    d = torch.cuda.current_device()
-    if d not in _MAX_CLUSTERS:
-        _MAX_CLUSTERS[d] = cutlass.utils.HardwareInfo().get_max_active_clusters(1)
-    return _MAX_CLUSTERS[d]
+    key = (torch.cuda.current_device(), cluster_size)
+    if key not in _MAX_CLUSTERS:
+        _MAX_CLUSTERS[key] = cutlass.utils.HardwareInfo().get_max_active_clusters(
+            cluster_size
+        )
+    return _MAX_CLUSTERS[key]
 
 
-def _stream():
-    """The CALLER's current stream, resolved per call -- never cached.
+_TVM_FFI = "--enable-tvm-ffi"
 
-    Caching the first stream seen per device meant that a caller running under a
-    non-default stream (torch.cuda.stream(...), a CUDA graph capture, or any library that
-    switches streams) had the kernel launched on a stale stream instead, silently breaking
-    stream ordering against their other work.
+
+def _ffi_tensor(t: torch.Tensor, align: int = 16):
+    """Compile-time signature tensor for a TVM-FFI compiled kernel."""
+    return from_dlpack(t, assumed_align=align, enable_tvm_ffi=True)
+
+
+def _env_stream():
+    return make_fake_stream(use_tvm_ffi_env_stream=True)
+
+
+def cutedsl_jagged_dense_bmm_broadcast_add_supported(
+    jagged: torch.Tensor, dense: torch.Tensor, bias: torch.Tensor
+) -> bool:
+    """Whether the CuTeDSL kernels (fwd, d_jagged, d_dense + d_bias) handle these inputs.
+
+    They are compiled for bf16 only, and TMA needs 16 B-aligned row strides, so the feature
+    dims (jagged.shape[1] and dense.shape[2]) must be multiples of 8. Other inputs give
+    silently wrong results, so ops/jagged_tensors.py falls back to Triton for them.
+    Layout (contiguity, base alignment) is not a condition: the dispatchers fix it with a copy.
     """
-    return cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    return (
+        jagged.dtype == dense.dtype == bias.dtype == torch.bfloat16
+        and jagged.shape[-1] % 8 == 0
+        and dense.shape[-1] % 8 == 0
+    )
+
+
+def _require_supported(fn: str, tensors, dims) -> None:
+    """Raise instead of computing a wrong result (see cutedsl_jagged_dense_bmm_broadcast_add_supported)."""
+    dtypes = sorted({str(t.dtype) for t in tensors if t.dtype != torch.bfloat16})
+    bad_dims = [d for d in dims if d % 8]
+    if dtypes or bad_dims:
+        raise ValueError(
+            f"{fn}: the CuTeDSL kernels need bf16 inputs and feature dims divisible by 8 "
+            f"(non-bf16 dtypes: {dtypes}, dims not divisible by 8: {bad_dims}). "
+            "Use the Triton kernel for these inputs."
+        )
+
+
+def _tma_ready(t: torch.Tensor) -> torch.Tensor:
+    """Contiguous with a 16 B-aligned base, as from_dlpack(assumed_align=16) and TMA need.
+    A no-op for ordinary tensors; a sliced view starting off a 16 B boundary is copied."""
+    t = t.contiguous()
+    return t if t.data_ptr() % 16 == 0 else t.clone()
 
 
 def _cutedsl_jagged_dense_bmm_broadcast_add_fwd(
@@ -717,6 +1055,7 @@ def _cutedsl_jagged_dense_bmm_broadcast_add_fwd(
     row offset is applied on device with cute.domain_offset, which shifts the TMA
     coordinate origin -- see the comment at the offset site in `kernel`.
     """
+    _require_cutlass_dsl_version()
     assert is_sm100_plus(), (
         "cutedsl_jagged_dense_bmm_broadcast_add requires a Blackwell datacenter GPU "
         "(sm_100-sm_103); it uses tcgen05 MMA with cta_group=2"
@@ -725,30 +1064,16 @@ def _cutedsl_jagged_dense_bmm_broadcast_add_fwd(
     g, k, n = dense.shape[0], dense.shape[1], dense.shape[2]
     total = jagged.shape[0]
     assert seq_offsets.numel() == g + 1, "seq_offsets must be (G+1,)"
-    # Assert the documented contract at the call site. Without these, fp16 fails deep
-    # inside cute.compile (which pins cutlass.BFloat16) and a non-16-divisible N/K
-    # produces misaligned TMA loads.
-    assert jagged.dtype == torch.bfloat16, (
-        f"CUTEDSL jagged_dense_bmm_broadcast_add is bf16-only, got {jagged.dtype}"
-    )
-    assert dense.dtype == torch.bfloat16 and bias.dtype == torch.bfloat16, (
-        f"dense and bias must be bf16 too, got dense={dense.dtype} bias={bias.dtype}"
-    )
     assert tuple(bias.shape) == (g, n), (
         f"bias must be (G, N) = ({g}, {n}), got {tuple(bias.shape)}"
     )
-    # Contiguity is a HARD requirement. from_dlpack bakes each tensor's
-    # strides into the compiled kernel, and only mA/mC mark mode 0 dynamic -- mB and mBias
-    # are fully static. The compile cache key carries dtypes and sizes but NOT strides.
-    assert jagged.is_contiguous(), "jagged must be contiguous"
-    assert dense.is_contiguous(), (
-        "dense must be contiguous: its strides are baked into the compiled kernel and "
-        "the compile cache is not keyed on layout"
+    _require_supported(
+        "cutedsl_jagged_dense_bmm_broadcast_add", (jagged, dense, bias), (k, n)
     )
-    assert bias.is_contiguous(), "bias must be contiguous (same reason as dense)"
-    assert k % 16 == 0 and n % 16 == 0, (
-        f"K and N must be 16-divisible (the shipped contract), got K={k} N={n}"
-    )
+    # Contiguity is a HARD requirement. from_dlpack bakes each tensor's strides into the
+    # compiled kernel, and only mA/mC mark mode 0 dynamic -- mB and mBias are fully
+    # static. The compile cache key carries dtypes and sizes but NOT strides.
+    jagged, dense, bias = _tma_ready(jagged), _tma_ready(dense), _tma_ready(bias)
 
     out = torch.empty((total, n), dtype=jagged.dtype, device=jagged.device)
 
@@ -761,48 +1086,43 @@ def _cutedsl_jagged_dense_bmm_broadcast_add_fwd(
     b3 = dense.permute(2, 1, 0)  # (N, K, G)
     bias2 = bias.permute(1, 0)  # (N, G)      unchanged
 
-    mA = from_dlpack(a3, assumed_align=16).mark_compact_shape_dynamic(
-        mode=0, stride_order=(0, 1, 2)
-    )
-    mB = from_dlpack(b3, assumed_align=16)
-    mC = from_dlpack(c3, assumed_align=16).mark_compact_shape_dynamic(
-        mode=0, stride_order=(0, 1, 2)
-    )
-    mBias = from_dlpack(bias2, assumed_align=16)
-    mSeq = from_dlpack(seq_offsets, assumed_align=8)
-
+    cfg = get_cfg()
+    if cfg.clc and -(-total // cfg.mma_tile_m) + g > _MAX_GRID_Y:
+        # The CLC grid puts row tiles on y, so M above ~16.7M rows takes the static schedule.
+        cfg = replace(cfg, clc=False)
     key = (
         torch.cuda.current_device(),
         n,
         k,
         g,
-        int(max_seq_len),
         jagged.dtype,
         seq_offsets.dtype,
+        cfg.clc,
     )
     if key not in _COMPILED:
-        op = JaggedDenseBmmBroadcastAdd(cutlass.BFloat16, cutlass.Float32, get_cfg())
+        op = JaggedDenseBmmBroadcastAdd(cutlass.BFloat16, cutlass.Float32, cfg)
         _COMPILED[key] = cute.compile(
             op,
-            mA,
-            mB,
-            mBias,
-            mC,
-            mSeq,
-            int(max_seq_len),
+            _ffi_tensor(a3).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2)),
+            _ffi_tensor(b3),
+            _ffi_tensor(bias2),
+            _ffi_tensor(c3).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2)),
+            _ffi_tensor(seq_offsets, 8),
+            cutlass.Int32(int(max_seq_len)),
             _max_active_clusters(),
-            _stream(),
+            _env_stream(),
+            options=_TVM_FFI,
         )
-    _COMPILED[key](mA, mB, mBias, mC, mSeq, _stream())
+    _COMPILED[key](a3, b3, bias2, c3, seq_offsets, int(max_seq_len))
     return out
 
 
 class _CuTeDSLJaggedDenseBmmBroadcastAddFunction(torch.autograd.Function):
-    """Forward-only autograd wrapper.
+    """Autograd wrapper: forward kernel, and the d_jagged and fused d_dense + d_bias
+    kernels for backward.
 
-    The kernel detaches its inputs so cute's from_dlpack will accept them.
-    Routing through an autograd.Function keeps the output connected
-    and turns the missing backward into a loud failure at .backward() instead.
+    The kernels detach their inputs so cute's from_dlpack will accept them; routing
+    through an autograd.Function keeps the output connected to the graph.
     """
 
     @staticmethod
@@ -815,6 +1135,8 @@ class _CuTeDSLJaggedDenseBmmBroadcastAddFunction(torch.autograd.Function):
         bias: torch.Tensor,
         max_seq_len: int,
     ) -> torch.Tensor:
+        ctx.save_for_backward(seq_offsets, jagged, dense)
+        ctx.max_seq_len = max_seq_len
         return _cutedsl_jagged_dense_bmm_broadcast_add_fwd(
             seq_offsets, jagged, dense, bias, max_seq_len
         )
@@ -822,22 +1144,1999 @@ class _CuTeDSLJaggedDenseBmmBroadcastAddFunction(torch.autograd.Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, d_out: torch.Tensor):
-        raise NotImplementedError(
-            "The CuTeDSL jagged_dense_bmm_broadcast_add backend is forward-only. "
-            "Backward needs two further kernels (dJagged, and dDense/dBias reduced over "
-            "the jagged dimension). Use HammerKernel.TRITON or HammerKernel.PYTORCH for "
-            "training."
+        seq_offsets, jagged, dense = ctx.saved_tensors
+        d_out = d_out.contiguous()
+        d_jagged = _cutedsl_jagged_dense_bmm_broadcast_add_djagged(
+            seq_offsets, d_out, dense, ctx.max_seq_len
         )
+        d_dense, d_bias = _cutedsl_jagged_dense_bmm_broadcast_add_ddense_dbias(
+            seq_offsets, jagged, d_out, ctx.max_seq_len
+        )
+        return None, d_jagged, d_dense, d_bias, None
 
 
 def cutedsl_jagged_dense_bmm_broadcast_add(
     seq_offsets, jagged, dense, bias, max_seq_len: int
 ):
-    """Blackwell CuTeDSL jagged_dense_bmm_broadcast_add. Forward only.
+    """Blackwell CuTeDSL jagged_dense_bmm_broadcast_add, forward and backward.
 
-    Public entry point for the HammerKernel.CUTEDSL dispatch. Forward works in a
-    grad-enabled context; calling .backward() on the result raises NotImplementedError.
+    Public entry point for the HammerKernel.CUTEDSL dispatch. Inputs must pass
+    cutedsl_jagged_dense_bmm_broadcast_add_supported (ValueError otherwise).
     """
     return _CuTeDSLJaggedDenseBmmBroadcastAddFunction.apply(
         seq_offsets, jagged, dense, bias, max_seq_len
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Backward kernel constants
+# ─────────────────────────────────────────────────────────────────────────────
+NUM_ACC_STAGE_JAGGED = 2
+
+_COMPILED_BWD_DJAGGED: dict = {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# d_jagged backward: d_out (M×K) @ dense[g].T (K×D) → d_jagged (M×D)
+# Each tile runs the full ceil(K / tile_k) contraction in one accumulator pass.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class JaggedDenseBmmBroadcastAddDJagged:
+    """d_jagged backward: d_out @ dense[g].T  (K-major B, no copy).
+
+    Tile scheduling (Cfg.clc): the static grid covers max_seq_len worth of row tiles for
+    every group and skips the empty ones (~4x the real tiles at blue_reels shapes), which
+    CLC cannot afford (every claim is a round trip). Under CLC the grid enumerates real row
+    tiles only: (2 * n_tiles, r_max, 1) CTAs (n tile fastest, for L2 reuse of d_out across the
+    n tiles of a row tile) with r_max = ceil(M / mma_tile_m) + G >=
+    sum_g ceil(len_g / mma_tile_m), and each CTA maps row tile r to (group, m tile) with a
+    per-group tile prefix sum it builds in SMEM at start. Row tiles past the real ones (at
+    most G per n tile) are claimed and dropped.
+    """
+
+    def __init__(self, ab_dtype, acc_dtype, cfg: Cfg):
+        from dataclasses import replace as _replace
+
+        self.ab_dtype = ab_dtype
+        self.acc_dtype = acc_dtype
+        self.cfg = _replace(cfg, stages=2)
+        self.threads = THREADS_CLC if self.cfg.clc else THREADS
+        self.cta_group = (
+            tcgen05.CtaGroup.TWO if self.cfg.two_cta else tcgen05.CtaGroup.ONE
+        )
+        self.a_major = tcgen05.OperandMajorMode.K  # d_out is K-major
+        self.b_major = tcgen05.OperandMajorMode.K  # dense.permute(1,2,0) K stride-1
+
+    @cute.jit
+    def __call__(
+        self,
+        mA,
+        mB,
+        mC,
+        mSeq,
+        max_seq_len: cutlass.Int32,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+        D_static: cutlass.Constexpr,
+        mTmapAddrs,
+    ):
+        cfg = self.cfg
+        tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.ab_dtype,
+            self.a_major,
+            self.b_major,
+            self.acc_dtype,
+            self.cta_group,
+            (cfg.mma_tile_m, cfg.tile_n),
+        )
+        mma_tiler = (cfg.mma_tile_m, cfg.tile_n, cfg.tile_k)
+        cluster_layout_vmnk = cute.tiled_divide(
+            cute.make_layout((*cfg.cluster_shape_mn, 1)), (tiled_mma.thr_id.shape,)
+        )
+        acc_shape = cute.append(
+            tiled_mma.partition_shape_C((cfg.mma_tile_m, cfg.tile_n)),
+            NUM_ACC_STAGE_JAGGED,
+        )
+        tmem_cols = cutlass.utils.get_num_tmem_alloc_cols(
+            tiled_mma.make_fragment_C(acc_shape)
+        )
+        stages = _ab_stages(cfg, self.ab_dtype)
+        a_smem_layout = sm100_utils.make_smem_layout_a(
+            tiled_mma, mma_tiler, self.ab_dtype, stages
+        )
+        b_smem_layout = sm100_utils.make_smem_layout_b(
+            tiled_mma, mma_tiler, self.ab_dtype, stages
+        )
+        a_op = sm100_utils.cluster_shape_to_tma_atom_A(
+            cfg.cluster_shape_mn, tiled_mma.thr_id
+        )
+        b_op = sm100_utils.cluster_shape_to_tma_atom_B(
+            cfg.cluster_shape_mn, tiled_mma.thr_id
+        )
+        tma_atom_a, tma_a = cute.nvgpu.make_tiled_tma_atom_A(
+            a_op,
+            mA,
+            cute.slice_(a_smem_layout, (None, None, None, 0)),
+            mma_tiler,
+            tiled_mma,
+            cluster_layout_vmnk.shape,
+        )
+        tma_atom_b, tma_b = cute.nvgpu.make_tiled_tma_atom_B(
+            b_op,
+            mB,
+            cute.slice_(b_smem_layout, (None, None, None, 0)),
+            mma_tiler,
+            tiled_mma,
+            cluster_layout_vmnk.shape,
+        )
+        n = cute.size(mC, mode=[1])
+        g = cute.size(mB, mode=[2])
+        # GEMM K is mode 1 of both A = d_out (M, K, 1) and B = dense (D, K, G). Static, so
+        # the per-tile k-loop has a compile-time trip count (12 at K=768).
+        k_tiles = cute.ceil_div(cute.size(mA, mode=[1]), cfg.tile_k)
+        n_tiles = cute.ceil_div(n, cfg.tile_n)
+        m_tiles = (max_seq_len + cfg.mma_tile_m - 1) // cfg.mma_tile_m
+        total_clusters = m_tiles * n_tiles * g
+        atom_thr = cute.size(tiled_mma.thr_id.shape)
+        r_max = (cute.size(mA, mode=[0]) + cfg.mma_tile_m - 1) // cfg.mma_tile_m + g
+        tile_sched_params = cutlass.utils.ClcDynamicPersistentTileSchedulerParams(
+            (n_tiles * atom_thr, r_max, 1), (*cfg.cluster_shape_mn, 1)
+        )
+        if cutlass.const_expr(cfg.clc):
+            grid = cutlass.utils.ClcDynamicPersistentTileScheduler.get_grid_shape(
+                tile_sched_params
+            )
+        else:
+            n_persist = cutlass.max(cutlass.min(max_active_clusters, total_clusters), 1)
+            grid = (cfg.cluster_shape_mn[0] * n_persist, 1, 1)
+
+        EPI_STAGES = 4
+        epi_tile_shape = (
+            cfg.cta_tile_m,
+            cfg.tile_n // EPI_STAGES,
+        )
+        epi_smem_staged = sm100_utils.make_smem_layout_epi(
+            self.ab_dtype,
+            cutlass.utils.LayoutEnum.ROW_MAJOR,
+            epi_tile_shape,
+            EPI_STAGES,
+        )
+        _tma_c_base = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
+            mC,
+            epi_smem_staged,
+            epi_tile_shape,
+        )
+        tma_atom_c = _tma_c_base.atom
+        tma_c = _tma_c_base.tma_tensor
+
+        self.kernel(
+            tiled_mma,
+            tma_atom_a,
+            tma_a,
+            tma_atom_b,
+            tma_b,
+            mC,
+            mSeq,
+            a_smem_layout,
+            b_smem_layout,
+            acc_shape,
+            tmem_cols,
+            cluster_layout_vmnk,
+            stages,
+            n_tiles,
+            m_tiles,
+            total_clusters,
+            tma_atom_c,
+            tma_c,
+            EPI_STAGES,
+            epi_smem_staged,
+            mTmapAddrs,
+            D_static,
+            k_tiles,
+            tile_sched_params,
+            g,
+        ).launch(
+            grid=grid,
+            block=[self.threads, 1, 1],
+            cluster=(*cfg.cluster_shape_mn, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(  # noqa: C901
+        self,
+        tiled_mma,
+        tma_atom_a,
+        mA,
+        tma_atom_b,
+        mB,
+        mC,
+        mSeq,
+        a_smem_layout,
+        b_smem_layout,
+        acc_shape: cutlass.Constexpr,
+        tmem_cols: cutlass.Constexpr,
+        cluster_layout_vmnk,
+        stages: cutlass.Constexpr,
+        n_tiles,
+        m_tiles,
+        total_clusters,
+        tma_atom_c,
+        mC_tma,
+        epi_stages: cutlass.Constexpr,
+        epi_smem_staged,
+        mTmapAddrs,
+        D_static: cutlass.Constexpr,
+        k_tiles: cutlass.Constexpr,
+        tile_sched_params,
+        g_static: cutlass.Constexpr,
+    ):
+        cfg = self.cfg
+        tidx, _, _ = cute.arch.thread_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        bx, by, bz = cute.arch.block_idx()
+        gdx, gdy, _ = cute.arch.grid_dim()
+        cta_linear = bx + by * gdx + bz * gdx * gdy
+
+        smem = cutlass.utils.SmemAllocator()
+        sA = smem.allocate_tensor(
+            self.ab_dtype, a_smem_layout.outer, 128, swizzle=a_smem_layout.inner
+        )
+        sB = smem.allocate_tensor(
+            self.ab_dtype, b_smem_layout.outer, 128, swizzle=b_smem_layout.inner
+        )
+        sD = smem.allocate_tensor(
+            element_type=self.ab_dtype,
+            layout=epi_smem_staged.outer,
+            byte_alignment=128,
+            swizzle=epi_smem_staged.inner,
+        )
+        # pyrefly: ignore [unsupported-operation]  # stages is a Constexpr
+        ab_mbar = smem.allocate_array(cutlass.Int64, 2 * stages)
+        acc_mbar = smem.allocate_array(cutlass.Int64, 2 * NUM_ACC_STAGE_JAGGED)
+        tmem_holding_buf = smem.allocate_array(cutlass.Int32, 1)
+        tmem_dealloc_mbar = smem.allocate_array(cutlass.Int64, 1)
+        if cutlass.const_expr(cfg.clc):
+            clc_mbar = smem.allocate_array(cutlass.Int64, 2)
+            clc_response = smem.allocate_array(cutlass.Int32, 4, byte_alignment=16)
+            sTileOff = smem.allocate_tensor(
+                cutlass.Int32, cute.make_layout(g_static + 1), 16
+            )
+            sLaneTot = smem.allocate_tensor(cutlass.Int32, cute.make_layout(32), 16)
+
+        atom_thr_size = cute.size(tiled_mma.thr_id.shape)
+        tx_count = atom_thr_size * (
+            cute.size_in_bytes(
+                self.ab_dtype, cute.slice_(a_smem_layout, (None, None, None, 0))
+            )
+            + cute.size_in_bytes(
+                self.ab_dtype, cute.slice_(b_smem_layout, (None, None, None, 0))
+            )
+        )
+        ab_producer, ab_consumer = cutlass.pipeline.PipelineTmaUmma.create(
+            barrier_storage=ab_mbar,
+            num_stages=stages,
+            producer_group=cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread
+            ),
+            consumer_group=cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread, 1
+            ),
+            tx_count=tx_count,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=cfg.two_cta,
+        ).make_participants()
+
+        acc_pipeline = cutlass.pipeline.PipelineUmmaAsync.create(
+            barrier_storage=acc_mbar,
+            num_stages=NUM_ACC_STAGE_JAGGED,
+            producer_group=cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread
+            ),
+            consumer_group=cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread,
+                len(EPILOGUE_WARP_ID) * (2 if cfg.two_cta else 1),
+            ),
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=cfg.two_cta,
+        )
+
+        if cutlass.const_expr(cfg.clc):
+            # Consumers: the sched warp, plus TMA, MMA and the 4 epilogue warps of every
+            # CTA in the cluster (CTA1's idle MMA warp too, or the pipeline never drains).
+            cluster_size = cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1]
+            clc_pipeline = cutlass.pipeline.PipelineClcFetchAsync.create(
+                barrier_storage=clc_mbar,
+                num_stages=1,
+                producer_group=cutlass.pipeline.CooperativeGroup(
+                    cutlass.pipeline.Agent.Thread
+                ),
+                consumer_group=cutlass.pipeline.CooperativeGroup(
+                    cutlass.pipeline.Agent.Thread,
+                    32 * (1 + cluster_size * (len(EPILOGUE_WARP_ID) + 2)),
+                ),
+                tx_count=16,
+                cta_layout_vmnk=cluster_layout_vmnk,
+                defer_sync=cfg.two_cta,
+            )
+
+        tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
+        tmem = cutlass.utils.TmemAllocator(
+            tmem_holding_buf,
+            barrier_for_retrieve=cutlass.pipeline.NamedBarrier(
+                barrier_id=TMEM_ALLOC_BAR_ID, num_threads=TMEM_ALLOC_BAR_THREADS
+            ),
+            allocator_warp_id=EPILOGUE_WARP_ID[0],
+            is_two_cta=False,
+            two_cta_tmem_dealloc_mbar_ptr=tmem_dealloc_mbar,
+        )
+        tmem_dealloc_barrier = cutlass.pipeline.NamedBarrier(
+            barrier_id=TMEM_DEALLOC_BAR_ID, num_threads=EPILOGUE_THREADS
+        )
+
+        if cutlass.const_expr(cfg.two_cta):
+            cutlass.pipeline.pipeline_init_arrive(
+                cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True
+            )
+
+        mma_tiler = (cfg.mma_tile_m, cfg.tile_n, cfg.tile_k)
+        epi_tile = (
+            cfg.cta_tile_m,
+            # pyrefly: ignore [unsupported-operation]  # epi_stages is a Constexpr
+            cfg.tile_n // epi_stages,
+        )
+
+        gB_nkl = cute.local_tile(
+            mB, cute.slice_(mma_tiler, (0, None, None)), (None, None, None)
+        )
+
+        mma_tile_coord_v = bx % cute.size(tiled_mma.thr_id.shape)
+        is_leader_cta = mma_tile_coord_v == 0
+        cluster_id = bx // cute.size(tiled_mma.thr_id.shape)
+        n_clusters = cute.arch.grid_dim()[0] // cute.size(tiled_mma.thr_id.shape)
+
+        cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        blk_in_cluster_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank)
+        thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
+        tCgB = thr_mma.partition_B(gB_nkl)
+
+        a_cta_layout = cute.make_layout(
+            cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
+        )
+        b_cta_layout = cute.make_layout(
+            cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
+        )
+        tBsB, tBgB = cpasync.tma_partition(
+            tma_atom_b,
+            blk_in_cluster_vmnk[1],
+            b_cta_layout,
+            cute.group_modes(sB, 0, 3),
+            cute.group_modes(tCgB, 0, 3),
+        )
+
+        a_mcast_mask = None
+        b_mcast_mask = None
+        if cutlass.const_expr(cfg.two_cta):
+            a_mcast_mask = cpasync.create_tma_multicast_mask(
+                cluster_layout_vmnk, blk_in_cluster_vmnk, mcast_mode=2
+            )
+            b_mcast_mask = cpasync.create_tma_multicast_mask(
+                cluster_layout_vmnk, blk_in_cluster_vmnk, mcast_mode=1
+            )
+
+        tCrA = tiled_mma.make_fragment_A(sA)
+        tCrB = tiled_mma.make_fragment_B(sB)
+
+        num_kblks = cute.size(tCrA, mode=[2])
+
+        if cutlass.const_expr(cfg.two_cta):
+            cutlass.pipeline.pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
+
+        if cutlass.const_expr(cfg.clc):
+            _build_row_tile_offsets(
+                sTileOff,
+                sLaneTot,
+                mSeq,
+                tidx,
+                warp_idx,
+                g_static,
+                self.threads,
+                cfg.mma_tile_m,
+            )
+            tile_sched = cutlass.utils.ClcDynamicPersistentTileScheduler.create(
+                tile_sched_params,
+                cute.arch.block_idx(),
+                cute.arch.grid_dim(),
+                clc_response,
+            )
+            clc_consumer_state = cutlass.pipeline.make_pipeline_state(
+                cutlass.pipeline.PipelineUserType.Consumer, 1
+            )
+            # Sched warp: claim the next tile for the whole cluster.
+            if warp_idx == SCHED_WARP_ID and cta_rank == 0:
+                clc_producer_state = cutlass.pipeline.make_pipeline_state(
+                    cutlass.pipeline.PipelineUserType.ProducerConsumer, 1
+                )
+                work = tile_sched.initial_work_tile_info()
+                while work.is_valid_tile:
+                    clc_pipeline.producer_acquire(clc_producer_state)
+                    tile_sched.advance_to_next_work(
+                        clc_pipeline.producer_get_barrier(clc_producer_state)
+                    )
+                    clc_producer_state.advance()
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
+                clc_pipeline.producer_tail(clc_producer_state)
+
+        # TMA warp: k_tiles stages per tile (static: M-fast; CLC: n-fast)
+        if warp_idx == TMA_WARP_ID:
+            t = cutlass.Int32(cluster_id)
+            if cutlass.const_expr(cfg.clc):
+                work = tile_sched.initial_work_tile_info()
+            else:
+                work = _static_work_tile_mfast(
+                    t, m_tiles, n_tiles, atom_thr_size, mma_tile_coord_v, total_clusters
+                )
+            while work.is_valid_tile:
+                if cutlass.const_expr(cfg.clc):
+                    # n-fast CLC grid: x = n tile * atom_thr + CTA v, y = real row tile.
+                    n_tile = work.tile_idx[0] // atom_thr_size
+                    bz_t, mtile, active = _jagged_row_tile(
+                        sTileOff, work.tile_idx[1], g_static
+                    )
+                else:
+                    n_tile = work.tile_idx[1]
+                    mtile = work.tile_idx[0] // atom_thr_size
+                    bz_t = work.tile_idx[2]
+                seq_start = mSeq[bz_t]
+                seq_len = mSeq[bz_t + 1] - seq_start
+                if cutlass.const_expr(not cfg.clc):
+                    active = mtile * cfg.mma_tile_m < seq_len
+                if active:
+                    mA_g = cute.domain_offset((seq_start, 0, 0), mA)
+                    gA_mkl = cute.local_tile(
+                        mA_g,
+                        cute.slice_(mma_tiler, (None, 0, None)),
+                        (None, None, None),
+                    )
+                    tAsA, tAgA = cpasync.tma_partition(
+                        tma_atom_a,
+                        blk_in_cluster_vmnk[2],
+                        a_cta_layout,
+                        cute.group_modes(sA, 0, 3),
+                        cute.group_modes(thr_mma.partition_A(gA_mkl), 0, 3),
+                    )
+                    gA = tAgA[(None, mtile, None, 0)]
+                    gB = tBgB[(None, n_tile, None, bz_t)]
+                    ab_producer.reset()
+                    for k in cutlass.range(k_tiles, unroll=1):
+                        producer_handle = ab_producer.acquire_and_advance()
+                        cute.copy(
+                            tma_atom_a,
+                            gA[(None, k)],
+                            tAsA[(None, producer_handle.index)],
+                            tma_bar_ptr=producer_handle.barrier,
+                            mcast_mask=a_mcast_mask,
+                        )
+                        cute.copy(
+                            tma_atom_b,
+                            gB[(None, k)],
+                            tBsB[(None, producer_handle.index)],
+                            tma_bar_ptr=producer_handle.barrier,
+                            mcast_mask=b_mcast_mask,
+                        )
+                if cutlass.const_expr(cfg.clc):
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
+                else:
+                    t = t + n_clusters
+                    work = _static_work_tile_mfast(
+                        t,
+                        m_tiles,
+                        n_tiles,
+                        atom_thr_size,
+                        mma_tile_coord_v,
+                        total_clusters,
+                    )
+            ab_producer.tail()
+
+        # MMA warp: k_tiles stages per tile, ACCUMULATE=False on the first
+        if warp_idx == MMA_WARP_ID:
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+            tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+            if is_leader_cta:
+                acc_producer_state = cutlass.pipeline.make_pipeline_state(
+                    cutlass.pipeline.PipelineUserType.Producer, NUM_ACC_STAGE_JAGGED
+                )
+                t = cutlass.Int32(cluster_id)
+                if cutlass.const_expr(cfg.clc):
+                    work = tile_sched.initial_work_tile_info()
+                else:
+                    work = _static_work_tile_mfast(
+                        t,
+                        m_tiles,
+                        n_tiles,
+                        atom_thr_size,
+                        mma_tile_coord_v,
+                        total_clusters,
+                    )
+                while work.is_valid_tile:
+                    if cutlass.const_expr(cfg.clc):
+                        _, _, active = _jagged_row_tile(
+                            sTileOff, work.tile_idx[1], g_static
+                        )
+                    else:
+                        mtile = work.tile_idx[0] // atom_thr_size
+                        bz_t = work.tile_idx[2]
+                        seq_len = mSeq[bz_t + 1] - mSeq[bz_t]
+                        active = mtile * cfg.mma_tile_m < seq_len
+                    if active:
+                        tCtAcc = tCtAcc_base[
+                            (None, None, None, acc_producer_state.index)
+                        ]
+                        ab_consumer.reset()
+                        acc_pipeline.producer_acquire(acc_producer_state)
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                        for _k in cutlass.range(k_tiles):
+                            consumer_handle = ab_consumer.wait_and_advance()
+                            for kb in cutlass.range_constexpr(num_kblks):
+                                crd = (None, None, kb, consumer_handle.index)
+                                cute.gemm(
+                                    tiled_mma, tCtAcc, tCrA[crd], tCrB[crd], tCtAcc
+                                )
+                                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                            consumer_handle.release()
+                        acc_pipeline.producer_commit(acc_producer_state)
+                        acc_producer_state.advance()
+                    if cutlass.const_expr(cfg.clc):
+                        clc_pipeline.consumer_wait(clc_consumer_state)
+                        work = tile_sched.get_current_work()
+                        clc_pipeline.consumer_release(clc_consumer_state)
+                        clc_consumer_state.advance()
+                    else:
+                        t = t + n_clusters
+                        work = _static_work_tile_mfast(
+                            t,
+                            m_tiles,
+                            n_tiles,
+                            atom_thr_size,
+                            mma_tile_coord_v,
+                            total_clusters,
+                        )
+                acc_pipeline.producer_tail(acc_producer_state)
+            else:
+                # CTA1's MMA warp idles (the leader's UMMAs cover both CTAs) but under CLC
+                # still consumes every response, which the pipeline counts.
+                if cutlass.const_expr(cfg.clc):
+                    work = tile_sched.initial_work_tile_info()
+                    while work.is_valid_tile:
+                        clc_pipeline.consumer_wait(clc_consumer_state)
+                        work = tile_sched.get_current_work()
+                        clc_pipeline.consumer_release(clc_consumer_state)
+                        clc_consumer_state.advance()
+
+        # Epilogue: single drain per tile — TMEM → stmatrix → sD → async TMA (per-group OOB descriptor)
+        if warp_idx < MMA_WARP_ID:
+            tmem.allocate(tmem_cols)
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+            tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+            acc_consumer_state = cutlass.pipeline.make_pipeline_state(
+                cutlass.pipeline.PipelineUserType.Consumer, NUM_ACC_STAGE_JAGGED
+            )
+            epi_sync = cutlass.pipeline.NamedBarrier(
+                barrier_id=EPI_SYNC_BAR_ID, num_threads=EPILOGUE_THREADS
+            )
+            epilogue_pipeline = cutlass.pipeline.PipelineTmaStore.create(
+                # pyrefly: ignore [bad-argument-type]  # epi_stages is a Constexpr
+                num_stages=epi_stages,
+                producer_group=cutlass.pipeline.CooperativeGroup(
+                    cutlass.pipeline.Agent.Thread
+                ),
+            )
+            epilogue_pipeline.producer_acquire()
+            _tmap_mgr_k = cutlass.utils.TensorMapManager(
+                cutlass.utils.TensorMapUpdateMode.GMEM, 128
+            )
+
+            # Prolog: initialize this CTA's private descriptor slot with the base atom
+            # (full mC shape). Per-tile update_tensormap patches the M-extent for each
+            # group before the TMA copy. One slot per CTA.
+            # Slots are 128 B apart from mTmapAddrs[0], one per CTA of the grid; the
+            # dispatcher sizes the buffer to the grid (it grows with M under CLC).
+            _cid_addr = mTmapAddrs[0] + cutlass.Int64(cta_linear) * 128
+            _slot_ptr_gmem = _tmap_mgr_k.get_tensormap_ptr(
+                cute.make_ptr(
+                    cutlass.Int64, _cid_addr, cute.AddressSpace.gmem, assumed_align=128
+                ),
+                cute.AddressSpace.gmem,
+            )
+            _slot_ptr_gen = _tmap_mgr_k.get_tensormap_ptr(
+                cute.make_ptr(
+                    cutlass.Int64, _cid_addr, cute.AddressSpace.gmem, assumed_align=128
+                ),
+                cute.AddressSpace.generic,
+            )
+            _tmap_mgr_k.init_tensormap_from_atom(tma_atom_c, _slot_ptr_gmem, warp_id=0)
+            _tmap_mgr_k.fence_tensormap_initialization()
+
+            t = cutlass.Int32(cluster_id)
+            if cutlass.const_expr(cfg.clc):
+                work = tile_sched.initial_work_tile_info()
+            else:
+                work = _static_work_tile_mfast(
+                    t, m_tiles, n_tiles, atom_thr_size, mma_tile_coord_v, total_clusters
+                )
+            while work.is_valid_tile:
+                if cutlass.const_expr(cfg.clc):
+                    # n-fast CLC grid: x = n tile * atom_thr + CTA v, y = real row tile.
+                    n_tile = work.tile_idx[0] // atom_thr_size
+                    bz_t, mtile, active = _jagged_row_tile(
+                        sTileOff, work.tile_idx[1], g_static
+                    )
+                else:
+                    n_tile = work.tile_idx[1]
+                    mtile = work.tile_idx[0] // atom_thr_size
+                    bz_t = work.tile_idx[2]
+                seq_start = mSeq[bz_t]
+                seq_len = mSeq[bz_t + 1] - seq_start
+                if cutlass.const_expr(not cfg.clc):
+                    active = mtile * cfg.mma_tile_m < seq_len
+                if active:
+                    tmem_load = sm100_utils.get_tmem_load_op(
+                        (cfg.cta_tile_m, cfg.tile_n, cfg.tile_k),
+                        cutlass.utils.LayoutEnum.ROW_MAJOR,
+                        self.ab_dtype,
+                        self.acc_dtype,
+                        epi_tile,
+                        cfg.two_cta,
+                    )
+
+                    # Single consumer_wait per tile — drain TMEM directly → stmatrix → sD
+                    acc_pipeline.consumer_wait(acc_consumer_state)
+                    tAcc_epi0 = cute.flat_divide(
+                        tCtAcc_base[((None, None), 0, 0, acc_consumer_state.index)],
+                        epi_tile,
+                    )
+                    tiled_t2r0 = tcgen05.make_tmem_copy(
+                        tmem_load, tAcc_epi0[(None, None, 0, 0)]
+                    )
+                    thr_t2r0 = tiled_t2r0.get_slice(tidx)
+                    tAcc0 = cute.group_modes(thr_t2r0.partition_S(tAcc_epi0), 3, 5)
+
+                    copy_atom_r2s = sm100_utils.get_smem_store_op(
+                        cutlass.utils.LayoutEnum.ROW_MAJOR,
+                        self.ab_dtype,
+                        self.acc_dtype,
+                        tiled_t2r0,
+                    )
+                    tiled_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_t2r0)
+                    thr_r2s = tiled_r2s.get_slice(tidx)
+                    tSD = thr_r2s.partition_D(sD)
+
+                    _fake_sc_ptr = cute.make_ptr(
+                        self.acc_dtype, 0, cute.AddressSpace.smem, assumed_align=16
+                    )
+                    _fake_sc = cute.make_tensor(
+                        _fake_sc_ptr,
+                        cute.make_layout((cfg.cta_tile_m, cfg.tile_n)),
+                    )
+                    _fake_tSC = cute.group_modes(
+                        thr_t2r0.partition_D(cute.flat_divide(_fake_sc, epi_tile)), 3, 5
+                    )
+                    frag_shape = _fake_tSC[(None, None, None, 0)].shape
+                    rAcc = cute.make_fragment(frag_shape, self.acc_dtype)
+                    rC_out = cute.make_rmem_tensor(frag_shape, self.ab_dtype)
+
+                    # TMA S2G epilogue: TMEM → sD → GMEM with per-group descriptor.
+                    # TMA hardware suppresses OOB stores (rows ≥ seq_len[g]) automatically.
+                    mC_tma_g = cute.domain_offset((seq_start, 0, 0), mC_tma)
+                    gC_mnl_tma = cute.local_tile(
+                        mC_tma_g,
+                        cute.slice_(mma_tiler, (None, None, 0)),
+                        (None, None, None),
+                    )
+                    tCgC_tma_p = thr_mma.partition_C(gC_mnl_tma)
+                    gC_full_tma = tCgC_tma_p[((None, None), 0, 0, mtile, n_tile, 0)]
+                    gC_epi_raw = cute.flat_divide(gC_full_tma, epi_tile)
+                    gC_epi = gC_epi_raw[(None, None, 0, None)]
+                    tCsD, tCgC_tma_part = cpasync.tma_partition(
+                        tma_atom_c,
+                        0,
+                        cute.make_layout(1),
+                        cute.group_modes(sD, 0, 2),
+                        cute.group_modes(gC_epi, 0, 2),
+                    )
+                    tCgC_grouped = cute.group_modes(
+                        tCgC_tma_part, 1, cute.rank(tCgC_tma_part)
+                    )
+
+                    # Update descriptor: patch M-extent to seq_offsets[g+1] so TMA suppresses
+                    # stores beyond the group boundary (OOB → NOP on the last M-tile).
+                    _seq_end = mSeq[bz_t + 1]
+                    _mC_g_upd = cute.make_tensor(
+                        mC.iterator,
+                        cute.make_layout(
+                            (_seq_end, D_static, 1), stride=(D_static, 1, 0)
+                        ),
+                    )
+                    _tmap_mgr_k.update_tensormap(
+                        (_mC_g_upd,),
+                        (tma_atom_c,),
+                        (_slot_ptr_gmem,),
+                        warp_id=0,
+                        tensormap_smem_ptr=(),
+                    )
+                    epi_sync.arrive_and_wait()
+
+                    # All 4 warps: stmatrix all sub-tiles into sD (128 threads, max throughput)
+                    for sub in cutlass.range_constexpr(cute.size(tAcc0, mode=[3])):
+                        c_buf = sub % epi_stages
+                        cute.copy(tiled_t2r0, tAcc0[(None, None, None, sub)], rAcc)
+                        rC_out.store(rAcc.load().to(self.ab_dtype))
+                        rC_retiled = tiled_r2s.retile(rC_out)
+                        cute.copy(tiled_r2s, rC_retiled, tSD[(None, None, None, c_buf)])
+
+                    cute.arch.fence_view_async_shared()
+                    with cute.arch.elect_one():
+                        acc_pipeline.consumer_release(acc_consumer_state)
+                    acc_consumer_state.advance()
+
+                    # Every warp's stmatrix into sD lands before warp 0 issues the stores.
+                    epi_sync.arrive_and_wait()
+
+                    # Warp 0: fence descriptor + all EPI_STAGES TMA stores (non-blocking with EPI_STAGES=4)
+                    if warp_idx == EPILOGUE_WARP_ID[0]:
+                        _tmap_mgr_k.fence_tensormap_update(_slot_ptr_gmem)
+                        for sub in cutlass.range_constexpr(cute.size(tAcc0, mode=[3])):
+                            c_buf = sub % epi_stages
+                            cute.copy(
+                                tma_atom_c,
+                                tCsD[(None, c_buf)],
+                                tCgC_grouped[(None, sub)],
+                                tma_desc_ptr=_slot_ptr_gen,
+                            )
+                            epilogue_pipeline.producer_commit()
+                            epilogue_pipeline.producer_acquire()
+                if cutlass.const_expr(cfg.clc):
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
+                else:
+                    t = t + n_clusters
+                    work = _static_work_tile_mfast(
+                        t,
+                        m_tiles,
+                        n_tiles,
+                        atom_thr_size,
+                        mma_tile_coord_v,
+                        total_clusters,
+                    )
+
+            epilogue_pipeline.producer_tail()
+            tmem_dealloc_barrier.arrive_and_wait()
+            tmem.relinquish_alloc_permit()
+            tmem.free(tmem_ptr)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# d_dense + d_bias backward: TMA-OOB + 2-CTA cluster UMMA, d_bias fused
+# ─────────────────────────────────────────────────────────────────────────────
+
+_COMPILED_BWD_DDENSE_DBIAS: dict = {}
+
+
+class JaggedDenseBmmBroadcastAddDDenseDBias:
+    """d_dense + d_bias backward: 2-CTA cluster UMMA.
+
+    mma_tile_m=256 across 2 CTAs (cta_tile_m=128 each), tile_n=_TILE_N.
+    TMA-OOB via TensorMapManager handles non-aligned jagged sequences.
+    Groups are scheduled longest first: each CTA ranks the group lengths in SMEM at start
+    (stable, descending), so the host does no argsort.
+    CTA1 MMA warp idles (the leader's cta_group=2 UMMA covers both CTAs).
+    One CTA per SM with a deep A/B pipeline (see _MAX_AB_STAGES).
+
+    d_bias is fused on the tensor cores: d_bias[g, k] = sum_m d_out[m, k] is the row sum
+    of A over the reduction dim, so the MMA warp also issues A (the same SMEM stage) x an
+    all-ones B of width _BIAS_N into spare TMEM columns. Each N tile does this only for its
+    own k-blocks (k_local % n_tiles == n_tile), which spreads the extra UMMAs evenly; the
+    epilogue of each CTA writes its partial row sums to (G, n_tiles, K) and the dispatcher
+    sums them in fixed order (D <= _TILE_N: one N tile, so the kernel writes the bf16 d_bias
+    directly). It rides the existing A/B and accumulator pipelines, so no extra
+    synchronisation.
+
+    Every output element is written, so the dispatcher allocates with torch.empty: tiles of
+    empty groups store zeros to d_dense, and d_bias tiles with no k-blocks of their own store
+    zero partial sums.
+
+    Tile scheduling (Cfg.clc): with Cluster Launch Control the grid is one cluster per tile,
+    (2 * m_tiles, n_tiles, G), and a sched warp in each cluster's first CTA claims the next
+    unlaunched cluster's tile (clusterlaunchcontrol.try_cancel) for every role to consume.
+    Groups are the slowest grid dim, so tiles are still claimed longest group first. The
+    static fallback walks t = cluster_id, cluster_id + n_clusters, ... over the same tiles.
+    Either way a tile's math is the same, so the outputs are bitwise identical.
+    """
+
+    _BIAS_N = 16
+    _MAX_AB_STAGES = 8
+    _MMA_TILE_M = 256
+    _TILE_N = 256
+    _EPI_STAGES_C = _TILE_N // 64  # = tile_n // epi_n
+
+    def __init__(self, ab_dtype, acc_dtype, cfg: Cfg):
+        from dataclasses import replace as _replace
+
+        self.ab_dtype = ab_dtype
+        self.acc_dtype = acc_dtype
+        self.c_dtype = ab_dtype
+        self.cfg = _replace(
+            cfg,
+            mma_tile_m=self._MMA_TILE_M,
+            two_cta=True,
+            stages=self._MAX_AB_STAGES,
+            tile_n=self._TILE_N,
+        )
+        assert self.cfg.tile_n // self.cfg.epi_n == self._EPI_STAGES_C
+        self.threads = THREADS_CLC if self.cfg.clc else THREADS
+        self.cta_group = tcgen05.CtaGroup.TWO
+        self.a_major = tcgen05.OperandMajorMode.MN
+        self.b_major = tcgen05.OperandMajorMode.MN
+
+    def _fast_epilogue(self, D_static, K_static) -> bool:
+        """Output tiles exactly (no partial tiles): direct st.global epilogue, no SMEM
+        staging. After the operand swap D_static is the MMA M extent, K_static the N."""
+        return D_static % self.cfg.mma_tile_m == 0 and K_static % self.cfg.tile_n == 0
+
+    def _num_ab_stages(self, D_static, K_static, G_static) -> int:
+        """A/B stages that fit one CTA's SMEM next to the epilogue staging, capped.
+
+        Not _ab_stages(): that counts the full tile_n of B per CTA, but with cta_group=2
+        each CTA holds only tile_n/2 columns of B, and it ignores the staging buffer.
+        32 KB per stage at tile_n=256: fast path 7, slow path (64 KB staging) 5.
+        """
+        cfg = self.cfg
+        ab_bytes = self.ab_dtype.width // 8
+        per_stage = cfg.tile_k * (cfg.cta_tile_m + cfg.tile_n // 2) * ab_bytes
+        staging = 0
+        if not self._fast_epilogue(D_static, K_static):
+            staging = (
+                cfg.cta_tile_m
+                * cfg.epi_n
+                * (self.c_dtype.width // 8)
+                * self._EPI_STAGES_C
+            )
+        ones = (self._BIAS_N // 2) * cfg.tile_k * ab_bytes
+        mbar_bytes = 1024
+        # Group lengths and the longest-first order (2 x G Int32, 16 B aligned each).
+        order_bytes = 2 * ((4 * G_static + 15) // 16 * 16)
+        budget = (
+            cutlass.utils.get_smem_capacity_in_bytes()
+            - staging
+            - ones
+            - mbar_bytes
+            - order_bytes
+        )
+        return min(self._MAX_AB_STAGES, budget // per_stage)
+
+    @cute.jit
+    def __call__(
+        self,
+        mA,
+        mB,
+        mC,
+        mDBias,  # (G, n_tiles, K) fp32 per-N-tile partial row sums; bf16 when n_tiles == 1
+        mSeq,  # (G + 1,) int32 or int64 row offsets
+        mTmapAddrsA,
+        mTmapAddrsB,
+        mTmapAddrsC,
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+        D_static: cutlass.Constexpr,
+        K_static: cutlass.Constexpr,
+    ):
+        cfg = self.cfg
+        tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.ab_dtype,
+            self.a_major,
+            self.b_major,
+            self.acc_dtype,
+            self.cta_group,
+            (cfg.mma_tile_m, cfg.tile_n),
+        )
+        mma_tiler = (cfg.mma_tile_m, cfg.tile_n, cfg.tile_k)
+        cluster_layout_vmnk = cute.tiled_divide(
+            cute.make_layout((*cfg.cluster_shape_mn, 1)), (tiled_mma.thr_id.shape,)
+        )
+        _NUM_ACC = 1
+        acc_shape = cute.append(
+            tiled_mma.partition_shape_C((cfg.mma_tile_m, cfg.tile_n)), _NUM_ACC
+        )
+        # d_bias UMMA: same A operand (MN-major), all-ones B (K-major: tile_k is the
+        # contiguous dim, so the 128B swizzle atom fits however few rows B has).
+        tiled_mma_bias = sm100_utils.make_trivial_tiled_mma(
+            self.ab_dtype,
+            self.a_major,
+            tcgen05.OperandMajorMode.K,
+            self.acc_dtype,
+            self.cta_group,
+            (cfg.mma_tile_m, self._BIAS_N),
+        )
+        bias_acc_shape = tiled_mma_bias.partition_shape_C(
+            (cfg.mma_tile_m, self._BIAS_N)
+        )
+        ones_smem_layout = sm100_utils.make_smem_layout_b(
+            tiled_mma_bias, (cfg.mma_tile_m, self._BIAS_N, cfg.tile_k), self.ab_dtype, 1
+        )
+        # Main accumulator, then the d_bias accumulator in the next TMEM columns.
+        tmem_cols = cutlass.utils.get_num_tmem_alloc_cols(
+            [
+                tiled_mma.make_fragment_C(acc_shape),
+                tiled_mma_bias.make_fragment_C(bias_acc_shape),
+            ]
+        )
+        stages = self._num_ab_stages(D_static, K_static, cute.size(mC, mode=[2]))
+        a_smem_layout = sm100_utils.make_smem_layout_a(
+            tiled_mma, mma_tiler, self.ab_dtype, stages
+        )
+        b_smem_layout = sm100_utils.make_smem_layout_b(
+            tiled_mma, mma_tiler, self.ab_dtype, stages
+        )
+        a_op = sm100_utils.cluster_shape_to_tma_atom_A(
+            cfg.cluster_shape_mn, tiled_mma.thr_id
+        )
+        b_op = sm100_utils.cluster_shape_to_tma_atom_B(
+            cfg.cluster_shape_mn, tiled_mma.thr_id
+        )
+        tma_atom_a, tma_a = cute.nvgpu.make_tiled_tma_atom_A(
+            a_op,
+            mA,
+            cute.slice_(a_smem_layout, (None, None, None, 0)),
+            mma_tiler,
+            tiled_mma,
+            cluster_layout_vmnk.shape,
+        )
+        tma_atom_b, tma_b = cute.nvgpu.make_tiled_tma_atom_B(
+            b_op,
+            mB,
+            cute.slice_(b_smem_layout, (None, None, None, 0)),
+            mma_tiler,
+            tiled_mma,
+            cluster_layout_vmnk.shape,
+        )
+        # ── TMA store for C (SMEM → GMEM epilogue) ────────────────────────────
+        _EPI_STAGES_C = self._EPI_STAGES_C
+        # Store sub-tile = the epilogue's epi_n drain width.
+        _epi_tile_c = (cfg.cta_tile_m, cfg.epi_n)
+        # COLUMN_MAJOR: first dim (cta_tile_m=128K) is fast — matches K-fast mC=[K,D,G].
+        _epi_smem_c = sm100_utils.make_smem_layout_epi(
+            self.c_dtype,
+            cutlass.utils.LayoutEnum.COL_MAJOR,
+            _epi_tile_c,
+            _EPI_STAGES_C,
+        )
+        _tma_c_base = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
+            mC,
+            _epi_smem_c,
+            _epi_tile_c,
+        )
+        tma_atom_c = _tma_c_base.atom
+        tma_c = _tma_c_base.tma_tensor
+        d_size = cute.size(mA, mode=[0])
+        k_size = cute.size(mB, mode=[0])
+        g = cute.size(mC, mode=[2])
+        m_tiles = (d_size + cfg.mma_tile_m - 1) // cfg.mma_tile_m
+        n_tiles = cute.ceil_div(k_size, cfg.tile_n)
+        total_tiles = m_tiles * n_tiles * g
+        atom_thr = cute.size(tiled_mma.thr_id.shape)
+        tile_sched_params = cutlass.utils.ClcDynamicPersistentTileSchedulerParams(
+            (m_tiles * atom_thr, n_tiles, g), (*cfg.cluster_shape_mn, 1)
+        )
+        if cutlass.const_expr(cfg.clc):
+            grid = cutlass.utils.ClcDynamicPersistentTileScheduler.get_grid_shape(
+                tile_sched_params
+            )
+        else:
+            # pyrefly: ignore [bad-specialization]  # Constexpr has no ordering bound
+            n_persist = min(max_active_clusters, total_tiles)
+            grid = (n_persist * atom_thr, 1, 1)
+        self.kernel(
+            tiled_mma,
+            tma_atom_a,
+            tma_a,
+            tma_atom_b,
+            tma_b,
+            mC,
+            mSeq,
+            mTmapAddrsA,
+            mTmapAddrsB,
+            mA,
+            mB,
+            a_smem_layout,
+            b_smem_layout,
+            acc_shape,
+            tmem_cols,
+            cluster_layout_vmnk,
+            stages,
+            n_tiles,
+            m_tiles,
+            total_tiles,
+            D_static,
+            K_static,
+            tma_atom_c,
+            tma_c,
+            _epi_smem_c,
+            _EPI_STAGES_C,
+            mTmapAddrsC,
+            mDBias,
+            tiled_mma_bias,
+            bias_acc_shape,
+            ones_smem_layout,
+            tile_sched_params,
+            g,
+        ).launch(
+            grid=grid,
+            block=[self.threads, 1, 1],
+            cluster=(*cfg.cluster_shape_mn, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(  # noqa: C901
+        self,
+        tiled_mma,
+        tma_atom_a,
+        mA,
+        tma_atom_b,
+        mB,
+        mC,
+        mSeq,
+        mTmapAddrsA,
+        mTmapAddrsB,
+        mA_gmem,
+        mB_gmem,
+        a_smem_layout,
+        b_smem_layout,
+        acc_shape: cutlass.Constexpr,
+        tmem_cols: cutlass.Constexpr,
+        cluster_layout_vmnk,
+        stages: cutlass.Constexpr,
+        n_tiles,
+        m_tiles,
+        total_tiles,
+        D_static: cutlass.Constexpr,
+        K_static: cutlass.Constexpr,
+        tma_atom_c,
+        mC_tma,
+        epi_smem_c_layout,
+        epi_stages_c: cutlass.Constexpr,
+        mTmapAddrsC,
+        mDBias,
+        tiled_mma_bias,
+        bias_acc_shape: cutlass.Constexpr,
+        ones_smem_layout,
+        tile_sched_params,
+        g_static: cutlass.Constexpr,
+    ):
+        cfg = self.cfg
+        tidx, _, _ = cute.arch.thread_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        bx, by, bz_block = cute.arch.block_idx()
+        _NUM_ACC = 1
+        # One CTA of the pair per x coordinate: the 2-CTA cluster is along grid x.
+        gdx, gdy, _ = cute.arch.grid_dim()
+        cta_linear = bx + by * gdx + bz_block * gdx * gdy
+
+        smem = cutlass.utils.SmemAllocator()
+        sA = smem.allocate_tensor(
+            self.ab_dtype, a_smem_layout.outer, 128, swizzle=a_smem_layout.inner
+        )
+        sB = smem.allocate_tensor(
+            self.ab_dtype, b_smem_layout.outer, 128, swizzle=b_smem_layout.inner
+        )
+        sOnes = smem.allocate_tensor(
+            self.ab_dtype, ones_smem_layout.outer, 1024, swizzle=ones_smem_layout.inner
+        )
+        # sC_staging only allocated for non-aligned shapes (slow TMA staging path).
+        # For aligned shapes the const_expr branch takes st.global and this is dead.
+        if cutlass.const_expr(not self._fast_epilogue(D_static, K_static)):
+            sC_staging = smem.allocate_tensor(
+                element_type=self.c_dtype,
+                layout=epi_smem_c_layout.outer
+                if hasattr(epi_smem_c_layout, "outer")
+                else epi_smem_c_layout,
+                byte_alignment=128,
+                swizzle=epi_smem_c_layout.inner
+                if hasattr(epi_smem_c_layout, "inner")
+                else None,
+            )
+        # pyrefly: ignore [unsupported-operation]  # stages is a Constexpr
+        ab_mbar = smem.allocate_array(cutlass.Int64, 2 * stages)
+        acc_mbar = smem.allocate_array(cutlass.Int64, 2 * _NUM_ACC)
+        tmem_hold = smem.allocate_array(cutlass.Int32, 1)
+        tmem_dealloc = smem.allocate_array(cutlass.Int64, 1)
+        # Group lengths and the longest-first group order (see _num_ab_stages).
+        sLen = smem.allocate_tensor(cutlass.Int32, cute.make_layout(g_static), 16)
+        sOrder = smem.allocate_tensor(cutlass.Int32, cute.make_layout(g_static), 16)
+        if cutlass.const_expr(cfg.clc):
+            clc_mbar = smem.allocate_array(cutlass.Int64, 2)
+            # try_cancel writes a 16-byte response that must be 16 B aligned.
+            clc_response = smem.allocate_array(cutlass.Int32, 4, byte_alignment=16)
+
+        atom_thr_size = cute.size(tiled_mma.thr_id.shape)
+        tx_count = atom_thr_size * (
+            cute.size_in_bytes(
+                self.ab_dtype, cute.slice_(a_smem_layout, (None, None, None, 0))
+            )
+            + cute.size_in_bytes(
+                self.ab_dtype, cute.slice_(b_smem_layout, (None, None, None, 0))
+            )
+        )
+        ab_producer, ab_consumer = cutlass.pipeline.PipelineTmaUmma.create(
+            barrier_storage=ab_mbar,
+            num_stages=stages,
+            producer_group=cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread
+            ),
+            consumer_group=cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread, 1
+            ),
+            tx_count=tx_count,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=cfg.two_cta,
+        ).make_participants()
+
+        acc_pipeline = cutlass.pipeline.PipelineUmmaAsync.create(
+            barrier_storage=acc_mbar,
+            num_stages=_NUM_ACC,
+            producer_group=cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread
+            ),
+            consumer_group=cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread,
+                len(EPILOGUE_WARP_ID) * (2 if cfg.two_cta else 1),
+            ),
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=cfg.two_cta,
+        )
+
+        if cutlass.const_expr(cfg.clc):
+            # Consumers: the sched warp, plus TMA, MMA and the 4 epilogue warps of every
+            # CTA in the cluster (CTA1's idle MMA warp too, or the pipeline never drains).
+            cluster_size = cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1]
+            clc_pipeline = cutlass.pipeline.PipelineClcFetchAsync.create(
+                barrier_storage=clc_mbar,
+                num_stages=1,
+                producer_group=cutlass.pipeline.CooperativeGroup(
+                    cutlass.pipeline.Agent.Thread
+                ),
+                consumer_group=cutlass.pipeline.CooperativeGroup(
+                    cutlass.pipeline.Agent.Thread,
+                    32 * (1 + cluster_size * (len(EPILOGUE_WARP_ID) + 2)),
+                ),
+                tx_count=16,
+                cta_layout_vmnk=cluster_layout_vmnk,
+                defer_sync=True,
+            )
+
+        for i in cutlass.range(tidx, cute.size(sOnes), self.threads, unroll=1):
+            sOnes[i] = self.ab_dtype(1.0)
+        cute.arch.fence_view_async_shared()
+
+        cutlass.pipeline.pipeline_init_arrive(
+            cluster_shape_mn=cluster_layout_vmnk, is_relaxed=False
+        )
+
+        tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
+        tCtAccBias_fake = tiled_mma_bias.make_fragment_C(bias_acc_shape)
+        bias_tmem_col = tcgen05.find_tmem_tensor_col_offset(tCtAcc_fake)
+        tmem = cutlass.utils.TmemAllocator(
+            tmem_hold,
+            barrier_for_retrieve=cutlass.pipeline.NamedBarrier(
+                barrier_id=TMEM_ALLOC_BAR_ID, num_threads=TMEM_ALLOC_BAR_THREADS
+            ),
+            allocator_warp_id=EPILOGUE_WARP_ID[0],
+            is_two_cta=True,
+            two_cta_tmem_dealloc_mbar_ptr=tmem_dealloc,
+        )
+        tmem_dealloc_barrier = cutlass.pipeline.NamedBarrier(
+            barrier_id=TMEM_DEALLOC_BAR_ID, num_threads=EPILOGUE_THREADS
+        )
+
+        mma_tiler = (cfg.mma_tile_m, cfg.tile_n, cfg.tile_k)
+        epi_tile_shape = (cfg.cta_tile_m, cfg.epi_n)
+
+        mma_tile_coord_v = bx % cute.size(tiled_mma.thr_id.shape)
+        is_leader_cta = mma_tile_coord_v == 0
+        cluster_id = bx // cute.size(tiled_mma.thr_id.shape)
+        n_clusters = cute.arch.grid_dim()[0] // cute.size(tiled_mma.thr_id.shape)
+        cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        blk_in_cluster_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank)
+        thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
+
+        a_cta_layout = cute.make_layout(
+            cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
+        )
+        b_cta_layout = cute.make_layout(
+            cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
+        )
+
+        a_mcast_mask = cpasync.create_tma_multicast_mask(
+            cluster_layout_vmnk, blk_in_cluster_vmnk, mcast_mode=2
+        )
+        b_mcast_mask = cpasync.create_tma_multicast_mask(
+            cluster_layout_vmnk, blk_in_cluster_vmnk, mcast_mode=1
+        )
+
+        tCrA = tiled_mma.make_fragment_A(sA)
+        tCrB = tiled_mma.make_fragment_B(sB)
+        num_kblks = cute.size(tCrA, mode=[2])
+
+        gA_nkl = cute.local_tile(
+            mA, cute.slice_(mma_tiler, (None, 0, None)), (None, None, None)
+        )
+        tAsA, _ = cpasync.tma_partition(
+            tma_atom_a,
+            blk_in_cluster_vmnk[2],
+            a_cta_layout,
+            cute.group_modes(sA, 0, 3),
+            cute.group_modes(thr_mma.partition_A(gA_nkl), 0, 3),
+        )
+        gB_nkl = cute.local_tile(
+            mB, cute.slice_(mma_tiler, (0, None, None)), (None, None, None)
+        )
+        tBsB, _ = cpasync.tma_partition(
+            tma_atom_b,
+            blk_in_cluster_vmnk[1],
+            b_cta_layout,
+            cute.group_modes(sB, 0, 3),
+            cute.group_modes(thr_mma.partition_B(gB_nkl), 0, 3),
+        )
+
+        cutlass.pipeline.pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
+
+        for i in cutlass.range(tidx, g_static, self.threads, unroll=1):
+            sLen[i] = cutlass.Int32(mSeq[i + 1]) - cutlass.Int32(mSeq[i])
+        cute.arch.sync_threads()
+        for i in cutlass.range(tidx, g_static, self.threads, unroll=1):
+            len_i = sLen[i]
+            rank = cutlass.Int32(0)
+            for j in cutlass.range(g_static, unroll=1):
+                len_j = sLen[j]
+                rank = rank + cutlass.Int32(
+                    cutlass.select_(
+                        (len_j > len_i) | ((len_j == len_i) & (j < i)), 1, 0
+                    )
+                )
+            sOrder[rank] = i
+        cute.arch.sync_threads()
+
+        if cutlass.const_expr(cfg.clc):
+            tile_sched = cutlass.utils.ClcDynamicPersistentTileScheduler.create(
+                tile_sched_params,
+                cute.arch.block_idx(),
+                cute.arch.grid_dim(),
+                clc_response,
+            )
+            clc_consumer_state = cutlass.pipeline.make_pipeline_state(
+                cutlass.pipeline.PipelineUserType.Consumer, 1
+            )
+
+        # ── Sched warp (CLC only): claim the next tile for the whole cluster ──
+        if cutlass.const_expr(cfg.clc):
+            if warp_idx == SCHED_WARP_ID and cta_rank == 0:
+                clc_producer_state = cutlass.pipeline.make_pipeline_state(
+                    cutlass.pipeline.PipelineUserType.ProducerConsumer, 1
+                )
+                work = tile_sched.initial_work_tile_info()
+                while work.is_valid_tile:
+                    clc_pipeline.producer_acquire(clc_producer_state)
+                    tile_sched.advance_to_next_work(
+                        clc_pipeline.producer_get_barrier(clc_producer_state)
+                    )
+                    clc_producer_state.advance()
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
+                clc_pipeline.producer_tail(clc_producer_state)
+
+        # ── TMA warp — TMA-OOB: update descriptor once per outer tile ─────────
+        if warp_idx == TMA_WARP_ID:
+            # Descriptor slots are per CTA of the grid: one CTA per tile under CLC.
+            _cid_addr_a = mTmapAddrsA[cta_linear]
+            _cid_addr_b = mTmapAddrsB[cta_linear]
+            _tmap_mgr = cutlass.utils.TensorMapManager(
+                cutlass.utils.TensorMapUpdateMode.GMEM, 128
+            )
+            _slot_a_gmem = _tmap_mgr.get_tensormap_ptr(
+                cute.make_ptr(
+                    cutlass.Int64,
+                    _cid_addr_a,
+                    cute.AddressSpace.gmem,
+                    assumed_align=128,
+                ),
+                cute.AddressSpace.gmem,
+            )
+            _slot_a_gen = _tmap_mgr.get_tensormap_ptr(
+                cute.make_ptr(
+                    cutlass.Int64,
+                    _cid_addr_a,
+                    cute.AddressSpace.gmem,
+                    assumed_align=128,
+                ),
+                cute.AddressSpace.generic,
+            )
+            _slot_b_gmem = _tmap_mgr.get_tensormap_ptr(
+                cute.make_ptr(
+                    cutlass.Int64,
+                    _cid_addr_b,
+                    cute.AddressSpace.gmem,
+                    assumed_align=128,
+                ),
+                cute.AddressSpace.gmem,
+            )
+            _slot_b_gen = _tmap_mgr.get_tensormap_ptr(
+                cute.make_ptr(
+                    cutlass.Int64,
+                    _cid_addr_b,
+                    cute.AddressSpace.gmem,
+                    assumed_align=128,
+                ),
+                cute.AddressSpace.generic,
+            )
+            cpasync.copy_tensormap(tma_atom_a, _slot_a_gmem)
+            cpasync.copy_tensormap(tma_atom_b, _slot_b_gmem)
+            cute.arch.fence_acq_rel_cta()
+
+            _mA_base_addr = mA_gmem.iterator.toint()
+            _mB_base_addr = mB_gmem.iterator.toint()
+
+            t = cutlass.Int32(cluster_id)
+            if cutlass.const_expr(cfg.clc):
+                work = tile_sched.initial_work_tile_info()
+            else:
+                work = _static_work_tile(
+                    t, n_tiles, m_tiles, atom_thr_size, mma_tile_coord_v, total_tiles
+                )
+            while work.is_valid_tile:
+                mtile = work.tile_idx[0] // atom_thr_size
+                n_tile = work.tile_idx[1]
+                bz = sOrder[work.tile_idx[2]]  # longest group first
+                seq_start = cutlass.Int32(mSeq[bz])
+                seq_len = sLen[bz]
+                if seq_len > 0:
+                    k_tiles_g = cute.ceil_div(seq_len, cfg.tile_k)
+                    _gA_g = cute.local_tile(
+                        cute.domain_offset((0, seq_start, 0), mA),
+                        cute.slice_(mma_tiler, (None, 0, None)),
+                        (None, None, None),
+                    )
+                    _, _tAgA_g = cpasync.tma_partition(
+                        tma_atom_a,
+                        blk_in_cluster_vmnk[2],
+                        a_cta_layout,
+                        cute.group_modes(sA, 0, 3),
+                        cute.group_modes(thr_mma.partition_A(_gA_g), 0, 3),
+                    )
+                    _gB_g = cute.local_tile(
+                        cute.domain_offset((0, seq_start, 0), mB),
+                        cute.slice_(mma_tiler, (0, None, None)),
+                        (None, None, None),
+                    )
+                    _, _tBgB_g = cpasync.tma_partition(
+                        tma_atom_b,
+                        blk_in_cluster_vmnk[1],
+                        b_cta_layout,
+                        cute.group_modes(sB, 0, 3),
+                        cute.group_modes(thr_mma.partition_B(_gB_g), 0, 3),
+                    )
+                    gA_m = _tAgA_g[(None, mtile, None, 0)]
+                    gB_n = _tBgB_g[(None, n_tile, None, 0)]
+
+                    _mA_upd = cute.make_tensor(
+                        cute.make_ptr(
+                            self.ab_dtype,
+                            _mA_base_addr,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ),
+                        cute.make_layout(
+                            (D_static, seq_start + seq_len, 1), stride=(1, D_static, 0)
+                        ),
+                    )
+                    _mB_upd = cute.make_tensor(
+                        cute.make_ptr(
+                            self.ab_dtype,
+                            _mB_base_addr,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ),
+                        cute.make_layout(
+                            (K_static, seq_start + seq_len, 1), stride=(1, K_static, 0)
+                        ),
+                    )
+                    _tmap_mgr.update_tensormap(
+                        (_mA_upd, _mB_upd),
+                        (tma_atom_a, tma_atom_b),
+                        (_slot_a_gmem, _slot_b_gmem),
+                        TMA_WARP_ID,
+                        (None, None),
+                    )
+                    _tmap_mgr.fence_tensormap_update(_slot_a_gen)
+                    _tmap_mgr.fence_tensormap_update(_slot_b_gen)
+
+                    ab_producer.reset()
+                    for k_local in cutlass.range(k_tiles_g, unroll=1):
+                        handle = ab_producer.acquire_and_advance()
+                        cute.copy(
+                            tma_atom_a,
+                            gA_m[(None, k_local)],
+                            tAsA[(None, handle.index)],
+                            tma_bar_ptr=handle.barrier,
+                            mcast_mask=a_mcast_mask,
+                            tma_desc_ptr=_slot_a_gen,
+                        )
+                        cute.copy(
+                            tma_atom_b,
+                            gB_n[(None, k_local)],
+                            tBsB[(None, handle.index)],
+                            tma_bar_ptr=handle.barrier,
+                            mcast_mask=b_mcast_mask,
+                            tma_desc_ptr=_slot_b_gen,
+                        )
+                if cutlass.const_expr(cfg.clc):
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
+                else:
+                    t = t + n_clusters
+                    work = _static_work_tile(
+                        t,
+                        n_tiles,
+                        m_tiles,
+                        atom_thr_size,
+                        mma_tile_coord_v,
+                        total_tiles,
+                    )
+            ab_producer.tail()
+
+        # ── MMA warp ──────────────────────────────────────────────────────────
+        if warp_idx == MMA_WARP_ID:
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+            tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+            tCtAccBias = cute.make_tensor(
+                tmem_ptr + bias_tmem_col, tCtAccBias_fake.layout
+            )
+            tCrA_bias = tiled_mma_bias.make_fragment_A(sA)
+            tCrOnes = tiled_mma_bias.make_fragment_B(sOnes)
+            if is_leader_cta:
+                acc_producer_state = cutlass.pipeline.make_pipeline_state(
+                    cutlass.pipeline.PipelineUserType.Producer, _NUM_ACC
+                )
+                t = cutlass.Int32(cluster_id)
+                if cutlass.const_expr(cfg.clc):
+                    work = tile_sched.initial_work_tile_info()
+                else:
+                    work = _static_work_tile(
+                        t,
+                        n_tiles,
+                        m_tiles,
+                        atom_thr_size,
+                        mma_tile_coord_v,
+                        total_tiles,
+                    )
+                while work.is_valid_tile:
+                    n_tile = work.tile_idx[1]
+                    bz = sOrder[work.tile_idx[2]]  # longest group first
+                    seq_len = sLen[bz]
+                    if seq_len > 0:
+                        k_tiles_g = cute.ceil_div(seq_len, cfg.tile_k)
+                        tCtAcc = tCtAcc_base[
+                            (None, None, None, acc_producer_state.index)
+                        ]
+                        ab_consumer.reset()
+                        acc_pipeline.producer_acquire(acc_producer_state)
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                        for k_local in cutlass.range(k_tiles_g, unroll=1):
+                            consumer_handle = ab_consumer.wait_and_advance()
+                            cute.arch.fence_view_async_shared()
+                            is_bias_kblk = k_local % n_tiles == n_tile
+                            for kb in cutlass.range_constexpr(num_kblks):
+                                crd = (None, None, kb, consumer_handle.index)
+                                cute.gemm(
+                                    tiled_mma, tCtAcc, tCrA[crd], tCrB[crd], tCtAcc
+                                )
+                                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                                tiled_mma_bias.set(
+                                    tcgen05.Field.ACCUMULATE, k_local > n_tile or kb > 0
+                                )
+                                if is_bias_kblk:
+                                    cute.gemm(
+                                        tiled_mma_bias,
+                                        tCtAccBias,
+                                        tCrA_bias[crd],
+                                        tCrOnes[(None, None, kb, 0)],
+                                        tCtAccBias,
+                                    )
+                            consumer_handle.release()
+                        acc_pipeline.producer_commit(acc_producer_state)
+                        acc_producer_state.advance()
+                    if cutlass.const_expr(cfg.clc):
+                        clc_pipeline.consumer_wait(clc_consumer_state)
+                        work = tile_sched.get_current_work()
+                        clc_pipeline.consumer_release(clc_consumer_state)
+                        clc_consumer_state.advance()
+                    else:
+                        t = t + n_clusters
+                        work = _static_work_tile(
+                            t,
+                            n_tiles,
+                            m_tiles,
+                            atom_thr_size,
+                            mma_tile_coord_v,
+                            total_tiles,
+                        )
+                acc_pipeline.producer_tail(acc_producer_state)
+            else:
+                # CTA1 idles: the leader's cta_group=2 UMMAs cover both CTAs. Under CLC
+                # it still consumes every response, which the pipeline counts.
+                if cutlass.const_expr(cfg.clc):
+                    work = tile_sched.initial_work_tile_info()
+                    while work.is_valid_tile:
+                        clc_pipeline.consumer_wait(clc_consumer_state)
+                        work = tile_sched.get_current_work()
+                        clc_pipeline.consumer_release(clc_consumer_state)
+                        clc_consumer_state.advance()
+
+        # ── Epilogue warps — both CTAs write their cta_tile_m D-row half ──────
+        if warp_idx < MMA_WARP_ID:
+            tmem.allocate(tmem_cols)
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+            tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+            acc_consumer_state = cutlass.pipeline.make_pipeline_state(
+                cutlass.pipeline.PipelineUserType.Consumer, _NUM_ACC
+            )
+            epi_sync = cutlass.pipeline.NamedBarrier(
+                barrier_id=EPI_SYNC_BAR_ID, num_threads=EPILOGUE_THREADS
+            )
+            # TMA store pipeline: SMEM → GMEM (epi_stages_c slots, one per epi_n sub-tile)
+            epi_tma_pipeline = cutlass.pipeline.PipelineTmaStore.create(
+                # pyrefly: ignore [bad-argument-type]  # epi_stages_c is a Constexpr
+                num_stages=epi_stages_c,
+                producer_group=cutlass.pipeline.CooperativeGroup(
+                    cutlass.pipeline.Agent.Thread
+                ),
+            )
+            epi_tma_pipeline.producer_acquire()
+            _tmap_mgr_c = cutlass.utils.TensorMapManager(
+                cutlass.utils.TensorMapUpdateMode.GMEM, 128
+            )
+            _cid_addr_c = mTmapAddrsC[cta_linear // atom_thr_size]
+            _slot_c_gmem = _tmap_mgr_c.get_tensormap_ptr(
+                cute.make_ptr(
+                    cutlass.Int64,
+                    _cid_addr_c,
+                    cute.AddressSpace.gmem,
+                    assumed_align=128,
+                ),
+                cute.AddressSpace.gmem,
+            )
+            _slot_c_gen = _tmap_mgr_c.get_tensormap_ptr(
+                cute.make_ptr(
+                    cutlass.Int64,
+                    _cid_addr_c,
+                    cute.AddressSpace.gmem,
+                    assumed_align=128,
+                ),
+                cute.AddressSpace.generic,
+            )
+            _tmap_mgr_c.init_tensormap_from_atom(tma_atom_c, _slot_c_gmem, warp_id=0)
+            _tmap_mgr_c.fence_tensormap_initialization()
+            tmem_load = sm100_utils.get_tmem_load_op(
+                (cfg.cta_tile_m, cfg.tile_n, cfg.tile_k),
+                cutlass.utils.LayoutEnum.ROW_MAJOR,
+                self.ab_dtype,
+                self.acc_dtype,
+                epi_tile_shape,
+                cfg.two_cta,
+            )
+            # d_bias readback: this CTA's (cta_tile_m, _BIAS_N) slice of the bias
+            # accumulator, one TMEM lane (= one K row) per epilogue thread.
+            tCtAccBias = cute.make_tensor(
+                tmem_ptr + bias_tmem_col, tCtAccBias_fake.layout
+            )
+            tAccBias = tCtAccBias[((None, None), 0, 0)]
+            tiled_t2r_bias = tcgen05.make_tmem_copy(
+                cute.make_copy_atom(
+                    tcgen05.Ld32x32bOp(tcgen05.Repetition.x16), self.acc_dtype
+                ),
+                tAccBias,
+            )
+            thr_t2r_bias = tiled_t2r_bias.get_slice(tidx)
+            tTR_tBias = thr_t2r_bias.partition_S(tAccBias)
+            tTR_cBias = thr_t2r_bias.partition_D(
+                cute.make_identity_tensor((cfg.cta_tile_m, self._BIAS_N))
+            )
+            rBias = cute.make_rmem_tensor(tTR_cBias.shape, self.acc_dtype)
+            bias_row = tTR_cBias[0][0]
+
+            t = cutlass.Int32(cluster_id)
+            if cutlass.const_expr(cfg.clc):
+                work = tile_sched.initial_work_tile_info()
+            else:
+                work = _static_work_tile(
+                    t, n_tiles, m_tiles, atom_thr_size, mma_tile_coord_v, total_tiles
+                )
+            while work.is_valid_tile:
+                mtile = work.tile_idx[0] // atom_thr_size
+                n_tile = work.tile_idx[1]
+                bz = sOrder[work.tile_idx[2]]  # longest group first
+                seq_len = sLen[bz]
+                has_acc = seq_len > 0
+                # 2-CTA: each CTA writes its own cta_tile_m rows.
+                m_base = mtile * cfg.mma_tile_m + mma_tile_coord_v * cfg.cta_tile_m
+
+                if has_acc:
+                    acc_pipeline.consumer_wait(acc_consumer_state)
+                bias_k = m_base + bias_row
+                if n_tile < cute.ceil_div(seq_len, cfg.tile_k):
+                    cute.copy(tiled_t2r_bias, tTR_tBias, rBias)
+                    if bias_k < D_static:
+                        mDBias[bz, n_tile, bias_k] = rBias[0].to(mDBias.element_type)
+                elif bias_k < D_static:
+                    mDBias[bz, n_tile, bias_k] = mDBias.element_type(0.0)
+                tAcc_epi0 = cute.flat_divide(
+                    tCtAcc_base[((None, None), 0, 0, acc_consumer_state.index)],
+                    epi_tile_shape,
+                )
+                tiled_t2r0 = tcgen05.make_tmem_copy(
+                    tmem_load, tAcc_epi0[(None, None, 0, 0)]
+                )
+                thr_t2r0 = tiled_t2r0.get_slice(tidx)
+                tAcc0 = cute.group_modes(thr_t2r0.partition_S(tAcc_epi0), 3, 5)
+
+                if cutlass.const_expr(self._fast_epilogue(D_static, K_static)):
+                    # ── FAST PATH: st.global (no boundary check, no SMEM staging) ──
+                    # All tiles are full — output dims exactly divide tile sizes.
+                    gC_mnl = cute.local_tile(
+                        mC,
+                        cute.slice_(mma_tiler, (None, None, 0)),
+                        (None, None, None),
+                    )
+                    tCgC = thr_mma.partition_C(gC_mnl)
+                    gC = tCgC[((None, None), 0, 0, mtile, n_tile, bz)]
+                    tC = cute.group_modes(
+                        thr_t2r0.partition_D(cute.flat_divide(gC, epi_tile_shape)),
+                        3,
+                        5,
+                    )
+                    frag_shape = tC[(None, None, None, 0)].shape
+                    rAcc = cute.make_rmem_tensor(frag_shape, self.acc_dtype)
+                    rC_out = cute.make_rmem_tensor(frag_shape, self.c_dtype)
+
+                    for sub in cutlass.range_constexpr(cute.size(tAcc0, mode=[3])):
+                        if has_acc:
+                            cute.copy(tiled_t2r0, tAcc0[(None, None, None, sub)], rAcc)
+                        else:
+                            rAcc.fill(0.0)
+                        rC_out.store(rAcc.load().to(self.c_dtype))
+                        cute.autovec_copy(rC_out, tC[(None, None, None, sub)])
+
+                    epi_sync.arrive_and_wait()
+                    if has_acc:
+                        with cute.arch.elect_one():
+                            acc_pipeline.consumer_release(acc_consumer_state)
+                        acc_consumer_state.advance()
+                    epi_sync.arrive_and_wait()
+
+                else:
+                    # ── SLOW PATH: TMA staging (non-aligned shapes, boundary suppression) ──
+                    copy_atom_r2s = sm100_utils.get_smem_store_op(
+                        cutlass.utils.LayoutEnum.COL_MAJOR,
+                        self.c_dtype,
+                        self.acc_dtype,
+                        tiled_t2r0,
+                    )
+                    tiled_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_t2r0)
+                    thr_r2s = tiled_r2s.get_slice(tidx)
+                    # pyrefly: ignore [unbound-name]  # allocated under the same const_expr(not _fast_epilogue) condition
+                    tSD = thr_r2s.partition_D(sC_staging)
+
+                    gC_mnl_tma = cute.local_tile(
+                        mC_tma,
+                        cute.slice_(mma_tiler, (None, None, 0)),
+                        (None, None, None),
+                    )
+                    tCgC_tma = thr_mma.partition_C(gC_mnl_tma)
+                    gC_full_tma = tCgC_tma[((None, None), 0, 0, mtile, n_tile, bz)]
+                    gC_epi_tma = cute.flat_divide(gC_full_tma, epi_tile_shape)
+                    bSG_sC, bSG_gC = cpasync.tma_partition(
+                        tma_atom_c,
+                        0,
+                        cute.make_layout(1),
+                        cute.group_modes(sC_staging, 0, 2),
+                        cute.group_modes(gC_epi_tma[(None, None, 0, None)], 0, 2),
+                    )
+                    bSG_gC_grouped = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
+
+                    _fake_sc_ptr = cute.make_ptr(
+                        self.acc_dtype, 0, cute.AddressSpace.smem, assumed_align=16
+                    )
+                    _fake_sc = cute.make_tensor(
+                        _fake_sc_ptr,
+                        cute.make_layout((cfg.cta_tile_m, cfg.tile_n)),
+                    )
+                    _fake_tSC = cute.group_modes(
+                        thr_t2r0.partition_D(
+                            cute.flat_divide(_fake_sc, epi_tile_shape)
+                        ),
+                        3,
+                        5,
+                    )
+                    frag_shape = _fake_tSC[(None, None, None, 0)].shape
+                    rAcc = cute.make_fragment(frag_shape, self.acc_dtype)
+                    rC_staging = cute.make_rmem_tensor(frag_shape, self.c_dtype)
+
+                    for sub in cutlass.range_constexpr(cute.size(tAcc0, mode=[3])):
+                        c_buf = sub % epi_stages_c
+                        if has_acc:
+                            cute.copy(tiled_t2r0, tAcc0[(None, None, None, sub)], rAcc)
+                        else:
+                            rAcc.fill(0.0)
+                        rC_staging.store(rAcc.load().to(self.c_dtype))
+                        rC_retiled = tiled_r2s.retile(rC_staging)
+                        cute.copy(tiled_r2s, rC_retiled, tSD[(None, None, None, c_buf)])
+
+                    cute.arch.fence_view_async_shared()
+                    if has_acc:
+                        with cute.arch.elect_one():
+                            acc_pipeline.consumer_release(acc_consumer_state)
+                        acc_consumer_state.advance()
+                    epi_sync.arrive_and_wait()
+
+                    if warp_idx == EPILOGUE_WARP_ID[0]:
+                        for sub in cutlass.range_constexpr(cute.size(tAcc0, mode=[3])):
+                            c_buf = sub % epi_stages_c
+                            cute.copy(
+                                tma_atom_c,
+                                bSG_sC[(None, c_buf)],
+                                bSG_gC_grouped[(None, sub)],
+                                tma_desc_ptr=_slot_c_gen,
+                            )
+                            epi_tma_pipeline.producer_commit()
+                            epi_tma_pipeline.producer_acquire()
+                        epi_tma_pipeline.producer_tail()
+                    epi_sync.arrive_and_wait()
+                if cutlass.const_expr(cfg.clc):
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
+                else:
+                    t = t + n_clusters
+                    work = _static_work_tile(
+                        t,
+                        n_tiles,
+                        m_tiles,
+                        atom_thr_size,
+                        mma_tile_coord_v,
+                        total_tiles,
+                    )
+
+            tmem_dealloc_barrier.arrive_and_wait()
+            tmem.relinquish_alloc_permit()
+            tmem.free(tmem_ptr)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dispatch functions
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _cutedsl_jagged_dense_bmm_broadcast_add_djagged(
+    seq_offsets: torch.Tensor,
+    d_out: torch.Tensor,
+    dense: torch.Tensor,
+    max_seq_len: int,
+) -> torch.Tensor:
+    """d_jagged = d_out @ dense[g].T  (K-major B, no copy)."""
+    _require_cutlass_dsl_version()
+    assert is_sm100_plus()
+    G, D, N = dense.shape
+    total = d_out.shape[0]
+    _require_supported(
+        "_cutedsl_jagged_dense_bmm_broadcast_add_djagged", (d_out, dense), (D, N)
+    )
+    d_out, dense = _tma_ready(d_out), _tma_ready(dense)
+    d_jagged = torch.empty((total, D), dtype=d_out.dtype, device=d_out.device)
+
+    dense_d = dense.detach()
+    b3_bwd = dense_d.permute(1, 2, 0)  # (D, K, G), K stride-1
+
+    a3 = d_out.detach().unsqueeze(-1)
+    c3 = d_jagged.unsqueeze(-1)
+
+    cfg = get_cfg()
+    r_max = -(-total // cfg.mma_tile_m) + G
+    if cfg.clc and r_max > _MAX_GRID_Y:
+        cfg = replace(cfg, clc=False)
+    key = (
+        torch.cuda.current_device(),
+        D,
+        N,
+        G,
+        d_out.dtype,
+        seq_offsets.dtype,
+        cfg.clc,
+    )
+    cluster_m = cfg.cluster_shape_mn[0]
+    if cfg.clc:
+        n_slots = cluster_m * r_max * -(-D // cfg.tile_n)
+    else:
+        n_slots = cluster_m * _max_active_clusters()
+    tmap_base = _djagged_tmap_slots(d_out.device, n_slots)
+    if key not in _COMPILED_BWD_DJAGGED:
+        op = JaggedDenseBmmBroadcastAddDJagged(cutlass.BFloat16, cutlass.Float32, cfg)
+        _COMPILED_BWD_DJAGGED[key] = cute.compile(
+            op,
+            _ffi_tensor(a3).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2)),
+            _ffi_tensor(b3_bwd),
+            _ffi_tensor(c3).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2)),
+            _ffi_tensor(seq_offsets, 8),
+            cutlass.Int32(int(max_seq_len)),
+            _max_active_clusters(),
+            _env_stream(),
+            D,
+            _ffi_tensor(tmap_base, 8).mark_layout_dynamic(),
+            options=_TVM_FFI,
+        )
+    _COMPILED_BWD_DJAGGED[key](a3, b3_bwd, c3, seq_offsets, int(max_seq_len), tmap_base)
+    return d_jagged
+
+
+_DJAGGED_TMAP_SLOTS: dict = {}
+
+
+def _djagged_tmap_slots(device: torch.device, n_slots: int) -> torch.Tensor:
+    """d_jagged's per-CTA descriptor slots, per device: a (1,) int64 tensor holding the base
+    of a buffer of >= n_slots 128 B slots (the kernel addresses slot i at base + 128 i).
+    Grown, never shrunk; the kernels on one stream run in order, so reusing the buffer
+    across launches is safe."""
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    cur = _DJAGGED_TMAP_SLOTS.get(idx)
+    if cur is None or cur[0].shape[0] < n_slots:
+        buf = torch.empty((n_slots, 128), dtype=torch.uint8, device=device)
+        base_t = torch.tensor([int(buf.data_ptr())], dtype=torch.int64, device=device)
+        cur = (buf, base_t)
+        _DJAGGED_TMAP_SLOTS[idx] = cur
+    return cur[1]
+
+
+def _cutedsl_jagged_dense_bmm_broadcast_add_ddense_dbias(
+    seq_offsets: torch.Tensor,
+    jagged: torch.Tensor,
+    d_out: torch.Tensor,
+    max_seq_len: int,
+) -> tuple:
+    """d_dense[g] = jagged[g].T @ d_out[g] and d_bias[g] = d_out[g].sum(0), fused in one
+    2-CTA kernel (TMA-OOB). Returns (d_dense, d_bias)."""
+    _require_cutlass_dsl_version()
+    assert is_sm100_plus()
+    D = jagged.shape[1]
+    G = int(seq_offsets.numel()) - 1
+    K = d_out.shape[1]
+    _require_supported(
+        "_cutedsl_jagged_dense_bmm_broadcast_add_ddense_dbias", (jagged, d_out), (D, K)
+    )
+    d_out_c = _tma_ready(d_out)
+    jagged_c = _tma_ready(jagged)
+    # Operand swap: A=d_out.T[K,M] (stride_M=1536B), B=jagged.T[D,M] (stride_M=4352B).
+    # Kernel output: C[k,d]=d_dense[g,d,k] written to mC=[K,D,G] (K-fast, COLUMN_MAJOR SMEM).
+    d_dense = torch.empty(G, D, K, dtype=jagged.dtype, device=jagged.device)
+    n_tiles_d = -(-D // JaggedDenseBmmBroadcastAddDDenseDBias._TILE_N)
+    d_bias_partial = torch.empty(
+        G,
+        n_tiles_d,
+        K,
+        dtype=torch.float32 if n_tiles_d > 1 else d_out.dtype,
+        device=jagged.device,
+    )
+    c3 = d_dense.permute(2, 1, 0)  # (K, D, G) — K-fast, correct for new A=d_out.T
+
+    _jag_3d = jagged_c.detach().permute(1, 0).unsqueeze(-1)  # (D, total_M, 1)
+    _dout_3d = d_out_c.detach().permute(1, 0).unsqueeze(-1)  # (K, total_M, 1)
+    # A = d_out.T [K, M], B = jagged.T [D, M]; int32 or int64 offsets, read on device (the
+    # dtype is in the key).
+    key = (
+        torch.cuda.current_device(),
+        D,
+        K,
+        G,
+        jagged.dtype,
+        seq_offsets.dtype,
+    )
+    n_persist = _max_active_clusters(cluster_size=2)
+
+    if key not in _COMPILED_BWD_DDENSE_DBIAS:
+        if get_cfg().clc:
+            n_clusters_grid = (
+                -(-K // JaggedDenseBmmBroadcastAddDDenseDBias._MMA_TILE_M)
+                * n_tiles_d
+                * G
+            )
+        else:
+            n_clusters_grid = n_persist
+        n_cta_slots = 2 * n_clusters_grid
+        _tmap_buf_a = torch.empty(
+            (n_cta_slots, 128), dtype=torch.uint8, device=jagged.device
+        )
+        _tmap_buf_b = torch.empty(
+            (n_cta_slots, 128), dtype=torch.uint8, device=jagged.device
+        )
+        _addrs_a = torch.tensor(
+            [int(_tmap_buf_a.data_ptr()) + i * 128 for i in range(n_cta_slots)],
+            dtype=torch.int64,
+            device=jagged.device,
+        )
+        _addrs_b = torch.tensor(
+            [int(_tmap_buf_b.data_ptr()) + i * 128 for i in range(n_cta_slots)],
+            dtype=torch.int64,
+            device=jagged.device,
+        )
+        _tmap_buf_c = torch.empty(
+            (n_clusters_grid, 128), dtype=torch.uint8, device=jagged.device
+        )
+        _addrs_c = torch.tensor(
+            [int(_tmap_buf_c.data_ptr()) + i * 128 for i in range(n_clusters_grid)],
+            dtype=torch.int64,
+            device=jagged.device,
+        )
+        op = JaggedDenseBmmBroadcastAddDDenseDBias(
+            cutlass.BFloat16, cutlass.Float32, get_cfg()
+        )
+        _COMPILED_BWD_DDENSE_DBIAS[key] = (
+            cute.compile(
+                op,
+                _ffi_tensor(_dout_3d).mark_compact_shape_dynamic(
+                    mode=1, stride_order=(2, 1, 0)
+                ),
+                _ffi_tensor(_jag_3d).mark_compact_shape_dynamic(
+                    mode=1, stride_order=(2, 1, 0)
+                ),
+                _ffi_tensor(c3),
+                _ffi_tensor(d_bias_partial),
+                _ffi_tensor(seq_offsets, 8),
+                _ffi_tensor(_addrs_a, 8).mark_layout_dynamic(),
+                _ffi_tensor(_addrs_b, 8).mark_layout_dynamic(),
+                _ffi_tensor(_addrs_c, 8).mark_layout_dynamic(),
+                n_persist,
+                _env_stream(),
+                K,
+                D,
+                options=_TVM_FFI,
+            ),
+            (_tmap_buf_a, _tmap_buf_b, _tmap_buf_c),
+            _addrs_a,
+            _addrs_b,
+            _addrs_c,
+        )
+
+    compiled, _bufs, addrs_a, addrs_b, addrs_c = _COMPILED_BWD_DDENSE_DBIAS[key]
+    compiled(
+        _dout_3d, _jag_3d, c3, d_bias_partial, seq_offsets, addrs_a, addrs_b, addrs_c
+    )
+    if n_tiles_d == 1:
+        return d_dense, d_bias_partial.view(G, K)
+    return d_dense, d_bias_partial.sum(dim=1).to(d_out.dtype)
