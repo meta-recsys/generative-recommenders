@@ -33,6 +33,12 @@ from generative_recommenders.common import (
     switch_to_contiguous_if_needed,
     triton_autotune,
 )
+from generative_recommenders.ops.triton.triton_jagged_lb import (
+    triton_concat_2D_jagged_jagged_lb_bwd,
+    triton_concat_2D_jagged_jagged_lb_fwd,
+    triton_split_2D_jagged_jagged_lb_bwd,
+    triton_split_2D_jagged_jagged_lb_fwd,
+)
 from generative_recommenders.ops.utils import is_sm90, is_sm90_plus
 from torch._inductor.runtime import triton_helpers
 
@@ -139,6 +145,41 @@ def _should_use_multirow() -> bool:
     if SPLIT_CONCAT_2D_JAGGED_USE_MULTIROW is not None:
         return SPLIT_CONCAT_2D_JAGGED_USE_MULTIROW
     return is_sm90_plus()
+
+
+SPLIT_CONCAT_2D_JAGGED_USE_LB: bool = False
+
+
+def set_split_concat_2d_jagged_lb_kernel(use_lb: bool) -> None:
+    """Route jagged+jagged concat and split to the load-balanced (LB) Triton kernels.
+
+    The LB kernels size their grid by the packed row count instead of
+    max_seq_len x B (see triton_jagged_lb.py). They cover concat without prefix
+    or replace, split without prefix (including skip_left), and their
+    backwards; every other path keeps the existing kernels.
+    """
+    global SPLIT_CONCAT_2D_JAGGED_USE_LB
+    SPLIT_CONCAT_2D_JAGGED_USE_LB = use_lb
+
+
+def _should_use_split_concat_2d_jagged_lb(
+    values: torch.Tensor,
+    offsets_a: Optional[torch.Tensor],
+    offsets_b: Optional[torch.Tensor],
+    is_replace: bool,
+    n_prefix: int,
+) -> bool:
+    # Not validated on AMD GPUs, so HIP keeps the existing kernels. Like the
+    # existing kernels, the LB kernels only copy values and accept any dtype.
+    return (
+        SPLIT_CONCAT_2D_JAGGED_USE_LB
+        and torch.version.hip is None
+        and offsets_a is not None
+        and offsets_b is not None
+        and not is_replace
+        and n_prefix == 0
+        and values.is_cuda
+    )
 
 
 def set_gln_mul_dropout_kernel(value: Optional[str]) -> None:
@@ -1766,23 +1807,37 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
             values_out = torch.empty(
                 (seq_len_a + seq_len_b, D), device=device, dtype=dtype
             )
-        _triton_concat_2D_jagged_internal(
-            values_a=values_a,
-            values_b=values_b,
-            values_out=values_out,
-            max_seq_len=max_seq_len,
-            B=B,
-            offsets_a=offsets_a,
-            offsets_b=offsets_b,
-            D=D,
-            dense_size=dense_size,
-            stride_dense_batch=stride_dense_batch,
-            n_prefix=n_prefix_from_right,
-            is_dense_a=is_dense_a,
-            is_dense_b=is_dense_b,
-            is_replace=is_replace,
-            BLOCK_D=BLOCK_D,
+        use_lb = _should_use_split_concat_2d_jagged_lb(
+            values_a, offsets_a, offsets_b, is_replace, n_prefix_from_right
         )
+        if use_lb:
+            assert offsets_a is not None and offsets_b is not None
+            triton_concat_2D_jagged_jagged_lb_fwd(
+                values_a=values_a,
+                values_b=values_b,
+                offsets_a=offsets_a,
+                offsets_b=offsets_b,
+                values_out=values_out,
+            )
+        else:
+            _triton_concat_2D_jagged_internal(
+                values_a=values_a,
+                values_b=values_b,
+                values_out=values_out,
+                max_seq_len=max_seq_len,
+                B=B,
+                offsets_a=offsets_a,
+                offsets_b=offsets_b,
+                D=D,
+                dense_size=dense_size,
+                stride_dense_batch=stride_dense_batch,
+                n_prefix=n_prefix_from_right,
+                is_dense_a=is_dense_a,
+                is_dense_b=is_dense_b,
+                is_replace=is_replace,
+                BLOCK_D=BLOCK_D,
+            )
+        ctx.use_lb = use_lb
         ctx.save_for_backward(offsets_a, offsets_b)
         ctx.max_seq_len = max_seq_len
         ctx.seq_len_a = seq_len_a
@@ -1812,28 +1867,38 @@ class _Concat2DJaggedFunction(torch.autograd.Function):
             B = offsets_a.shape[0] - 1
         _, D = d_out.shape
         BLOCK_D = triton.next_power_of_2(D)
-        values_a = torch.zeros(
-            (ctx.seq_len_a, D), device=d_out.device, dtype=d_out.dtype
-        )
+        # The LB backward writes every row of both gradients, so it skips the
+        # zero fill of values_a.
+        alloc_a = torch.empty if ctx.use_lb else torch.zeros
+        values_a = alloc_a((ctx.seq_len_a, D), device=d_out.device, dtype=d_out.dtype)
         values_b = torch.empty(
             (ctx.seq_len_b, D), device=d_out.device, dtype=d_out.dtype
         )
-        _triton_split_2D_jagged_internal(
-            jagged_in=d_out,
-            max_seq_len=ctx.max_seq_len,
-            B=B,
-            offsets_a=offsets_a,
-            offsets_b=offsets_b,
-            out_a=values_a,
-            out_b=values_b,
-            D=D,
-            dense_size=dense_size,
-            n_prefix=ctx.n_prefix_from_right,
-            is_dense_a=is_dense_a,
-            is_dense_b=is_dense_b,
-            is_replace=is_replace,
-            BLOCK_D=BLOCK_D,
-        )
+        if ctx.use_lb:
+            triton_concat_2D_jagged_jagged_lb_bwd(
+                d_out=d_out,
+                offsets_a=offsets_a,
+                offsets_b=offsets_b,
+                d_values_a=values_a,
+                d_values_b=values_b,
+            )
+        else:
+            _triton_split_2D_jagged_internal(
+                jagged_in=d_out,
+                max_seq_len=ctx.max_seq_len,
+                B=B,
+                offsets_a=offsets_a,
+                offsets_b=offsets_b,
+                out_a=values_a,
+                out_b=values_b,
+                D=D,
+                dense_size=dense_size,
+                n_prefix=ctx.n_prefix_from_right,
+                is_dense_a=is_dense_a,
+                is_dense_b=is_dense_b,
+                is_replace=is_replace,
+                BLOCK_D=BLOCK_D,
+            )
 
         if is_dense_a:
             values_a = values_a.reshape((B, dense_size, D))
@@ -1933,6 +1998,10 @@ class _Split2DJaggedFunction(torch.autograd.Function):
             "0-row buffer cannot carry the (B, dense_size, D) shape that a dense "
             "left output promises. Pass offsets_a, or leave skip_left False."
         )
+        # Decide before the dense branches below replace a None offsets.
+        use_lb = _should_use_split_concat_2d_jagged_lb(
+            values, offsets_a, offsets_b, False, n_prefix_to_right
+        )
         if is_dense_a:
             L, _ = values.shape
             assert offsets_b is not None
@@ -1990,9 +2059,10 @@ class _Split2DJaggedFunction(torch.autograd.Function):
                 f"{seq_len_a} + {seq_len_b}"
             )
         # pyre-ignore[6] Incompatible parameter type
-        if skip_left and _should_use_multirow():
+        if skip_left and (use_lb or _should_use_multirow()):
             # Every multirow kernel guards its OutA use behind `if not SKIP_LEFT`,
-            # so a 0-row buffer is never dereferenced: skip the allocation entirely.
+            # and the LB kernel writes no A rows for a 0-row buffer, so it is
+            # never dereferenced: skip the allocation entirely.
             values_a = torch.empty((0, D), device=values.device, dtype=values.dtype)
         else:
             # skip_left without multirow still needs the full buffer: the single-row
@@ -2000,24 +2070,33 @@ class _Split2DJaggedFunction(torch.autograd.Function):
             values_a = torch.empty(
                 (seq_len_a, D), device=values.device, dtype=values.dtype
             )
-        _triton_split_2D_jagged_internal(
-            jagged_in=values,
-            max_seq_len=max_seq_len,
-            B=B,
-            offsets_a=offsets_a,
-            offsets_b=offsets_b,
-            out_a=values_a,
-            out_b=values_b,
-            D=D,
-            dense_size=dense_size,
-            n_prefix=n_prefix_to_right,
-            is_dense_a=is_dense_a,
-            is_dense_b=is_dense_b,
-            is_replace=False,
-            BLOCK_D=BLOCK_D,
-            skip_left=skip_left and _should_use_multirow(),
-        )
-        if skip_left and not _should_use_multirow():
+        if use_lb:
+            triton_split_2D_jagged_jagged_lb_fwd(
+                values=values,
+                offsets_a=offsets_a,
+                offsets_b=offsets_b,
+                values_a=values_a,
+                values_b=values_b,
+            )
+        else:
+            _triton_split_2D_jagged_internal(
+                jagged_in=values,
+                max_seq_len=max_seq_len,
+                B=B,
+                offsets_a=offsets_a,
+                offsets_b=offsets_b,
+                out_a=values_a,
+                out_b=values_b,
+                D=D,
+                dense_size=dense_size,
+                n_prefix=n_prefix_to_right,
+                is_dense_a=is_dense_a,
+                is_dense_b=is_dense_b,
+                is_replace=False,
+                BLOCK_D=BLOCK_D,
+                skip_left=skip_left and _should_use_multirow(),
+            )
+        if skip_left and not use_lb and not _should_use_multirow():
             # The fallback wrote the full left output; drop it so the returned
             # shape does not depend on which kernel was dispatched.
             values_a = torch.empty((0, D), device=values.device, dtype=values.dtype)
@@ -2036,6 +2115,7 @@ class _Split2DJaggedFunction(torch.autograd.Function):
         ctx.D = D
         ctx.n_prefix_to_right = n_prefix_to_right
         ctx.skip_left = skip_left
+        ctx.use_lb = use_lb
         return values_a, values_b
 
     @staticmethod
@@ -2055,6 +2135,18 @@ class _Split2DJaggedFunction(torch.autograd.Function):
             device=values_a.device if values_a.numel() > 0 else values_b.device,
             dtype=values_b.dtype,
         )
+        if getattr(ctx, "use_lb", False):
+            # The LB kernel writes every row of dvalues; with skip_left it stores
+            # zeros over the left region without reading values_a.
+            triton_split_2D_jagged_jagged_lb_bwd(
+                d_values_a=values_a,
+                d_values_b=values_b,
+                offsets_a=offsets_a,
+                offsets_b=offsets_b,
+                d_values=dvalues,
+                skip_left=skip_left,
+            )
+            return dvalues, None, None, None, None, None, None, None, None, None
         if skip_left and not _should_use_multirow() and values_a.numel() == 0:
             # The fallback concat really loads the left region; give it real zeros.
             concat_values_a = torch.zeros(
