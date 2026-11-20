@@ -22,6 +22,14 @@ import traceback
 
 import gin
 import torch
+
+try:
+    import fbgemm_xpu  # noqa: F401  registers XPU kernels for fbgemm ops
+
+    _FBGEMM_XPU_AVAILABLE = True
+except ImportError:
+    _FBGEMM_XPU_AVAILABLE = False
+
 from generative_recommenders.dlrm_v3.checkpoint import load_dmp_checkpoint
 from generative_recommenders.dlrm_v3.train.utils import (
     cleanup,
@@ -35,7 +43,7 @@ from generative_recommenders.dlrm_v3.train.utils import (
     train_loop,
 )
 from generative_recommenders.dlrm_v3.utils import MetricsLogger
-from torch import multiprocessing as mp
+from torch import distributed as dist, multiprocessing as mp
 from torchrec.test_utils import get_free_port
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -45,6 +53,7 @@ SUPPORTED_CONFIGS = {
     "debug": "debug.gin",
     "kuairand-1k": "kuairand_1k.gin",
     "movielens-1m": "movielens_1m.gin",
+    "movielens-1m-xpu": "movielens_1m_xpu.gin",
     "movielens-20m": "movielens_20m.gin",
     "movielens-13b": "movielens_13b.gin",
     "movielens-18b": "movielens_18b.gin",
@@ -66,7 +75,16 @@ def _main_func(
     checkpoint_path: str,
     checkpoint_frequency: int | None,
 ) -> None:
-    device = torch.device(f"cuda:{rank}")
+
+    if torch.cuda.is_available():
+        device = torch.device(f"cuda:{rank}")
+    elif torch.xpu.is_available():
+        if not _FBGEMM_XPU_AVAILABLE:
+            raise ImportError("fbgemm_xpu is required to run on XPU devices")
+        device = torch.device(f"xpu:{rank}")
+    else:
+        raise ValueError("Unsupported device type")
+    
     logger.info(f"rank: {rank}, world_size: {world_size}, device: {device}")
     setup(
         rank=rank,
@@ -104,12 +122,17 @@ def _main_func(
         hstu_config=model_configs,
         embedding_table_configs=embedding_table_configs,
     )
+    
+    metrics_device, metrics_pg = device, None
+    if device.type == "xpu":
+        metrics_device, metrics_pg = torch.device("cpu"), dist.new_group(backend="gloo")
     metrics = MetricsLogger(
         multitask_configs=model_configs.multitask_configs,
         batch_size=train_dataloader.batch_size,
         window_size=2500,
-        device=device,
+        device=metrics_device,
         rank=rank,
+        process_group=metrics_pg,
     )
     load_dmp_checkpoint(
         model=model, optimizer=optimizer, metric_logger=metrics, device=device
@@ -132,8 +155,9 @@ def _main_func(
                 multitask_configs=model_configs.multitask_configs,
                 batch_size=train_dataloader.batch_size,
                 window_size=1000,
-                device=device,
+                device=metrics_device,
                 rank=rank,
+                process_group=metrics_pg,
             )
             eval_loop(
                 rank=rank,

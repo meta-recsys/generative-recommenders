@@ -247,7 +247,7 @@ class ContextualInterleavePreprocessor(InputPreprocessor):
     ]:
         max_seq_len = max_uih_len + max_targets
         with torch.autocast(
-            "cuda",
+            seq_embeddings.device.type,
             dtype=torch.bfloat16,
             enabled=(not self.is_inference and self._training_dtype == torch.bfloat16),
         ):
