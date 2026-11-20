@@ -184,47 +184,29 @@ def _ln_mul_dropout_fwd_rng(  # noqa: C901
     block_id = tl.program_id(0)
     start_row = block_id * BLOCK_N
 
-    # Create block pointers for X, U, and Y
-    X_block_ptr = tl.make_block_ptr(
-        base=X,
-        shape=(N, D),
-        strides=(stride_x, 1),
-        offsets=(start_row, 0),
-        block_shape=(BLOCK_N, BLOCK_D),
-        order=(1, 0),
-    )
-
-    U_block_ptr = tl.make_block_ptr(
-        base=U,
-        shape=(N, D),
-        strides=(stride_u, 1),
-        offsets=(start_row, 0),
-        block_shape=(BLOCK_N, BLOCK_D),
-        order=(1, 0),
-    )
-
-    # Load data blocks
-    x_block = tl.load(X_block_ptr, boundary_check=(0, 1), padding_option="zero").to(
-        tl.float32
-    )
-    u_block = tl.load(U_block_ptr, boundary_check=(0, 1), padding_option="zero").to(
-        tl.float32
-    )
-
     cols = tl.arange(0, BLOCK_D)
     col_mask = cols < D
     rows = start_row + tl.arange(0, BLOCK_N)
     row_mask = rows < N
     # Pre-compute 2D mask for reuse in dropout and masked operations
     mask_2d = row_mask[:, None] & col_mask[None, :]
+    rows_i64 = rows.to(tl.int64)
+
+    # Load data blocks
+    x_block = tl.load(
+        X + rows_i64[:, None] * stride_x + cols[None, :], mask=mask_2d, other=0.0
+    ).to(tl.float32)
+    u_block = tl.load(
+        U + rows_i64[:, None] * stride_u + cols[None, :], mask=mask_2d, other=0.0
+    ).to(tl.float32)
 
     # Pre-compute inv_D to replace divisions with multiplications (optimization)
     inv_D = 1.0 / D
 
     if IS_RMS_NORM:
         # RMSNorm normalizes by the root mean square of x itself, so there is
-        # no mean to subtract and nothing to store in Mean. The load above used
-        # padding_option="zero", so out-of-range lanes are already 0 and fall
+        # no mean to subtract and nothing to store in Mean. The masked load uses
+        # other=0.0, so out-of-range lanes are already 0 and fall
         # out of the variance sum on their own. LayerNorm still needs the mask
         # below: subtracting the mean leaves -mean in those lanes.
         x_mean = x_block
@@ -299,86 +281,21 @@ def _ln_mul_dropout_fwd_rng(  # noqa: C901
             y_keep = tl.load(RANDOM_MASK + offsets, mask=mask_2d, other=True)
             y = tl.where(y_keep, y * dropout_scale, 0.0)
 
+    # Each output segment is D columns wide; mask every segment to its own
+    # columns so padded lanes (BLOCK_D > D) never spill into the next segment.
+    y_ptrs = Y + rows_i64[:, None] * stride_y + cols[None, :]
     if CONCAT_U and CONCAT_X:
-        Y_block_ptr_u = tl.make_block_ptr(
-            base=Y,
-            shape=(N, 3 * D),
-            strides=(stride_y, 1),
-            offsets=(start_row, 0),
-            block_shape=(BLOCK_N, BLOCK_D),
-            order=(1, 0),
-        )
-
-        Y_block_ptr_x = tl.make_block_ptr(
-            base=Y,
-            shape=(N, 3 * D),
-            strides=(stride_y, 1),
-            offsets=(start_row, D),
-            block_shape=(BLOCK_N, BLOCK_D),
-            order=(1, 0),
-        )
-
-        Y_block_ptr_y = tl.make_block_ptr(
-            base=Y,
-            shape=(N, 3 * D),
-            strides=(stride_y, 1),
-            offsets=(start_row, 2 * D),
-            block_shape=(BLOCK_N, BLOCK_D),
-            order=(1, 0),
-        )
-
-        tl.store(Y_block_ptr_u, u_block.to(Y.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(Y_block_ptr_x, x_block.to(Y.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(Y_block_ptr_y, y.to(Y.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(y_ptrs, u_block.to(Y.dtype.element_ty), mask=mask_2d)
+        tl.store(y_ptrs + D, x_block.to(Y.dtype.element_ty), mask=mask_2d)
+        tl.store(y_ptrs + 2 * D, y.to(Y.dtype.element_ty), mask=mask_2d)
     elif CONCAT_U:
-        Y_block_ptr_u = tl.make_block_ptr(
-            base=Y,
-            shape=(N, 2 * D),
-            strides=(stride_y, 1),
-            offsets=(start_row, 0),
-            block_shape=(BLOCK_N, BLOCK_D),
-            order=(1, 0),
-        )
-        Y_block_ptr_y = tl.make_block_ptr(
-            base=Y,
-            shape=(N, 2 * D),
-            strides=(stride_y, 1),
-            offsets=(start_row, D),
-            block_shape=(BLOCK_N, BLOCK_D),
-            order=(1, 0),
-        )
-        tl.store(Y_block_ptr_u, u_block.to(Y.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(Y_block_ptr_y, y.to(Y.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(y_ptrs, u_block.to(Y.dtype.element_ty), mask=mask_2d)
+        tl.store(y_ptrs + D, y.to(Y.dtype.element_ty), mask=mask_2d)
     elif CONCAT_X:
-        Y_block_ptr_x = tl.make_block_ptr(
-            base=Y,
-            shape=(N, 2 * D),
-            strides=(stride_y, 1),
-            offsets=(start_row, 0),
-            block_shape=(BLOCK_N, BLOCK_D),
-            order=(1, 0),
-        )
-        Y_block_ptr_y = tl.make_block_ptr(
-            base=Y,
-            shape=(N, 2 * D),
-            strides=(stride_y, 1),
-            offsets=(start_row, D),
-            block_shape=(BLOCK_N, BLOCK_D),
-            order=(1, 0),
-        )
-        tl.store(Y_block_ptr_x, x_block.to(Y.dtype.element_ty), boundary_check=(0, 1))
-        tl.store(Y_block_ptr_y, y.to(Y.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(y_ptrs, x_block.to(Y.dtype.element_ty), mask=mask_2d)
+        tl.store(y_ptrs + D, y.to(Y.dtype.element_ty), mask=mask_2d)
     else:
-        Y_block_ptr = tl.make_block_ptr(
-            base=Y,
-            shape=(N, D),
-            strides=(stride_y, 1),
-            offsets=(start_row, 0),
-            block_shape=(BLOCK_N, BLOCK_D),
-            order=(1, 0),
-        )
-
-        tl.store(Y_block_ptr, y.to(Y.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(y_ptrs, y.to(Y.dtype.element_ty), mask=mask_2d)
 
 
 @triton.jit
