@@ -247,7 +247,7 @@ class DefaultMultitaskModule(MultitaskModule):
             return mt_preds, None, None, None
 
         with torch.autocast(
-            "cuda",
+            encoded_user_embeddings.device.type,
             dtype=torch.bfloat16,
             enabled=(not self.is_inference and self._training_dtype == torch.bfloat16),
         ):
