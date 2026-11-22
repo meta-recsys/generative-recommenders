@@ -270,7 +270,7 @@ def _hstu_output_fp8_quantize_kernel(  # noqa: C901, TR001
     stride_x,
     stride_u,
     stride_y,
-    SILU_U: tl.constexpr,
+    CONCAT_U_SILU_U: tl.constexpr,
     BLOCK_D: tl.constexpr,
     TRAINING: tl.constexpr,
     CONCAT_U: tl.constexpr,
@@ -302,7 +302,7 @@ def _hstu_output_fp8_quantize_kernel(  # noqa: C901, TR001
         y *= sigmoid_u
     else:
         y *= u
-    if CONCAT_U and SILU_U:
+    if CONCAT_U and CONCAT_U_SILU_U:
         u = silu_u
 
     tl.store(MEAN + row, mean)
@@ -434,7 +434,7 @@ def triton_hstu_output_fp8_quantize_fwd(
     eps: float,
     dropout_ratio: float,
     training: bool,
-    silu_u: bool,
+    concat_u_silu_u: bool,
     concat_u: bool,
     concat_x: bool,
     mul_u_activation_type: str,
@@ -497,7 +497,7 @@ def triton_hstu_output_fp8_quantize_fwd(
             x.stride(0),
             u.stride(0),
             output_width,
-            SILU_U=silu_u,  # pyrefly: ignore [bad-argument-type]
+            CONCAT_U_SILU_U=concat_u_silu_u,  # pyrefly: ignore [bad-argument-type]
             BLOCK_D=block_width,  # pyrefly: ignore [bad-argument-type]
             TRAINING=training,  # pyrefly: ignore [bad-argument-type]
             CONCAT_U=concat_u,  # pyrefly: ignore [bad-argument-type]
