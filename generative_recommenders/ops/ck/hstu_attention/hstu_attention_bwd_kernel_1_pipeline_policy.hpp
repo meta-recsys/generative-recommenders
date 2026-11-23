@@ -10,9 +10,9 @@
 #include <ck_tile/ops/gemm/pipeline/tile_gemm_shape.hpp>
 #include <ck_tile/ops/gemm/warp/warp_gemm_dispatcher.hpp>
 
-#include "block_gemm_areg_bsmem_creg_v2_hack_0.hpp"
-#include "block_gemm_areg_bsmem_creg_v2_hack_1.hpp"
-#include "block_gemm_areg_bsmem_trload_creg_v2_hack_1.hpp"
+#include "block_gemm_areg_bsmem_creg_full_gemmk_slice_gemmn.hpp"
+#include "block_gemm_areg_bsmem_creg_slice_gemmk_full_gemmn.hpp"
+#include "block_gemm_areg_bsmem_trload_creg_slice_gemmk_full_gemmn.hpp"
 #include "block_gemm_tdm_group_prefetch.hpp"
 
 #include "hstu_attention_config.hpp"
@@ -990,11 +990,8 @@ struct HstuAttentionBwdKernel1PipelinePolicy {
           GetSmemSizeKT<Problem>() + GetSmemSizeDropout<Problem>();
     } else {
       if constexpr (kUseDirectLds) {
-        // k_lds is ping-pong double-buffered (two regions); v_lds is a single
-        // circular buffer (NumKVLdsBuffers slots inside one region), so V is
-        // counted once.
         return GetSmemSizeK<Problem, kUseTrLoad, true /*kUseDirectLds*/>() * 2 +
-            GetSmemSizeV<Problem, true /*kUseDirectLds*/>() +
+            GetSmemSizeV<Problem, true /*kUseDirectLds*/>() * 2 +
             GetSmemSizeDropout<Problem>();
       } else {
         return GetSmemSizeK<Problem, kUseTrLoad>() + GetSmemSizeV<Problem>() +
@@ -1093,13 +1090,15 @@ struct HstuAttentionBwdKernel1PipelinePolicy {
     constexpr index_t kTdmGemmPrefetchDepth = NIterPerWarp * KIterPerWarp / 2;
     constexpr index_t kTdmGemmStepsPerGroup = 1;
 
-    return BlockGemmARegBSmemCRegTdmGroupPrefetch_0<
+    return BlockGemmARegBSmemCRegTdmGroupPrefetchFullGemmKSliceGemmN<
         GemmProblem,
         BlockGemmPolicy,
         kTdmGemmPrefetchDepth,
         kTdmGemmStepsPerGroup>{};
 #else
-    return BlockGemmARegBSmemCRegV2Hack_0<GemmProblem, BlockGemmPolicy>{};
+    return BlockGemmARegBSmemCRegFullGemmKSliceGemmN<
+        GemmProblem,
+        BlockGemmPolicy>{};
 #endif
   }
 
@@ -1176,7 +1175,9 @@ struct HstuAttentionBwdKernel1PipelinePolicy {
         typename Problem::HstuAttentionTileSetting::Gemm0Gemm2BlockWarps,
         decltype(warp_gemm)>;
 
-    return BlockGemmARegBSmemCRegV2Hack_0<GemmProblem, BlockGemmPolicy>{};
+    return BlockGemmARegBSmemCRegFullGemmKSliceGemmN<
+        GemmProblem,
+        BlockGemmPolicy>{};
   }
 
   // Gemm2: dP = dO @ V   [kM0, kN0Sub] = [kM0, kVHeaddim] x [kN0Sub, kVHeaddim]
@@ -1257,13 +1258,15 @@ struct HstuAttentionBwdKernel1PipelinePolicy {
     constexpr index_t kTdmGemmPrefetchDepth = NIterPerWarp * KIterPerWarp / 2;
     constexpr index_t kTdmGemmStepsPerGroup = 1;
 
-    return BlockGemmARegBSmemCRegTdmGroupPrefetch_0<
+    return BlockGemmARegBSmemCRegTdmGroupPrefetchFullGemmKSliceGemmN<
         GemmProblem,
         BlockGemmPolicy,
         kTdmGemmPrefetchDepth,
         kTdmGemmStepsPerGroup>{};
 #else
-    return BlockGemmARegBSmemCRegV2Hack_0<GemmProblem, BlockGemmPolicy>{};
+    return BlockGemmARegBSmemCRegFullGemmKSliceGemmN<
+        GemmProblem,
+        BlockGemmPolicy>{};
 #endif
   }
 
@@ -1362,7 +1365,9 @@ struct HstuAttentionBwdKernel1PipelinePolicy {
         decltype(warp_gemm)>;
 
     if constexpr (!kUseTrLoad) {
-      return BlockGemmARegBSmemCRegV2Hack_1<GemmProblem, BlockGemmPolicy>{};
+      return BlockGemmARegBSmemCRegSliceGemmKFullGemmN<
+          GemmProblem,
+          BlockGemmPolicy>{};
     } else {
 #if HSTU_LDS_STAGING_THROUGH_TDM_AVAILABLE
       constexpr index_t NIterPerWarp =
@@ -1373,13 +1378,13 @@ struct HstuAttentionBwdKernel1PipelinePolicy {
       constexpr index_t kTdmGemmPrefetchDepth = NIterPerWarp * KIterPerWarp / 2;
       constexpr index_t kTdmGemmStepsPerGroup = 1;
 
-      return BlockGemmARegBSmemTrLoadCRegTdmGroupPrefetch_1<
+      return BlockGemmARegBSmemTrLoadCRegTdmGroupPrefetchSliceGemmKFullGemmN<
           GemmProblem,
           BlockGemmPolicy,
           kTdmGemmPrefetchDepth,
           kTdmGemmStepsPerGroup>{};
 #else
-      return BlockGemmARegBSmemTrLoadCRegV2Hack_1<
+      return BlockGemmARegBSmemTrLoadCRegSliceGemmKFullGemmN<
           GemmProblem,
           BlockGemmPolicy>{};
 #endif

@@ -467,7 +467,8 @@ struct HstuAttentionWithSoftmaxBwdPipelineKRVRQS_dK_dV {
     move_tile_window(q_dram_window, {kM0Sub, 0});
 
     __builtin_amdgcn_sched_barrier(
-        LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+        LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+        LLVMSchedGroupMask::TRANS);
 
     clear_tile(dk_acc);
     clear_tile(dv_acc);
@@ -476,7 +477,8 @@ struct HstuAttentionWithSoftmaxBwdPipelineKRVRQS_dK_dV {
     move_tile_window(do_dram_window, {kM0Sub, 0});
 
     __builtin_amdgcn_sched_barrier(
-        LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+        LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+        LLVMSchedGroupMask::TRANS);
 
     // Full [kM0] row-scalar tiles for LSE and delta
     using LSETileType = decltype(block_tile_reduce<CompDataType>(
@@ -520,13 +522,15 @@ struct HstuAttentionWithSoftmaxBwdPipelineKRVRQS_dK_dV {
         }
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Ensure all stores for q_lds are visible before Gemm0 reads
         block_sync_lds();
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Gemm0: sacc_tile = Q_sub @ K
         gemm_0(sacc_tile, q_lds_windows[i_lds_buf_0], k_tile);
@@ -575,12 +579,14 @@ struct HstuAttentionWithSoftmaxBwdPipelineKRVRQS_dK_dV {
         }
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         block_sync_lds();
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Gemm2: dpacc_tile = dO_sub @ V
         gemm_2(dpacc_tile, do_lds_windows[i_lds_buf_0], v_tile);
@@ -605,7 +611,8 @@ struct HstuAttentionWithSoftmaxBwdPipelineKRVRQS_dK_dV {
       });
 
       __builtin_amdgcn_sched_barrier(
-          LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+          LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+          LLVMSchedGroupMask::TRANS);
 
       // ---- Scale, optional bias, mask ----
       if constexpr (kHasBias) {

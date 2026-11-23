@@ -438,13 +438,15 @@ struct HstuAttentionWithSoftmaxBwdTrLoadPipelineKRVRQS_dK_dV {
         }
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Ensure all LDS stores are visible before Gemm0 reads
         block_sync_lds();
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Gemm0: sacc_tile = Q_sub @ K
         gemm_0(sacc_tile, q_lds_windows[i_m0], k_tile);
@@ -478,7 +480,8 @@ struct HstuAttentionWithSoftmaxBwdTrLoadPipelineKRVRQS_dK_dV {
       });
 
       __builtin_amdgcn_sched_barrier(
-          LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+          LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+          LLVMSchedGroupMask::TRANS);
 
       // ---- Scale, optional bias, mask ----
       if constexpr (kHasBias) {

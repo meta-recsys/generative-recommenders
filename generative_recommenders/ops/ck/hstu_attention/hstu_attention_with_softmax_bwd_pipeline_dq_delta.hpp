@@ -428,13 +428,15 @@ struct HstuAttentionWithSoftmaxBwdPipelineQRKSVS_dQ_D {
     move_tile_window(k_dram_window, {kN0Sub, 0});
 
     __builtin_amdgcn_sched_barrier(
-        LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+        LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+        LLVMSchedGroupMask::TRANS);
 
     v_tiles[number<0>{}] = load_tile(v_dram_window);
     move_tile_window(v_dram_window, {kN0Sub, 0});
 
     __builtin_amdgcn_sched_barrier(
-        LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+        LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+        LLVMSchedGroupMask::TRANS);
 
     auto seqlen_k_curr = seqlen_k_start;
 
@@ -457,7 +459,8 @@ struct HstuAttentionWithSoftmaxBwdPipelineQRKSVS_dQ_D {
             partition_index);
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Prefetch next K tile while current stores are in flight
         if constexpr (i_n0 + 1 < n0_loops) {
@@ -466,13 +469,15 @@ struct HstuAttentionWithSoftmaxBwdPipelineQRKSVS_dQ_D {
         }
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Ensure all LDS stores are visible before Gemm0 reads
         block_sync_lds();
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Gemm0: sacc_tile = Q @ K_sub
         gemm_0(sacc_tile, q_tile, k_lds_windows[i_lds_buf_0]);
@@ -503,7 +508,8 @@ struct HstuAttentionWithSoftmaxBwdPipelineQRKSVS_dQ_D {
             partition_index);
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Prefetch next V tile while current stores are in flight
         if constexpr (i_n0 + 1 < n0_loops) {
@@ -512,7 +518,8 @@ struct HstuAttentionWithSoftmaxBwdPipelineQRKSVS_dQ_D {
         }
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Ensure all LDS stores are visible before Gemm2 reads
         block_sync_lds();
@@ -528,7 +535,8 @@ struct HstuAttentionWithSoftmaxBwdPipelineQRKSVS_dQ_D {
       });
 
       __builtin_amdgcn_sched_barrier(
-          LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+          LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+          LLVMSchedGroupMask::TRANS);
 
       // === STAGE 3: scale, bias, mask, then compute P = exp(S - LSE) ===
 
@@ -602,7 +610,8 @@ struct HstuAttentionWithSoftmaxBwdPipelineQRKSVS_dQ_D {
 
       if constexpr (kHasDropout) {
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         auto randval_lds_ptr = reinterpret_cast<char*>(smem_ptr) + k_smem_size +
             v_smem_size + kt_smem_size;
@@ -621,7 +630,8 @@ struct HstuAttentionWithSoftmaxBwdPipelineQRKSVS_dQ_D {
             randval_lds_ptr, seqlen_k_curr, dpcomp_tile, null_randval_window);
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
       }
 
       // === STAGE 4: dS = P * (dP - D[sq]), then dQ += alpha * dS @ K^T ===
