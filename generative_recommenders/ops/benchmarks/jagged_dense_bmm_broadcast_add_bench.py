@@ -200,7 +200,7 @@ def _bwd_breakdown(
             msl, seq_offsets, d_out, dense, jagged
         ),
         "d_jagged cutedsl": lambda: _cutedsl_jagged_dense_bmm_broadcast_add_djagged(
-            seq_offsets, d_out, dense, msl
+            seq_offsets, d_out, dense
         ),
         "d_dense+d_bias triton": lambda: (
             triton_jagged_dense_bmm_broadcast_add_bwd_ddense_dbias(
@@ -209,7 +209,7 @@ def _bwd_breakdown(
         ),
         "d_dense+d_bias cutedsl": lambda: (
             _cutedsl_jagged_dense_bmm_broadcast_add_ddense_dbias(
-                seq_offsets, jagged, d_out, msl
+                seq_offsets, jagged, d_out
             )
         ),
         "full bwd triton": _full_backward(

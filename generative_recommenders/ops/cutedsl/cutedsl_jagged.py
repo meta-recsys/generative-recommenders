@@ -10,19 +10,18 @@ The CuTeDSL backend for `generative_recommenders.ops.jagged_tensors
 
 Blackwell-native: tcgen05 MMA with `cta_group=2` over a 2x1 cluster, TMA bulk-tensor
 loads into swizzled shared memory, an fp32 accumulator in tensor memory, the bias folded
-into the epilogue, and warp specialisation (4 epilogue + 1 MMA + 1 TMA warp, 192
-threads). Persistent grid-stride loop with N-fast rasterisation.
+into the epilogue, and warp specialisation (4 epilogue + 1 MMA + 1 TMA + 1 scheduler warp,
+224 threads). Tiles are scheduled with Cluster Launch Control, N tile fastest.
 
 Correctness gates live in generative_recommenders/ops/tests/jagged_tensors_test.py
-(test_jagged_dense_bmm_broadcast_add* with the CUTEDSL kernel, and
-JaggedDenseBmmBroadcastAddCuTeDSLTest).
+(test_jagged_dense_bmm_broadcast_add* with the CUTEDSL kernel).
 
 """
 
 import functools
 import os
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 # pyrefly: ignore [missing-import]  # cuda-bindings ships no type stubs
 import cuda.bindings.driver as cuda
@@ -30,8 +29,10 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
+from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
+from cutlass.cutlass_dsl import dsl_user_op, T
 from generative_recommenders.ops.utils import is_sm100_plus
 
 
@@ -79,12 +80,6 @@ class Cfg:
     epi_n: int = _env_int("KA_EPI_N", 64)
     # 3 stages. This keeps dynamic smem at 98.4 KB
     stages: int = _env_int("KA_STAGES", 3)
-    # Tile scheduling of all three kernels (fwd, d_jagged, d_dense + d_bias). 1: Cluster Launch Control -- one cluster
-    # per tile, running clusters claim tiles of clusters that have not launched, so tiles
-    # move to whichever SMs are free. 0: persistent
-    # grid of max active clusters with a fixed round-robin tile assignment, which leaves the
-    # tiles of CTAs that cannot get an SM waiting for them.
-    clc: bool = bool(_env_int("KA_CLC", 1))
 
     @property
     def cta_tile_m(self) -> int:
@@ -107,32 +102,23 @@ def get_cfg() -> Cfg:
     return Cfg()
 
 
-# Warp specialisation, following the upstream CUTLASS Blackwell dense_gemm_persistent example.
-# Three roles:
+# Warp specialisation, following the upstream CUTLASS Blackwell
+# dense_gemm_persistent_dynamic example. Four roles:
 #   0-3  epilogue -- tmem -> rmem, bias, store. 128 threads, which is what makes the
 #                    t2r partitioning line up one row of the tile per thread.
 #   4    mma      -- issues tcgen05 MMA only.
 #   5    tma      -- issues TMA loads only.
+#   6    sched    -- first CTA of each cluster only; asks the hardware for the next tile
+#                    (Cluster Launch Control).
 # Splitting TMA issue from MMA issue is what removes the need for explicit prefetching:
 # the load warp runs ahead on its own, which that example calls out as the point of
 # the design.
 EPILOGUE_WARP_ID = (0, 1, 2, 3)
 MMA_WARP_ID = 4
 TMA_WARP_ID = 5
-THREADS = 32 * (len(EPILOGUE_WARP_ID) + 2)  # 192
-EPILOGUE_THREADS = 32 * len(EPILOGUE_WARP_ID)  # 128
-# With Cfg.clc a fourth role, as in the upstream dense_gemm_persistent_dynamic example:
-#   6    sched    -- first CTA of each cluster only; asks the hardware for the next tile.
 SCHED_WARP_ID = 6
-THREADS_CLC = THREADS + 32  # 224
-# CUDA gridDim.y limit. The fwd and d_jagged CLC grids put real row tiles on y, so above
-# ~16.7M rows their dispatchers fall back to the static schedule.
-# TODO(follow-up): linearize those grids to 1D, x = (row tile, n tile, cta) with the n tile
-# fastest, decoded in the kernel. CLC claims x in order, so the n-fast order and its L2 reuse
-# are unchanged, and gridDim.x allows 2^31 - 1 CTAs. (CUTLASS's linearized raster puts the
-# cluster count on z, which has the same 65535 cap, so it cannot be used.) With that, index
-# the d_jagged tensormap slots by SM instead of by grid CTA, and delete the static schedule.
-_MAX_GRID_Y = 65535
+THREADS = 32 * (len(EPILOGUE_WARP_ID) + 3)  # 224
+EPILOGUE_THREADS = 32 * len(EPILOGUE_WARP_ID)  # 128
 
 # NamedBarrier ids. 0 collides with __syncthreads(); 1 is the reference's epilogue sync.
 TMEM_ALLOC_BAR_ID = 2
@@ -161,32 +147,10 @@ def _ab_stages(cfg: Cfg, ab_dtype, occupancy: int = 1) -> int:
     return max(2, (cap // occupancy - mbar_helpers_bytes) // per_stage)
 
 
-def _static_work_tile(t, n_tiles, m_tiles, atom_thr, mma_v, total_tiles):
-    """Tile t of the static persistent schedule (n fastest, then m, then group rank) as a
-    WorkTileInfo in the CLC scheduler's coordinates: (CTA m = mma tile * atom_thr + this
-    CTA's v, n tile, group rank). Module level with explicit arguments because the DSL
-    rejects closures called inside dynamic control flow."""
-    return cutlass.utils.WorkTileInfo(
-        (
-            ((t // n_tiles) % m_tiles) * atom_thr + mma_v,
-            t % n_tiles,
-            (t // n_tiles) // m_tiles,
-        ),
-        t < total_tiles,
-    )
-
-
-def _static_work_tile_mfast(t, m_tiles, n_tiles, atom_thr, mma_v, total_tiles):
-    """As _static_work_tile, for the M-fastest order of the d_jagged static schedule
-    (m tile fastest, then n tile, then group)."""
-    return cutlass.utils.WorkTileInfo(
-        (
-            (t % m_tiles) * atom_thr + mma_v,
-            (t // m_tiles) % n_tiles,
-            (t // m_tiles) // n_tiles,
-        ),
-        t < total_tiles,
-    )
+@dsl_user_op
+def _sm_id(*, loc=None, ip=None) -> cutlass.Int32:
+    """%smid: the SM this CTA runs on (as cute.arch.lane_idx reads %laneid)."""
+    return cutlass.Int32(nvvm.read_ptx_sreg_smid(T.i32(), loc=loc, ip=ip))
 
 
 def _jagged_row_tile(sTileOff, r, g_static):
@@ -202,6 +166,31 @@ def _jagged_row_tile(sTileOff, r, g_static):
         lo = cutlass.Int32(cutlass.select_(le, mid, lo))
         hi = cutlass.Int32(cutlass.select_(le, hi, mid))
     return lo, r - sTileOff[lo], r < sTileOff[g_static]
+
+
+def _n_fast_tile(tile_x, n_tiles, atom_thr, sTileOff, g_static):
+    """(n tile, group, m tile within the group, valid) of a work tile of the fwd and d_jagged
+    CLC grids. The grid is 1D, one cluster per (real row tile, n tile) with the n tile
+    fastest, so tile_x = (row_tile * n_tiles + n_tile) * atom_thr + this CTA's v. CLC claims
+    clusters in increasing x, so the n_tiles clusters that read one row tile of A run back to
+    back and share it through L2. 1D because gridDim.x allows 2^31 - 1 CTAs where y and z stop
+    at 65535 (CUTLASS's own linearised raster puts the cluster count on z)."""
+    cluster = tile_x // atom_thr
+    g, mtile, active = _jagged_row_tile(sTileOff, cluster // n_tiles, g_static)
+    return cluster % n_tiles, g, mtile, active
+
+
+def _jit_view(t, perm=None, unit_mode=False):
+    """The view of t a kernel's TMA atoms expect: modes permuted (torch.permute) and/or a
+    trailing unit mode appended (torch.unsqueeze(-1)). Called from the @cute.jit __call__,
+    so it is resolved at compile time; doing it with torch on the host would cost a few
+    aten ops per call."""
+    layout = t.layout
+    if perm is not None:
+        layout = cute.select(layout, mode=list(perm))
+    if unit_mode:
+        layout = cute.append(layout, cute.make_layout(1, stride=1))
+    return cute.make_tensor(t.iterator, layout)
 
 
 @cute.jit
@@ -264,7 +253,7 @@ class JaggedDenseBmmBroadcastAdd:
         self.ab_dtype = ab_dtype
         self.acc_dtype = acc_dtype
         self.cfg = cfg
-        self.threads = THREADS_CLC if cfg.clc else THREADS
+        self.threads = THREADS
         self.cta_group = tcgen05.CtaGroup.TWO if cfg.two_cta else tcgen05.CtaGroup.ONE
         # Major mode is about which mode is CONTIGUOUS IN MEMORY, not which one we
         # contract over.
@@ -284,10 +273,15 @@ class JaggedDenseBmmBroadcastAdd:
         mBias,
         mC,
         mSeq,
-        max_seq_len: cutlass.Int32,
-        max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
+        # The tensors arrive as the caller holds them: jagged (sum_L, K), dense (G, K, N),
+        # bias (G, N), out (sum_L, N). The kernel's views: A (sum_L, K, 1), B (N, K, G),
+        # bias (N, G), C (sum_L, N, 1).
+        mA = _jit_view(mA, unit_mode=True)
+        mB = _jit_view(mB, perm=(2, 1, 0))
+        mBias = _jit_view(mBias, perm=(1, 0))
+        mC = _jit_view(mC, unit_mode=True)
         cfg = self.cfg
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.ab_dtype,
@@ -348,24 +342,15 @@ class JaggedDenseBmmBroadcastAdd:
 
         n = cute.size(mC, mode=[1])
         g = cute.size(mB, mode=[2])
-        # m_tiles is sized by max_seq_len (the PADDED bound), matching Triton
-        # (triton_jagged.py:347 `if start_m >= seq_len: return`). Tiles
-        # past a group's real length are skipped at runtime.
         n_tiles = cute.ceil_div(n, cfg.tile_n)
-        m_tiles = (max_seq_len + cfg.mma_tile_m - 1) // cfg.mma_tile_m
-        total_clusters = m_tiles * n_tiles * g
         atom_thr = cute.size(tiled_mma.thr_id.shape)
         r_max = (cute.size(mA, mode=[0]) + cfg.mma_tile_m - 1) // cfg.mma_tile_m + g
         tile_sched_params = cutlass.utils.ClcDynamicPersistentTileSchedulerParams(
-            (n_tiles * atom_thr, r_max, 1), (*cfg.cluster_shape_mn, 1)
+            (r_max * n_tiles * atom_thr, 1, 1), (*cfg.cluster_shape_mn, 1)
         )
-        if cutlass.const_expr(cfg.clc):
-            grid = cutlass.utils.ClcDynamicPersistentTileScheduler.get_grid_shape(
-                tile_sched_params
-            )
-        else:
-            n_persist = cutlass.max(cutlass.min(max_active_clusters, total_clusters), 1)
-            grid = (cfg.cluster_shape_mn[0] * n_persist, 1, 1)
+        grid = cutlass.utils.ClcDynamicPersistentTileScheduler.get_grid_shape(
+            tile_sched_params
+        )
         self.kernel(
             tiled_mma,
             tma_atom_a,
@@ -382,8 +367,6 @@ class JaggedDenseBmmBroadcastAdd:
             cluster_layout_vmnk,
             stages,
             n_tiles,
-            m_tiles,
-            total_clusters,
             tile_sched_params,
             g,
         ).launch(
@@ -395,8 +378,7 @@ class JaggedDenseBmmBroadcastAdd:
 
     # noqa C901: the complexity is three warp-role blocks (TMA / MMA / epilogue) in
     # one @cute.kernel. They cannot be split into helpers -- CuTeDSL rejects closures
-    # that capture variables inside dynamic control flow, which is why the per-tile
-    # decode is inlined three times rather than factored out.
+    # that capture variables inside dynamic control flow.
     @cute.kernel
     def kernel(  # noqa: C901
         self,
@@ -414,9 +396,7 @@ class JaggedDenseBmmBroadcastAdd:
         tmem_cols: cutlass.Constexpr,
         cluster_layout_vmnk,
         stages: cutlass.Constexpr,
-        n_tiles,
-        m_tiles,
-        total_clusters,
+        n_tiles: cutlass.Constexpr,
         tile_sched_params,
         g_static: cutlass.Constexpr,
     ):
@@ -453,14 +433,13 @@ class JaggedDenseBmmBroadcastAdd:
         tmem_holding_buf = smem.allocate_array(cutlass.Int32, 1)
         # Freeing tmem in a 2-CTA pair needs a cross-CTA mbarrier, not just a NamedBarrier.
         tmem_dealloc_mbar = smem.allocate_array(cutlass.Int64, 1)
-        if cutlass.const_expr(cfg.clc):
-            clc_mbar = smem.allocate_array(cutlass.Int64, 2)
-            clc_response = smem.allocate_array(cutlass.Int32, 4, byte_alignment=16)
-            # Row-tile prefix sum over groups (G + 1 entries) and per-lane scan totals.
-            sTileOff = smem.allocate_tensor(
-                cutlass.Int32, cute.make_layout(g_static + 1), 16
-            )
-            sLaneTot = smem.allocate_tensor(cutlass.Int32, cute.make_layout(32), 16)
+        clc_mbar = smem.allocate_array(cutlass.Int64, 2)
+        clc_response = smem.allocate_array(cutlass.Int32, 4, byte_alignment=16)
+        # Row-tile prefix sum over groups (G + 1 entries) and per-lane scan totals.
+        sTileOff = smem.allocate_tensor(
+            cutlass.Int32, cute.make_layout(g_static + 1), 16
+        )
+        sLaneTot = smem.allocate_tensor(cutlass.Int32, cute.make_layout(32), 16)
 
         # One thread issues the TMA; one arrival consumes each full barrier.
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
@@ -486,8 +465,8 @@ class JaggedDenseBmmBroadcastAdd:
             defer_sync=cfg.two_cta,
         ).make_participants()
 
-        # Consumer is the epilogue warps only -- 128 threads, not all 192. The TMA and
-        # MMA warps never read the accumulator and must not arrive on this barrier.
+        # Consumer is the epilogue warps only -- 128 threads, not all 224. The other
+        # warps never read the accumulator and must not arrive on this barrier.
         acc_pipeline = cutlass.pipeline.PipelineUmmaAsync.create(
             barrier_storage=acc_mbar,
             num_stages=NUM_ACC_STAGE,
@@ -505,24 +484,23 @@ class JaggedDenseBmmBroadcastAdd:
             defer_sync=cfg.two_cta,
         )
 
-        if cutlass.const_expr(cfg.clc):
-            # Consumers: the sched warp, plus TMA, MMA and the 4 epilogue warps of every
-            # CTA in the cluster (CTA1's idle MMA warp too, or the pipeline never drains).
-            cluster_size = cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1]
-            clc_pipeline = cutlass.pipeline.PipelineClcFetchAsync.create(
-                barrier_storage=clc_mbar,
-                num_stages=1,
-                producer_group=cutlass.pipeline.CooperativeGroup(
-                    cutlass.pipeline.Agent.Thread
-                ),
-                consumer_group=cutlass.pipeline.CooperativeGroup(
-                    cutlass.pipeline.Agent.Thread,
-                    32 * (1 + cluster_size * (len(EPILOGUE_WARP_ID) + 2)),
-                ),
-                tx_count=16,
-                cta_layout_vmnk=cluster_layout_vmnk,
-                defer_sync=cfg.two_cta,
-            )
+        # Consumers: the sched warp, plus TMA, MMA and the 4 epilogue warps of every CTA in
+        # the cluster (CTA1's idle MMA warp too, or the pipeline never drains).
+        cluster_size = cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1]
+        clc_pipeline = cutlass.pipeline.PipelineClcFetchAsync.create(
+            barrier_storage=clc_mbar,
+            num_stages=1,
+            producer_group=cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread
+            ),
+            consumer_group=cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread,
+                32 * (1 + cluster_size * (len(EPILOGUE_WARP_ID) + 2)),
+            ),
+            tx_count=16,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=cfg.two_cta,
+        )
 
         # Accumulator lives in tensor memory. With specialised warps the allocating warp
         # has to be named, as in the upstream CUTLASS Blackwell dense_gemm_persistent example: epilogue warp 0 allocates, and
@@ -560,8 +538,6 @@ class JaggedDenseBmmBroadcastAdd:
         # v is always 0 and every CTA is a leader -- the 1-CTA path is unchanged.
         mma_tile_coord_v = bx % cute.size(tiled_mma.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
-        cluster_id = bx // cute.size(tiled_mma.thr_id.shape)
-        n_clusters = cute.arch.grid_dim()[0] // cute.size(tiled_mma.thr_id.shape)
 
         cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         blk_in_cluster_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank)
@@ -608,42 +584,42 @@ class JaggedDenseBmmBroadcastAdd:
         if cutlass.const_expr(cfg.two_cta):
             cutlass.pipeline.pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
-        if cutlass.const_expr(cfg.clc):
-            _build_row_tile_offsets(
-                sTileOff,
-                sLaneTot,
-                mSeq,
-                tidx,
-                warp_idx,
-                g_static,
-                self.threads,
-                cfg.mma_tile_m,
+        _build_row_tile_offsets(
+            sTileOff,
+            sLaneTot,
+            mSeq,
+            tidx,
+            warp_idx,
+            g_static,
+            self.threads,
+            cfg.mma_tile_m,
+        )
+        tile_sched = cutlass.utils.ClcDynamicPersistentTileScheduler.create(
+            tile_sched_params,
+            cute.arch.block_idx(),
+            cute.arch.grid_dim(),
+            clc_response,
+        )
+        clc_consumer_state = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, 1
+        )
+        # Sched warp: claim the next tile for the whole cluster.
+        if warp_idx == SCHED_WARP_ID and cta_rank == 0:
+            clc_producer_state = cutlass.pipeline.make_pipeline_state(
+                cutlass.pipeline.PipelineUserType.ProducerConsumer, 1
             )
-            tile_sched = cutlass.utils.ClcDynamicPersistentTileScheduler.create(
-                tile_sched_params,
-                cute.arch.block_idx(),
-                cute.arch.grid_dim(),
-                clc_response,
-            )
-            clc_consumer_state = cutlass.pipeline.make_pipeline_state(
-                cutlass.pipeline.PipelineUserType.Consumer, 1
-            )
-            if warp_idx == SCHED_WARP_ID and cta_rank == 0:
-                clc_producer_state = cutlass.pipeline.make_pipeline_state(
-                    cutlass.pipeline.PipelineUserType.ProducerConsumer, 1
+            work = tile_sched.initial_work_tile_info()
+            while work.is_valid_tile:
+                clc_pipeline.producer_acquire(clc_producer_state)
+                tile_sched.advance_to_next_work(
+                    clc_pipeline.producer_get_barrier(clc_producer_state)
                 )
-                work = tile_sched.initial_work_tile_info()
-                while work.is_valid_tile:
-                    clc_pipeline.producer_acquire(clc_producer_state)
-                    tile_sched.advance_to_next_work(
-                        clc_pipeline.producer_get_barrier(clc_producer_state)
-                    )
-                    clc_producer_state.advance()
-                    clc_pipeline.consumer_wait(clc_consumer_state)
-                    work = tile_sched.get_current_work()
-                    clc_pipeline.consumer_release(clc_consumer_state)
-                    clc_consumer_state.advance()
-                clc_pipeline.producer_tail(clc_producer_state)
+                clc_producer_state.advance()
+                clc_pipeline.consumer_wait(clc_consumer_state)
+                work = tile_sched.get_current_work()
+                clc_pipeline.consumer_release(clc_consumer_state)
+                clc_consumer_state.advance()
+            clc_pipeline.producer_tail(clc_producer_state)
 
         #
         # TMA warp -- issues loads and nothing else.
@@ -652,28 +628,12 @@ class JaggedDenseBmmBroadcastAdd:
         # ahead structurally, bounded only by `stages` empty buffers.
         #
         if warp_idx == TMA_WARP_ID:
-            t = cutlass.Int32(cluster_id)
-            if cutlass.const_expr(cfg.clc):
-                work = tile_sched.initial_work_tile_info()
-            else:
-                work = _static_work_tile(
-                    t, n_tiles, m_tiles, atom_thr_size, mma_tile_coord_v, total_clusters
-                )
+            work = tile_sched.initial_work_tile_info()
             while work.is_valid_tile:
-                # Decode one tile.
-                if cutlass.const_expr(cfg.clc):
-                    n_tile = work.tile_idx[0] // atom_thr_size
-                    bz, mtile, active = _jagged_row_tile(
-                        sTileOff, work.tile_idx[1], g_static
-                    )
-                else:
-                    n_tile = work.tile_idx[1]
-                    mtile = work.tile_idx[0] // atom_thr_size
-                    bz = work.tile_idx[2]
+                n_tile, bz, mtile, active = _n_fast_tile(
+                    work.tile_idx[0], n_tiles, atom_thr_size, sTileOff, g_static
+                )
                 seq_start = mSeq[bz]
-                seq_len = mSeq[bz + 1] - seq_start
-                if cutlass.const_expr(not cfg.clc):
-                    active = mtile * cfg.mma_tile_m < seq_len
                 if active:
                     # A's TMA view shifted to this group's first row. domain_offset must
                     # be applied to the rank-3 (M,K,L) view BEFORE local_tile.
@@ -713,21 +673,10 @@ class JaggedDenseBmmBroadcastAdd:
                             tma_bar_ptr=producer_handle.barrier,
                             mcast_mask=b_mcast_mask,
                         )
-                if cutlass.const_expr(cfg.clc):
-                    clc_pipeline.consumer_wait(clc_consumer_state)
-                    work = tile_sched.get_current_work()
-                    clc_pipeline.consumer_release(clc_consumer_state)
-                    clc_consumer_state.advance()
-                else:
-                    t = t + n_clusters
-                    work = _static_work_tile(
-                        t,
-                        n_tiles,
-                        m_tiles,
-                        atom_thr_size,
-                        mma_tile_coord_v,
-                        total_clusters,
-                    )
+                clc_pipeline.consumer_wait(clc_consumer_state)
+                work = tile_sched.get_current_work()
+                clc_pipeline.consumer_release(clc_consumer_state)
+                clc_consumer_state.advance()
             ab_producer.tail()
 
         #
@@ -746,30 +695,13 @@ class JaggedDenseBmmBroadcastAdd:
                 acc_producer_state = cutlass.pipeline.make_pipeline_state(
                     cutlass.pipeline.PipelineUserType.Producer, NUM_ACC_STAGE
                 )
-                t = cutlass.Int32(cluster_id)
-                if cutlass.const_expr(cfg.clc):
-                    work = tile_sched.initial_work_tile_info()
-                else:
-                    work = _static_work_tile(
-                        t,
-                        n_tiles,
-                        m_tiles,
-                        atom_thr_size,
-                        mma_tile_coord_v,
-                        total_clusters,
-                    )
+                work = tile_sched.initial_work_tile_info()
                 while work.is_valid_tile:
                     # Same decode as the TMA warp (the MMA warp reads A/B from SMEM, so
                     # it needs only whether the tile is real).
-                    if cutlass.const_expr(cfg.clc):
-                        _, _, active = _jagged_row_tile(
-                            sTileOff, work.tile_idx[1], g_static
-                        )
-                    else:
-                        mtile = work.tile_idx[0] // atom_thr_size
-                        bz = work.tile_idx[2]
-                        seq_len = mSeq[bz + 1] - mSeq[bz]
-                        active = mtile * cfg.mma_tile_m < seq_len
+                    _, _, _, active = _n_fast_tile(
+                        work.tile_idx[0], n_tiles, atom_thr_size, sTileOff, g_static
+                    )
                     if active:
                         tCtAcc = tCtAcc_base[
                             (None, None, None, acc_producer_state.index)
@@ -789,33 +721,21 @@ class JaggedDenseBmmBroadcastAdd:
 
                         acc_pipeline.producer_commit(acc_producer_state)
                         acc_producer_state.advance()
-                    if cutlass.const_expr(cfg.clc):
-                        clc_pipeline.consumer_wait(clc_consumer_state)
-                        work = tile_sched.get_current_work()
-                        clc_pipeline.consumer_release(clc_consumer_state)
-                        clc_consumer_state.advance()
-                    else:
-                        t = t + n_clusters
-                        work = _static_work_tile(
-                            t,
-                            n_tiles,
-                            m_tiles,
-                            atom_thr_size,
-                            mma_tile_coord_v,
-                            total_clusters,
-                        )
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
 
                 acc_pipeline.producer_tail(acc_producer_state)
             else:
-                # CTA1's MMA warp idles (the leader's UMMAs cover both CTAs) but under CLC
-                # still consumes every response, which the pipeline counts.
-                if cutlass.const_expr(cfg.clc):
-                    work = tile_sched.initial_work_tile_info()
-                    while work.is_valid_tile:
-                        clc_pipeline.consumer_wait(clc_consumer_state)
-                        work = tile_sched.get_current_work()
-                        clc_pipeline.consumer_release(clc_consumer_state)
-                        clc_consumer_state.advance()
+                # CTA1's MMA warp idles (the leader's UMMAs cover both CTAs) but still
+                # consumes every CLC response, which the pipeline counts.
+                work = tile_sched.initial_work_tile_info()
+                while work.is_valid_tile:
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
 
         #
         # Epilogue warps -- tmem -> registers, broadcast bias, vectorised store with a
@@ -838,28 +758,14 @@ class JaggedDenseBmmBroadcastAdd:
                 barrier_id=EPI_SYNC_BAR_ID, num_threads=EPILOGUE_THREADS
             )
 
-            t = cutlass.Int32(cluster_id)
-            if cutlass.const_expr(cfg.clc):
-                work = tile_sched.initial_work_tile_info()
-            else:
-                work = _static_work_tile(
-                    t, n_tiles, m_tiles, atom_thr_size, mma_tile_coord_v, total_clusters
-                )
+            work = tile_sched.initial_work_tile_info()
             while work.is_valid_tile:
                 # Same decode as the TMA warp.
-                if cutlass.const_expr(cfg.clc):
-                    n_tile = work.tile_idx[0] // atom_thr_size
-                    bz, mtile, active = _jagged_row_tile(
-                        sTileOff, work.tile_idx[1], g_static
-                    )
-                else:
-                    n_tile = work.tile_idx[1]
-                    mtile = work.tile_idx[0] // atom_thr_size
-                    bz = work.tile_idx[2]
+                n_tile, bz, mtile, active = _n_fast_tile(
+                    work.tile_idx[0], n_tiles, atom_thr_size, sTileOff, g_static
+                )
                 seq_start = mSeq[bz]
                 seq_len = mSeq[bz + 1] - seq_start
-                if cutlass.const_expr(not cfg.clc):
-                    active = mtile * cfg.mma_tile_m < seq_len
                 if active:
                     acc_pipeline.consumer_wait(acc_consumer_state)
                     epi_tile = (cfg.cta_tile_m, cfg.epi_n)
@@ -957,21 +863,10 @@ class JaggedDenseBmmBroadcastAdd:
                     with cute.arch.elect_one():
                         acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
-                if cutlass.const_expr(cfg.clc):
-                    clc_pipeline.consumer_wait(clc_consumer_state)
-                    work = tile_sched.get_current_work()
-                    clc_pipeline.consumer_release(clc_consumer_state)
-                    clc_consumer_state.advance()
-                else:
-                    t = t + n_clusters
-                    work = _static_work_tile(
-                        t,
-                        n_tiles,
-                        m_tiles,
-                        atom_thr_size,
-                        mma_tile_coord_v,
-                        total_clusters,
-                    )
+                clc_pipeline.consumer_wait(clc_consumer_state)
+                work = tile_sched.get_current_work()
+                clc_pipeline.consumer_release(clc_consumer_state)
+                clc_consumer_state.advance()
 
             tmem_dealloc_barrier.arrive_and_wait()
             tmem.relinquish_alloc_permit()
@@ -979,23 +874,6 @@ class JaggedDenseBmmBroadcastAdd:
 
 
 _COMPILED = {}
-_MAX_CLUSTERS: dict = {}
-
-
-def _max_active_clusters(cluster_size: int = 1) -> int:
-    """Clusters of `cluster_size` CTAs the machine holds at once -- this sizes the
-    persistent grid.
-
-    Cached because the query is a driver call on the hot path, but keyed PER DEVICE: it
-    is a device property, and a single global would size the grid for whichever GPU
-    happened to be current first on a multi-GPU host.
-    """
-    key = (torch.cuda.current_device(), cluster_size)
-    if key not in _MAX_CLUSTERS:
-        _MAX_CLUSTERS[key] = cutlass.utils.HardwareInfo().get_max_active_clusters(
-            cluster_size
-        )
-    return _MAX_CLUSTERS[key]
 
 
 _TVM_FFI = "--enable-tvm-ffi"
@@ -1046,9 +924,7 @@ def _tma_ready(t: torch.Tensor) -> torch.Tensor:
     return t if t.data_ptr() % 16 == 0 else t.clone()
 
 
-def _cutedsl_jagged_dense_bmm_broadcast_add_fwd(
-    seq_offsets, jagged, dense, bias, max_seq_len: int
-):
+def _cutedsl_jagged_dense_bmm_broadcast_add_fwd(seq_offsets, jagged, dense, bias):
     """Jagged: group g owns rows [seq_offsets[g], seq_offsets[g+1]) of `jagged`.
 
     A and C are FLAT (sum_L, K) / (sum_L, N) with a singleton group mode. The group's
@@ -1077,19 +953,8 @@ def _cutedsl_jagged_dense_bmm_broadcast_add_fwd(
 
     out = torch.empty((total, n), dtype=jagged.dtype, device=jagged.device)
 
-    jagged = jagged.detach()
-    dense = dense.detach()
-    bias = bias.detach()
-
-    a3 = jagged.unsqueeze(-1)  # (sum_L, K, 1)
-    c3 = out.unsqueeze(-1)  # (sum_L, N, 1)
-    b3 = dense.permute(2, 1, 0)  # (N, K, G)
-    bias2 = bias.permute(1, 0)  # (N, G)      unchanged
-
-    cfg = get_cfg()
-    if cfg.clc and -(-total // cfg.mma_tile_m) + g > _MAX_GRID_Y:
-        # The CLC grid puts row tiles on y, so M above ~16.7M rows takes the static schedule.
-        cfg = replace(cfg, clc=False)
+    # Tensors go in as-is (views built in the jit, no detach needed with TVM-FFI); one
+    # compile serves every batch of these dims.
     key = (
         torch.cuda.current_device(),
         n,
@@ -1097,23 +962,22 @@ def _cutedsl_jagged_dense_bmm_broadcast_add_fwd(
         g,
         jagged.dtype,
         seq_offsets.dtype,
-        cfg.clc,
     )
     if key not in _COMPILED:
-        op = JaggedDenseBmmBroadcastAdd(cutlass.BFloat16, cutlass.Float32, cfg)
+        op = JaggedDenseBmmBroadcastAdd(cutlass.BFloat16, cutlass.Float32, get_cfg())
         _COMPILED[key] = cute.compile(
             op,
-            _ffi_tensor(a3).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2)),
-            _ffi_tensor(b3),
-            _ffi_tensor(bias2),
-            _ffi_tensor(c3).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2)),
+            _ffi_tensor(jagged.detach()).mark_compact_shape_dynamic(
+                mode=0, stride_order=(0, 1)
+            ),
+            _ffi_tensor(dense.detach()),
+            _ffi_tensor(bias.detach()),
+            _ffi_tensor(out).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1)),
             _ffi_tensor(seq_offsets, 8),
-            cutlass.Int32(int(max_seq_len)),
-            _max_active_clusters(),
             _env_stream(),
             options=_TVM_FFI,
         )
-    _COMPILED[key](a3, b3, bias2, c3, seq_offsets, int(max_seq_len))
+    _COMPILED[key](jagged, dense, bias, out, seq_offsets)
     return out
 
 
@@ -1121,8 +985,7 @@ class _CuTeDSLJaggedDenseBmmBroadcastAddFunction(torch.autograd.Function):
     """Autograd wrapper: forward kernel, and the d_jagged and fused d_dense + d_bias
     kernels for backward.
 
-    The kernels detach their inputs so cute's from_dlpack will accept them; routing
-    through an autograd.Function keeps the output connected to the graph.
+    Routing through an autograd.Function keeps the outputs connected to the graph.
     """
 
     @staticmethod
@@ -1136,9 +999,8 @@ class _CuTeDSLJaggedDenseBmmBroadcastAddFunction(torch.autograd.Function):
         max_seq_len: int,
     ) -> torch.Tensor:
         ctx.save_for_backward(seq_offsets, jagged, dense)
-        ctx.max_seq_len = max_seq_len
         return _cutedsl_jagged_dense_bmm_broadcast_add_fwd(
-            seq_offsets, jagged, dense, bias, max_seq_len
+            seq_offsets, jagged, dense, bias
         )
 
     @staticmethod
@@ -1147,10 +1009,10 @@ class _CuTeDSLJaggedDenseBmmBroadcastAddFunction(torch.autograd.Function):
         seq_offsets, jagged, dense = ctx.saved_tensors
         d_out = d_out.contiguous()
         d_jagged = _cutedsl_jagged_dense_bmm_broadcast_add_djagged(
-            seq_offsets, d_out, dense, ctx.max_seq_len
+            seq_offsets, d_out, dense
         )
         d_dense, d_bias = _cutedsl_jagged_dense_bmm_broadcast_add_ddense_dbias(
-            seq_offsets, jagged, d_out, ctx.max_seq_len
+            seq_offsets, jagged, d_out
         )
         return None, d_jagged, d_dense, d_bias, None
 
@@ -1161,7 +1023,9 @@ def cutedsl_jagged_dense_bmm_broadcast_add(
     """Blackwell CuTeDSL jagged_dense_bmm_broadcast_add, forward and backward.
 
     Public entry point for the HammerKernel.CUTEDSL dispatch. Inputs must pass
-    cutedsl_jagged_dense_bmm_broadcast_add_supported (ValueError otherwise).
+    cutedsl_jagged_dense_bmm_broadcast_add_supported (ValueError otherwise). max_seq_len
+    is accepted for parity with the Triton op and not used: the kernels read the offsets
+    on device and size their grids from the real row tiles.
     """
     return _CuTeDSLJaggedDenseBmmBroadcastAddFunction.apply(
         seq_offsets, jagged, dense, bias, max_seq_len
@@ -1185,14 +1049,13 @@ _COMPILED_BWD_DJAGGED: dict = {}
 class JaggedDenseBmmBroadcastAddDJagged:
     """d_jagged backward: d_out @ dense[g].T  (K-major B, no copy).
 
-    Tile scheduling (Cfg.clc): the static grid covers max_seq_len worth of row tiles for
-    every group and skips the empty ones (~4x the real tiles at blue_reels shapes), which
-    CLC cannot afford (every claim is a round trip). Under CLC the grid enumerates real row
-    tiles only: (2 * n_tiles, r_max, 1) CTAs (n tile fastest, for L2 reuse of d_out across the
-    n tiles of a row tile) with r_max = ceil(M / mma_tile_m) + G >=
-    sum_g ceil(len_g / mma_tile_m), and each CTA maps row tile r to (group, m tile) with a
-    per-group tile prefix sum it builds in SMEM at start. Row tiles past the real ones (at
-    most G per n tile) are claimed and dropped.
+    Tile scheduling: Cluster Launch Control over real row tiles only, as in the forward. The
+    grid is 1D, 2 * n_tiles * r_max CTAs with r_max = ceil(M / mma_tile_m) + G >=
+    sum_g ceil(len_g / mma_tile_m), n tile fastest for L2 reuse of d_out across the n tiles of
+    a row tile (_n_fast_tile). Each CTA maps row tile r to (group, m tile) with a per-group
+    tile prefix sum it builds in SMEM at start. Row tiles past the real ones (at most G per n
+    tile) are claimed and dropped. A grid sized by max_seq_len would be mostly empty tiles
+    (~4x the real ones at blue_reels shapes), and every CLC claim is a round trip.
     """
 
     def __init__(self, ab_dtype, acc_dtype, cfg: Cfg):
@@ -1201,7 +1064,7 @@ class JaggedDenseBmmBroadcastAddDJagged:
         self.ab_dtype = ab_dtype
         self.acc_dtype = acc_dtype
         self.cfg = _replace(cfg, stages=2)
-        self.threads = THREADS_CLC if self.cfg.clc else THREADS
+        self.threads = THREADS
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.cfg.two_cta else tcgen05.CtaGroup.ONE
         )
@@ -1215,12 +1078,15 @@ class JaggedDenseBmmBroadcastAddDJagged:
         mB,
         mC,
         mSeq,
-        max_seq_len: cutlass.Int32,
-        max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         D_static: cutlass.Constexpr,
         mTmapAddrs,
     ):
+        # d_out (sum_L, N), dense (G, D, N), d_jagged (sum_L, D) as the caller holds them;
+        # the kernel's views: A (sum_L, N, 1), B (D, N, G) with N stride-1, C (sum_L, D, 1).
+        mA = _jit_view(mA, unit_mode=True)
+        mB = _jit_view(mB, perm=(1, 2, 0))
+        mC = _jit_view(mC, unit_mode=True)
         cfg = self.cfg
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.ab_dtype,
@@ -1241,6 +1107,8 @@ class JaggedDenseBmmBroadcastAddDJagged:
         tmem_cols = cutlass.utils.get_num_tmem_alloc_cols(
             tiled_mma.make_fragment_C(acc_shape)
         )
+        # Per-SM tensormap slot: holding all of TMEM serialises the CTAs on an SM.
+        assert tmem_cols == 512, f"d_jagged must allocate all of TMEM, got {tmem_cols}"
         stages = _ab_stages(cfg, self.ab_dtype)
         a_smem_layout = sm100_utils.make_smem_layout_a(
             tiled_mma, mma_tiler, self.ab_dtype, stages
@@ -1276,20 +1144,15 @@ class JaggedDenseBmmBroadcastAddDJagged:
         # the per-tile k-loop has a compile-time trip count (12 at K=768).
         k_tiles = cute.ceil_div(cute.size(mA, mode=[1]), cfg.tile_k)
         n_tiles = cute.ceil_div(n, cfg.tile_n)
-        m_tiles = (max_seq_len + cfg.mma_tile_m - 1) // cfg.mma_tile_m
-        total_clusters = m_tiles * n_tiles * g
         atom_thr = cute.size(tiled_mma.thr_id.shape)
+        # Upper bound on real row tiles: each group adds at most one partial tile.
         r_max = (cute.size(mA, mode=[0]) + cfg.mma_tile_m - 1) // cfg.mma_tile_m + g
         tile_sched_params = cutlass.utils.ClcDynamicPersistentTileSchedulerParams(
-            (n_tiles * atom_thr, r_max, 1), (*cfg.cluster_shape_mn, 1)
+            (r_max * n_tiles * atom_thr, 1, 1), (*cfg.cluster_shape_mn, 1)
         )
-        if cutlass.const_expr(cfg.clc):
-            grid = cutlass.utils.ClcDynamicPersistentTileScheduler.get_grid_shape(
-                tile_sched_params
-            )
-        else:
-            n_persist = cutlass.max(cutlass.min(max_active_clusters, total_clusters), 1)
-            grid = (cfg.cluster_shape_mn[0] * n_persist, 1, 1)
+        grid = cutlass.utils.ClcDynamicPersistentTileScheduler.get_grid_shape(
+            tile_sched_params
+        )
 
         EPI_STAGES = 4
         epi_tile_shape = (
@@ -1326,8 +1189,6 @@ class JaggedDenseBmmBroadcastAddDJagged:
             cluster_layout_vmnk,
             stages,
             n_tiles,
-            m_tiles,
-            total_clusters,
             tma_atom_c,
             tma_c,
             EPI_STAGES,
@@ -1360,9 +1221,7 @@ class JaggedDenseBmmBroadcastAddDJagged:
         tmem_cols: cutlass.Constexpr,
         cluster_layout_vmnk,
         stages: cutlass.Constexpr,
-        n_tiles,
-        m_tiles,
-        total_clusters,
+        n_tiles: cutlass.Constexpr,
         tma_atom_c,
         mC_tma,
         epi_stages: cutlass.Constexpr,
@@ -1377,8 +1236,6 @@ class JaggedDenseBmmBroadcastAddDJagged:
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bx, by, bz = cute.arch.block_idx()
-        gdx, gdy, _ = cute.arch.grid_dim()
-        cta_linear = bx + by * gdx + bz * gdx * gdy
 
         smem = cutlass.utils.SmemAllocator()
         sA = smem.allocate_tensor(
@@ -1398,13 +1255,12 @@ class JaggedDenseBmmBroadcastAddDJagged:
         acc_mbar = smem.allocate_array(cutlass.Int64, 2 * NUM_ACC_STAGE_JAGGED)
         tmem_holding_buf = smem.allocate_array(cutlass.Int32, 1)
         tmem_dealloc_mbar = smem.allocate_array(cutlass.Int64, 1)
-        if cutlass.const_expr(cfg.clc):
-            clc_mbar = smem.allocate_array(cutlass.Int64, 2)
-            clc_response = smem.allocate_array(cutlass.Int32, 4, byte_alignment=16)
-            sTileOff = smem.allocate_tensor(
-                cutlass.Int32, cute.make_layout(g_static + 1), 16
-            )
-            sLaneTot = smem.allocate_tensor(cutlass.Int32, cute.make_layout(32), 16)
+        clc_mbar = smem.allocate_array(cutlass.Int64, 2)
+        clc_response = smem.allocate_array(cutlass.Int32, 4, byte_alignment=16)
+        sTileOff = smem.allocate_tensor(
+            cutlass.Int32, cute.make_layout(g_static + 1), 16
+        )
+        sLaneTot = smem.allocate_tensor(cutlass.Int32, cute.make_layout(32), 16)
 
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
         tx_count = atom_thr_size * (
@@ -1443,24 +1299,23 @@ class JaggedDenseBmmBroadcastAddDJagged:
             defer_sync=cfg.two_cta,
         )
 
-        if cutlass.const_expr(cfg.clc):
-            # Consumers: the sched warp, plus TMA, MMA and the 4 epilogue warps of every
-            # CTA in the cluster (CTA1's idle MMA warp too, or the pipeline never drains).
-            cluster_size = cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1]
-            clc_pipeline = cutlass.pipeline.PipelineClcFetchAsync.create(
-                barrier_storage=clc_mbar,
-                num_stages=1,
-                producer_group=cutlass.pipeline.CooperativeGroup(
-                    cutlass.pipeline.Agent.Thread
-                ),
-                consumer_group=cutlass.pipeline.CooperativeGroup(
-                    cutlass.pipeline.Agent.Thread,
-                    32 * (1 + cluster_size * (len(EPILOGUE_WARP_ID) + 2)),
-                ),
-                tx_count=16,
-                cta_layout_vmnk=cluster_layout_vmnk,
-                defer_sync=cfg.two_cta,
-            )
+        # Consumers: the sched warp, plus TMA, MMA and the 4 epilogue warps of every CTA in
+        # the cluster (CTA1's idle MMA warp too, or the pipeline never drains).
+        cluster_size = cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1]
+        clc_pipeline = cutlass.pipeline.PipelineClcFetchAsync.create(
+            barrier_storage=clc_mbar,
+            num_stages=1,
+            producer_group=cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread
+            ),
+            consumer_group=cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread,
+                32 * (1 + cluster_size * (len(EPILOGUE_WARP_ID) + 2)),
+            ),
+            tx_count=16,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=cfg.two_cta,
+        )
 
         tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
         tmem = cutlass.utils.TmemAllocator(
@@ -1494,8 +1349,6 @@ class JaggedDenseBmmBroadcastAddDJagged:
 
         mma_tile_coord_v = bx % cute.size(tiled_mma.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
-        cluster_id = bx // cute.size(tiled_mma.thr_id.shape)
-        n_clusters = cute.arch.grid_dim()[0] // cute.size(tiled_mma.thr_id.shape)
 
         cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         blk_in_cluster_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank)
@@ -1534,68 +1387,51 @@ class JaggedDenseBmmBroadcastAddDJagged:
         if cutlass.const_expr(cfg.two_cta):
             cutlass.pipeline.pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
-        if cutlass.const_expr(cfg.clc):
-            _build_row_tile_offsets(
-                sTileOff,
-                sLaneTot,
-                mSeq,
-                tidx,
-                warp_idx,
-                g_static,
-                self.threads,
-                cfg.mma_tile_m,
+        _build_row_tile_offsets(
+            sTileOff,
+            sLaneTot,
+            mSeq,
+            tidx,
+            warp_idx,
+            g_static,
+            self.threads,
+            cfg.mma_tile_m,
+        )
+        tile_sched = cutlass.utils.ClcDynamicPersistentTileScheduler.create(
+            tile_sched_params,
+            cute.arch.block_idx(),
+            cute.arch.grid_dim(),
+            clc_response,
+        )
+        clc_consumer_state = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, 1
+        )
+        # Sched warp: claim the next tile for the whole cluster.
+        if warp_idx == SCHED_WARP_ID and cta_rank == 0:
+            clc_producer_state = cutlass.pipeline.make_pipeline_state(
+                cutlass.pipeline.PipelineUserType.ProducerConsumer, 1
             )
-            tile_sched = cutlass.utils.ClcDynamicPersistentTileScheduler.create(
-                tile_sched_params,
-                cute.arch.block_idx(),
-                cute.arch.grid_dim(),
-                clc_response,
-            )
-            clc_consumer_state = cutlass.pipeline.make_pipeline_state(
-                cutlass.pipeline.PipelineUserType.Consumer, 1
-            )
-            # Sched warp: claim the next tile for the whole cluster.
-            if warp_idx == SCHED_WARP_ID and cta_rank == 0:
-                clc_producer_state = cutlass.pipeline.make_pipeline_state(
-                    cutlass.pipeline.PipelineUserType.ProducerConsumer, 1
-                )
-                work = tile_sched.initial_work_tile_info()
-                while work.is_valid_tile:
-                    clc_pipeline.producer_acquire(clc_producer_state)
-                    tile_sched.advance_to_next_work(
-                        clc_pipeline.producer_get_barrier(clc_producer_state)
-                    )
-                    clc_producer_state.advance()
-                    clc_pipeline.consumer_wait(clc_consumer_state)
-                    work = tile_sched.get_current_work()
-                    clc_pipeline.consumer_release(clc_consumer_state)
-                    clc_consumer_state.advance()
-                clc_pipeline.producer_tail(clc_producer_state)
-
-        # TMA warp: k_tiles stages per tile (static: M-fast; CLC: n-fast)
-        if warp_idx == TMA_WARP_ID:
-            t = cutlass.Int32(cluster_id)
-            if cutlass.const_expr(cfg.clc):
-                work = tile_sched.initial_work_tile_info()
-            else:
-                work = _static_work_tile_mfast(
-                    t, m_tiles, n_tiles, atom_thr_size, mma_tile_coord_v, total_clusters
-                )
+            work = tile_sched.initial_work_tile_info()
             while work.is_valid_tile:
-                if cutlass.const_expr(cfg.clc):
-                    # n-fast CLC grid: x = n tile * atom_thr + CTA v, y = real row tile.
-                    n_tile = work.tile_idx[0] // atom_thr_size
-                    bz_t, mtile, active = _jagged_row_tile(
-                        sTileOff, work.tile_idx[1], g_static
-                    )
-                else:
-                    n_tile = work.tile_idx[1]
-                    mtile = work.tile_idx[0] // atom_thr_size
-                    bz_t = work.tile_idx[2]
+                clc_pipeline.producer_acquire(clc_producer_state)
+                tile_sched.advance_to_next_work(
+                    clc_pipeline.producer_get_barrier(clc_producer_state)
+                )
+                clc_producer_state.advance()
+                clc_pipeline.consumer_wait(clc_consumer_state)
+                work = tile_sched.get_current_work()
+                clc_pipeline.consumer_release(clc_consumer_state)
+                clc_consumer_state.advance()
+            clc_pipeline.producer_tail(clc_producer_state)
+
+        # TMA warp: k_tiles stages per tile
+        if warp_idx == TMA_WARP_ID:
+            work = tile_sched.initial_work_tile_info()
+            while work.is_valid_tile:
+                n_tile, bz_t, mtile, active = _n_fast_tile(
+                    work.tile_idx[0], n_tiles, atom_thr_size, sTileOff, g_static
+                )
                 seq_start = mSeq[bz_t]
-                seq_len = mSeq[bz_t + 1] - seq_start
-                if cutlass.const_expr(not cfg.clc):
-                    active = mtile * cfg.mma_tile_m < seq_len
                 if active:
                     mA_g = cute.domain_offset((seq_start, 0, 0), mA)
                     gA_mkl = cute.local_tile(
@@ -1629,21 +1465,10 @@ class JaggedDenseBmmBroadcastAddDJagged:
                             tma_bar_ptr=producer_handle.barrier,
                             mcast_mask=b_mcast_mask,
                         )
-                if cutlass.const_expr(cfg.clc):
-                    clc_pipeline.consumer_wait(clc_consumer_state)
-                    work = tile_sched.get_current_work()
-                    clc_pipeline.consumer_release(clc_consumer_state)
-                    clc_consumer_state.advance()
-                else:
-                    t = t + n_clusters
-                    work = _static_work_tile_mfast(
-                        t,
-                        m_tiles,
-                        n_tiles,
-                        atom_thr_size,
-                        mma_tile_coord_v,
-                        total_clusters,
-                    )
+                clc_pipeline.consumer_wait(clc_consumer_state)
+                work = tile_sched.get_current_work()
+                clc_pipeline.consumer_release(clc_consumer_state)
+                clc_consumer_state.advance()
             ab_producer.tail()
 
         # MMA warp: k_tiles stages per tile, ACCUMULATE=False on the first
@@ -1655,28 +1480,11 @@ class JaggedDenseBmmBroadcastAddDJagged:
                 acc_producer_state = cutlass.pipeline.make_pipeline_state(
                     cutlass.pipeline.PipelineUserType.Producer, NUM_ACC_STAGE_JAGGED
                 )
-                t = cutlass.Int32(cluster_id)
-                if cutlass.const_expr(cfg.clc):
-                    work = tile_sched.initial_work_tile_info()
-                else:
-                    work = _static_work_tile_mfast(
-                        t,
-                        m_tiles,
-                        n_tiles,
-                        atom_thr_size,
-                        mma_tile_coord_v,
-                        total_clusters,
-                    )
+                work = tile_sched.initial_work_tile_info()
                 while work.is_valid_tile:
-                    if cutlass.const_expr(cfg.clc):
-                        _, _, active = _jagged_row_tile(
-                            sTileOff, work.tile_idx[1], g_static
-                        )
-                    else:
-                        mtile = work.tile_idx[0] // atom_thr_size
-                        bz_t = work.tile_idx[2]
-                        seq_len = mSeq[bz_t + 1] - mSeq[bz_t]
-                        active = mtile * cfg.mma_tile_m < seq_len
+                    _, _, _, active = _n_fast_tile(
+                        work.tile_idx[0], n_tiles, atom_thr_size, sTileOff, g_static
+                    )
                     if active:
                         tCtAcc = tCtAcc_base[
                             (None, None, None, acc_producer_state.index)
@@ -1695,32 +1503,20 @@ class JaggedDenseBmmBroadcastAddDJagged:
                             consumer_handle.release()
                         acc_pipeline.producer_commit(acc_producer_state)
                         acc_producer_state.advance()
-                    if cutlass.const_expr(cfg.clc):
-                        clc_pipeline.consumer_wait(clc_consumer_state)
-                        work = tile_sched.get_current_work()
-                        clc_pipeline.consumer_release(clc_consumer_state)
-                        clc_consumer_state.advance()
-                    else:
-                        t = t + n_clusters
-                        work = _static_work_tile_mfast(
-                            t,
-                            m_tiles,
-                            n_tiles,
-                            atom_thr_size,
-                            mma_tile_coord_v,
-                            total_clusters,
-                        )
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
                 acc_pipeline.producer_tail(acc_producer_state)
             else:
-                # CTA1's MMA warp idles (the leader's UMMAs cover both CTAs) but under CLC
-                # still consumes every response, which the pipeline counts.
-                if cutlass.const_expr(cfg.clc):
-                    work = tile_sched.initial_work_tile_info()
-                    while work.is_valid_tile:
-                        clc_pipeline.consumer_wait(clc_consumer_state)
-                        work = tile_sched.get_current_work()
-                        clc_pipeline.consumer_release(clc_consumer_state)
-                        clc_consumer_state.advance()
+                # CTA1's MMA warp idles (the leader's UMMAs cover both CTAs) but still
+                # consumes every CLC response, which the pipeline counts.
+                work = tile_sched.initial_work_tile_info()
+                while work.is_valid_tile:
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
 
         # Epilogue: single drain per tile — TMEM → stmatrix → sD → async TMA (per-group OOB descriptor)
         if warp_idx < MMA_WARP_ID:
@@ -1746,12 +1542,9 @@ class JaggedDenseBmmBroadcastAddDJagged:
                 cutlass.utils.TensorMapUpdateMode.GMEM, 128
             )
 
-            # Prolog: initialize this CTA's private descriptor slot with the base atom
-            # (full mC shape). Per-tile update_tensormap patches the M-extent for each
-            # group before the TMA copy. One slot per CTA.
-            # Slots are 128 B apart from mTmapAddrs[0], one per CTA of the grid; the
-            # dispatcher sizes the buffer to the grid (it grows with M under CLC).
-            _cid_addr = mTmapAddrs[0] + cutlass.Int64(cta_linear) * 128
+            # Prolog: init this SM's descriptor slot from the base atom; each tile
+            # patches the M extent. Used only while this CTA holds all of TMEM.
+            _cid_addr = mTmapAddrs[0] + cutlass.Int64(_sm_id()) * 128
             _slot_ptr_gmem = _tmap_mgr_k.get_tensormap_ptr(
                 cute.make_ptr(
                     cutlass.Int64, _cid_addr, cute.AddressSpace.gmem, assumed_align=128
@@ -1767,28 +1560,12 @@ class JaggedDenseBmmBroadcastAddDJagged:
             _tmap_mgr_k.init_tensormap_from_atom(tma_atom_c, _slot_ptr_gmem, warp_id=0)
             _tmap_mgr_k.fence_tensormap_initialization()
 
-            t = cutlass.Int32(cluster_id)
-            if cutlass.const_expr(cfg.clc):
-                work = tile_sched.initial_work_tile_info()
-            else:
-                work = _static_work_tile_mfast(
-                    t, m_tiles, n_tiles, atom_thr_size, mma_tile_coord_v, total_clusters
-                )
+            work = tile_sched.initial_work_tile_info()
             while work.is_valid_tile:
-                if cutlass.const_expr(cfg.clc):
-                    # n-fast CLC grid: x = n tile * atom_thr + CTA v, y = real row tile.
-                    n_tile = work.tile_idx[0] // atom_thr_size
-                    bz_t, mtile, active = _jagged_row_tile(
-                        sTileOff, work.tile_idx[1], g_static
-                    )
-                else:
-                    n_tile = work.tile_idx[1]
-                    mtile = work.tile_idx[0] // atom_thr_size
-                    bz_t = work.tile_idx[2]
+                n_tile, bz_t, mtile, active = _n_fast_tile(
+                    work.tile_idx[0], n_tiles, atom_thr_size, sTileOff, g_static
+                )
                 seq_start = mSeq[bz_t]
-                seq_len = mSeq[bz_t + 1] - seq_start
-                if cutlass.const_expr(not cfg.clc):
-                    active = mtile * cfg.mma_tile_m < seq_len
                 if active:
                     tmem_load = sm100_utils.get_tmem_load_op(
                         (cfg.cta_tile_m, cfg.tile_n, cfg.tile_k),
@@ -1905,21 +1682,10 @@ class JaggedDenseBmmBroadcastAddDJagged:
                             )
                             epilogue_pipeline.producer_commit()
                             epilogue_pipeline.producer_acquire()
-                if cutlass.const_expr(cfg.clc):
-                    clc_pipeline.consumer_wait(clc_consumer_state)
-                    work = tile_sched.get_current_work()
-                    clc_pipeline.consumer_release(clc_consumer_state)
-                    clc_consumer_state.advance()
-                else:
-                    t = t + n_clusters
-                    work = _static_work_tile_mfast(
-                        t,
-                        m_tiles,
-                        n_tiles,
-                        atom_thr_size,
-                        mma_tile_coord_v,
-                        total_clusters,
-                    )
+                clc_pipeline.consumer_wait(clc_consumer_state)
+                work = tile_sched.get_current_work()
+                clc_pipeline.consumer_release(clc_consumer_state)
+                clc_consumer_state.advance()
 
             epilogue_pipeline.producer_tail()
             tmem_dealloc_barrier.arrive_and_wait()
@@ -1957,12 +1723,11 @@ class JaggedDenseBmmBroadcastAddDDenseDBias:
     empty groups store zeros to d_dense, and d_bias tiles with no k-blocks of their own store
     zero partial sums.
 
-    Tile scheduling (Cfg.clc): with Cluster Launch Control the grid is one cluster per tile,
+    Tile scheduling: with Cluster Launch Control the grid is one cluster per tile,
     (2 * m_tiles, n_tiles, G), and a sched warp in each cluster's first CTA claims the next
     unlaunched cluster's tile (clusterlaunchcontrol.try_cancel) for every role to consume.
-    Groups are the slowest grid dim, so tiles are still claimed longest group first. The
-    static fallback walks t = cluster_id, cluster_id + n_clusters, ... over the same tiles.
-    Either way a tile's math is the same, so the outputs are bitwise identical.
+    Groups are the slowest grid dim, so tiles are claimed longest group first. The grid
+    follows D, K and G, not total_M.
     """
 
     _BIAS_N = 16
@@ -1985,7 +1750,7 @@ class JaggedDenseBmmBroadcastAddDDenseDBias:
             tile_n=self._TILE_N,
         )
         assert self.cfg.tile_n // self.cfg.epi_n == self._EPI_STAGES_C
-        self.threads = THREADS_CLC if self.cfg.clc else THREADS
+        self.threads = THREADS
         self.cta_group = tcgen05.CtaGroup.TWO
         self.a_major = tcgen05.OperandMajorMode.MN
         self.b_major = tcgen05.OperandMajorMode.MN
@@ -2032,16 +1797,26 @@ class JaggedDenseBmmBroadcastAddDDenseDBias:
         mA,
         mB,
         mC,
-        mDBias,  # (G, n_tiles, K) fp32 per-N-tile partial row sums; bf16 when n_tiles == 1
+        mDBias,  # (G, n_tiles, K) fp32 per-N-tile partial row sums; (G, K) bf16 when n_tiles == 1
         mSeq,  # (G + 1,) int32 or int64 row offsets
         mTmapAddrsA,
         mTmapAddrsB,
         mTmapAddrsC,
-        max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         D_static: cutlass.Constexpr,
         K_static: cutlass.Constexpr,
     ):
+        # d_out (sum_L, K), jagged (sum_L, D), d_dense (G, D, K) as the caller holds them;
+        # the kernel's views (operand swap): A = d_out.T (K, sum_L, 1), B = jagged.T
+        # (D, sum_L, 1), C (K, D, G). d_bias arrives as (G, K) when there is one N tile.
+        mA = _jit_view(mA, perm=(1, 0), unit_mode=True)
+        mB = _jit_view(mB, perm=(1, 0), unit_mode=True)
+        mC = _jit_view(mC, perm=(2, 1, 0))
+        if cutlass.const_expr(cute.rank(mDBias) == 2):
+            mDBias = _jit_view(mDBias, unit_mode=True)
+            mDBias = cute.make_tensor(
+                mDBias.iterator, cute.select(mDBias.layout, mode=[0, 2, 1])
+            )
         cfg = self.cfg
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.ab_dtype,
@@ -2135,19 +1910,13 @@ class JaggedDenseBmmBroadcastAddDDenseDBias:
         g = cute.size(mC, mode=[2])
         m_tiles = (d_size + cfg.mma_tile_m - 1) // cfg.mma_tile_m
         n_tiles = cute.ceil_div(k_size, cfg.tile_n)
-        total_tiles = m_tiles * n_tiles * g
         atom_thr = cute.size(tiled_mma.thr_id.shape)
         tile_sched_params = cutlass.utils.ClcDynamicPersistentTileSchedulerParams(
             (m_tiles * atom_thr, n_tiles, g), (*cfg.cluster_shape_mn, 1)
         )
-        if cutlass.const_expr(cfg.clc):
-            grid = cutlass.utils.ClcDynamicPersistentTileScheduler.get_grid_shape(
-                tile_sched_params
-            )
-        else:
-            # pyrefly: ignore [bad-specialization]  # Constexpr has no ordering bound
-            n_persist = min(max_active_clusters, total_tiles)
-            grid = (n_persist * atom_thr, 1, 1)
+        grid = cutlass.utils.ClcDynamicPersistentTileScheduler.get_grid_shape(
+            tile_sched_params
+        )
         self.kernel(
             tiled_mma,
             tma_atom_a,
@@ -2167,8 +1936,6 @@ class JaggedDenseBmmBroadcastAddDDenseDBias:
             cluster_layout_vmnk,
             stages,
             n_tiles,
-            m_tiles,
-            total_tiles,
             D_static,
             K_static,
             tma_atom_c,
@@ -2210,8 +1977,6 @@ class JaggedDenseBmmBroadcastAddDDenseDBias:
         cluster_layout_vmnk,
         stages: cutlass.Constexpr,
         n_tiles,
-        m_tiles,
-        total_tiles,
         D_static: cutlass.Constexpr,
         K_static: cutlass.Constexpr,
         tma_atom_c,
@@ -2266,10 +2031,9 @@ class JaggedDenseBmmBroadcastAddDDenseDBias:
         # Group lengths and the longest-first group order (see _num_ab_stages).
         sLen = smem.allocate_tensor(cutlass.Int32, cute.make_layout(g_static), 16)
         sOrder = smem.allocate_tensor(cutlass.Int32, cute.make_layout(g_static), 16)
-        if cutlass.const_expr(cfg.clc):
-            clc_mbar = smem.allocate_array(cutlass.Int64, 2)
-            # try_cancel writes a 16-byte response that must be 16 B aligned.
-            clc_response = smem.allocate_array(cutlass.Int32, 4, byte_alignment=16)
+        clc_mbar = smem.allocate_array(cutlass.Int64, 2)
+        # try_cancel writes a 16-byte response that must be 16 B aligned.
+        clc_response = smem.allocate_array(cutlass.Int32, 4, byte_alignment=16)
 
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
         tx_count = atom_thr_size * (
@@ -2308,24 +2072,23 @@ class JaggedDenseBmmBroadcastAddDDenseDBias:
             defer_sync=cfg.two_cta,
         )
 
-        if cutlass.const_expr(cfg.clc):
-            # Consumers: the sched warp, plus TMA, MMA and the 4 epilogue warps of every
-            # CTA in the cluster (CTA1's idle MMA warp too, or the pipeline never drains).
-            cluster_size = cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1]
-            clc_pipeline = cutlass.pipeline.PipelineClcFetchAsync.create(
-                barrier_storage=clc_mbar,
-                num_stages=1,
-                producer_group=cutlass.pipeline.CooperativeGroup(
-                    cutlass.pipeline.Agent.Thread
-                ),
-                consumer_group=cutlass.pipeline.CooperativeGroup(
-                    cutlass.pipeline.Agent.Thread,
-                    32 * (1 + cluster_size * (len(EPILOGUE_WARP_ID) + 2)),
-                ),
-                tx_count=16,
-                cta_layout_vmnk=cluster_layout_vmnk,
-                defer_sync=True,
-            )
+        # Consumers: the sched warp, plus TMA, MMA and the 4 epilogue warps of every CTA in
+        # the cluster (CTA1's idle MMA warp too, or the pipeline never drains).
+        cluster_size = cfg.cluster_shape_mn[0] * cfg.cluster_shape_mn[1]
+        clc_pipeline = cutlass.pipeline.PipelineClcFetchAsync.create(
+            barrier_storage=clc_mbar,
+            num_stages=1,
+            producer_group=cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread
+            ),
+            consumer_group=cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread,
+                32 * (1 + cluster_size * (len(EPILOGUE_WARP_ID) + 2)),
+            ),
+            tx_count=16,
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
 
         for i in cutlass.range(tidx, cute.size(sOnes), self.threads, unroll=1):
             sOnes[i] = self.ab_dtype(1.0)
@@ -2356,8 +2119,6 @@ class JaggedDenseBmmBroadcastAddDDenseDBias:
 
         mma_tile_coord_v = bx % cute.size(tiled_mma.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
-        cluster_id = bx // cute.size(tiled_mma.thr_id.shape)
-        n_clusters = cute.arch.grid_dim()[0] // cute.size(tiled_mma.thr_id.shape)
         cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         blk_in_cluster_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank)
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
@@ -2419,39 +2180,37 @@ class JaggedDenseBmmBroadcastAddDDenseDBias:
             sOrder[rank] = i
         cute.arch.sync_threads()
 
-        if cutlass.const_expr(cfg.clc):
-            tile_sched = cutlass.utils.ClcDynamicPersistentTileScheduler.create(
-                tile_sched_params,
-                cute.arch.block_idx(),
-                cute.arch.grid_dim(),
-                clc_response,
-            )
-            clc_consumer_state = cutlass.pipeline.make_pipeline_state(
-                cutlass.pipeline.PipelineUserType.Consumer, 1
-            )
+        tile_sched = cutlass.utils.ClcDynamicPersistentTileScheduler.create(
+            tile_sched_params,
+            cute.arch.block_idx(),
+            cute.arch.grid_dim(),
+            clc_response,
+        )
+        clc_consumer_state = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, 1
+        )
 
-        # ── Sched warp (CLC only): claim the next tile for the whole cluster ──
-        if cutlass.const_expr(cfg.clc):
-            if warp_idx == SCHED_WARP_ID and cta_rank == 0:
-                clc_producer_state = cutlass.pipeline.make_pipeline_state(
-                    cutlass.pipeline.PipelineUserType.ProducerConsumer, 1
+        # ── Sched warp: claim the next tile for the whole cluster ──
+        if warp_idx == SCHED_WARP_ID and cta_rank == 0:
+            clc_producer_state = cutlass.pipeline.make_pipeline_state(
+                cutlass.pipeline.PipelineUserType.ProducerConsumer, 1
+            )
+            work = tile_sched.initial_work_tile_info()
+            while work.is_valid_tile:
+                clc_pipeline.producer_acquire(clc_producer_state)
+                tile_sched.advance_to_next_work(
+                    clc_pipeline.producer_get_barrier(clc_producer_state)
                 )
-                work = tile_sched.initial_work_tile_info()
-                while work.is_valid_tile:
-                    clc_pipeline.producer_acquire(clc_producer_state)
-                    tile_sched.advance_to_next_work(
-                        clc_pipeline.producer_get_barrier(clc_producer_state)
-                    )
-                    clc_producer_state.advance()
-                    clc_pipeline.consumer_wait(clc_consumer_state)
-                    work = tile_sched.get_current_work()
-                    clc_pipeline.consumer_release(clc_consumer_state)
-                    clc_consumer_state.advance()
-                clc_pipeline.producer_tail(clc_producer_state)
+                clc_producer_state.advance()
+                clc_pipeline.consumer_wait(clc_consumer_state)
+                work = tile_sched.get_current_work()
+                clc_pipeline.consumer_release(clc_consumer_state)
+                clc_consumer_state.advance()
+            clc_pipeline.producer_tail(clc_producer_state)
 
         # ── TMA warp — TMA-OOB: update descriptor once per outer tile ─────────
         if warp_idx == TMA_WARP_ID:
-            # Descriptor slots are per CTA of the grid: one CTA per tile under CLC.
+            # Descriptor slots are per CTA of the grid (one cluster per tile).
             _cid_addr_a = mTmapAddrsA[cta_linear]
             _cid_addr_b = mTmapAddrsB[cta_linear]
             _tmap_mgr = cutlass.utils.TensorMapManager(
@@ -2500,13 +2259,7 @@ class JaggedDenseBmmBroadcastAddDDenseDBias:
             _mA_base_addr = mA_gmem.iterator.toint()
             _mB_base_addr = mB_gmem.iterator.toint()
 
-            t = cutlass.Int32(cluster_id)
-            if cutlass.const_expr(cfg.clc):
-                work = tile_sched.initial_work_tile_info()
-            else:
-                work = _static_work_tile(
-                    t, n_tiles, m_tiles, atom_thr_size, mma_tile_coord_v, total_tiles
-                )
+            work = tile_sched.initial_work_tile_info()
             while work.is_valid_tile:
                 mtile = work.tile_idx[0] // atom_thr_size
                 n_tile = work.tile_idx[1]
@@ -2593,21 +2346,10 @@ class JaggedDenseBmmBroadcastAddDDenseDBias:
                             mcast_mask=b_mcast_mask,
                             tma_desc_ptr=_slot_b_gen,
                         )
-                if cutlass.const_expr(cfg.clc):
-                    clc_pipeline.consumer_wait(clc_consumer_state)
-                    work = tile_sched.get_current_work()
-                    clc_pipeline.consumer_release(clc_consumer_state)
-                    clc_consumer_state.advance()
-                else:
-                    t = t + n_clusters
-                    work = _static_work_tile(
-                        t,
-                        n_tiles,
-                        m_tiles,
-                        atom_thr_size,
-                        mma_tile_coord_v,
-                        total_tiles,
-                    )
+                clc_pipeline.consumer_wait(clc_consumer_state)
+                work = tile_sched.get_current_work()
+                clc_pipeline.consumer_release(clc_consumer_state)
+                clc_consumer_state.advance()
             ab_producer.tail()
 
         # ── MMA warp ──────────────────────────────────────────────────────────
@@ -2624,18 +2366,7 @@ class JaggedDenseBmmBroadcastAddDDenseDBias:
                 acc_producer_state = cutlass.pipeline.make_pipeline_state(
                     cutlass.pipeline.PipelineUserType.Producer, _NUM_ACC
                 )
-                t = cutlass.Int32(cluster_id)
-                if cutlass.const_expr(cfg.clc):
-                    work = tile_sched.initial_work_tile_info()
-                else:
-                    work = _static_work_tile(
-                        t,
-                        n_tiles,
-                        m_tiles,
-                        atom_thr_size,
-                        mma_tile_coord_v,
-                        total_tiles,
-                    )
+                work = tile_sched.initial_work_tile_info()
                 while work.is_valid_tile:
                     n_tile = work.tile_idx[1]
                     bz = sOrder[work.tile_idx[2]]  # longest group first
@@ -2672,32 +2403,20 @@ class JaggedDenseBmmBroadcastAddDDenseDBias:
                             consumer_handle.release()
                         acc_pipeline.producer_commit(acc_producer_state)
                         acc_producer_state.advance()
-                    if cutlass.const_expr(cfg.clc):
-                        clc_pipeline.consumer_wait(clc_consumer_state)
-                        work = tile_sched.get_current_work()
-                        clc_pipeline.consumer_release(clc_consumer_state)
-                        clc_consumer_state.advance()
-                    else:
-                        t = t + n_clusters
-                        work = _static_work_tile(
-                            t,
-                            n_tiles,
-                            m_tiles,
-                            atom_thr_size,
-                            mma_tile_coord_v,
-                            total_tiles,
-                        )
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
                 acc_pipeline.producer_tail(acc_producer_state)
             else:
-                # CTA1 idles: the leader's cta_group=2 UMMAs cover both CTAs. Under CLC
-                # it still consumes every response, which the pipeline counts.
-                if cutlass.const_expr(cfg.clc):
-                    work = tile_sched.initial_work_tile_info()
-                    while work.is_valid_tile:
-                        clc_pipeline.consumer_wait(clc_consumer_state)
-                        work = tile_sched.get_current_work()
-                        clc_pipeline.consumer_release(clc_consumer_state)
-                        clc_consumer_state.advance()
+                # CTA1 idles: the leader's cta_group=2 UMMAs cover both CTAs. It still
+                # consumes every CLC response, which the pipeline counts.
+                work = tile_sched.initial_work_tile_info()
+                while work.is_valid_tile:
+                    clc_pipeline.consumer_wait(clc_consumer_state)
+                    work = tile_sched.get_current_work()
+                    clc_pipeline.consumer_release(clc_consumer_state)
+                    clc_consumer_state.advance()
 
         # ── Epilogue warps — both CTAs write their cta_tile_m D-row half ──────
         if warp_idx < MMA_WARP_ID:
@@ -2772,13 +2491,7 @@ class JaggedDenseBmmBroadcastAddDDenseDBias:
             rBias = cute.make_rmem_tensor(tTR_cBias.shape, self.acc_dtype)
             bias_row = tTR_cBias[0][0]
 
-            t = cutlass.Int32(cluster_id)
-            if cutlass.const_expr(cfg.clc):
-                work = tile_sched.initial_work_tile_info()
-            else:
-                work = _static_work_tile(
-                    t, n_tiles, m_tiles, atom_thr_size, mma_tile_coord_v, total_tiles
-                )
+            work = tile_sched.initial_work_tile_info()
             while work.is_valid_tile:
                 mtile = work.tile_idx[0] // atom_thr_size
                 n_tile = work.tile_idx[1]
@@ -2919,21 +2632,10 @@ class JaggedDenseBmmBroadcastAddDDenseDBias:
                             epi_tma_pipeline.producer_acquire()
                         epi_tma_pipeline.producer_tail()
                     epi_sync.arrive_and_wait()
-                if cutlass.const_expr(cfg.clc):
-                    clc_pipeline.consumer_wait(clc_consumer_state)
-                    work = tile_sched.get_current_work()
-                    clc_pipeline.consumer_release(clc_consumer_state)
-                    clc_consumer_state.advance()
-                else:
-                    t = t + n_clusters
-                    work = _static_work_tile(
-                        t,
-                        n_tiles,
-                        m_tiles,
-                        atom_thr_size,
-                        mma_tile_coord_v,
-                        total_tiles,
-                    )
+                clc_pipeline.consumer_wait(clc_consumer_state)
+                work = tile_sched.get_current_work()
+                clc_pipeline.consumer_release(clc_consumer_state)
+                clc_consumer_state.advance()
 
             tmem_dealloc_barrier.arrive_and_wait()
             tmem.relinquish_alloc_permit()
@@ -2949,7 +2651,6 @@ def _cutedsl_jagged_dense_bmm_broadcast_add_djagged(
     seq_offsets: torch.Tensor,
     d_out: torch.Tensor,
     dense: torch.Tensor,
-    max_seq_len: int,
 ) -> torch.Tensor:
     """d_jagged = d_out @ dense[g].T  (K-major B, no copy)."""
     _require_cutlass_dsl_version()
@@ -2962,16 +2663,6 @@ def _cutedsl_jagged_dense_bmm_broadcast_add_djagged(
     d_out, dense = _tma_ready(d_out), _tma_ready(dense)
     d_jagged = torch.empty((total, D), dtype=d_out.dtype, device=d_out.device)
 
-    dense_d = dense.detach()
-    b3_bwd = dense_d.permute(1, 2, 0)  # (D, K, G), K stride-1
-
-    a3 = d_out.detach().unsqueeze(-1)
-    c3 = d_jagged.unsqueeze(-1)
-
-    cfg = get_cfg()
-    r_max = -(-total // cfg.mma_tile_m) + G
-    if cfg.clc and r_max > _MAX_GRID_Y:
-        cfg = replace(cfg, clc=False)
     key = (
         torch.cuda.current_device(),
         D,
@@ -2979,45 +2670,47 @@ def _cutedsl_jagged_dense_bmm_broadcast_add_djagged(
         G,
         d_out.dtype,
         seq_offsets.dtype,
-        cfg.clc,
     )
-    cluster_m = cfg.cluster_shape_mn[0]
-    if cfg.clc:
-        n_slots = cluster_m * r_max * -(-D // cfg.tile_n)
-    else:
-        n_slots = cluster_m * _max_active_clusters()
-    tmap_base = _djagged_tmap_slots(d_out.device, n_slots)
+    tmap_base = _djagged_tmap_slots(d_out.device)
     if key not in _COMPILED_BWD_DJAGGED:
-        op = JaggedDenseBmmBroadcastAddDJagged(cutlass.BFloat16, cutlass.Float32, cfg)
+        op = JaggedDenseBmmBroadcastAddDJagged(
+            cutlass.BFloat16, cutlass.Float32, get_cfg()
+        )
         _COMPILED_BWD_DJAGGED[key] = cute.compile(
             op,
-            _ffi_tensor(a3).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2)),
-            _ffi_tensor(b3_bwd),
-            _ffi_tensor(c3).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2)),
+            _ffi_tensor(d_out.detach()).mark_compact_shape_dynamic(
+                mode=0, stride_order=(0, 1)
+            ),
+            _ffi_tensor(dense.detach()),
+            _ffi_tensor(d_jagged).mark_compact_shape_dynamic(
+                mode=0, stride_order=(0, 1)
+            ),
             _ffi_tensor(seq_offsets, 8),
-            cutlass.Int32(int(max_seq_len)),
-            _max_active_clusters(),
             _env_stream(),
             D,
             _ffi_tensor(tmap_base, 8).mark_layout_dynamic(),
             options=_TVM_FFI,
         )
-    _COMPILED_BWD_DJAGGED[key](a3, b3_bwd, c3, seq_offsets, int(max_seq_len), tmap_base)
+    _COMPILED_BWD_DJAGGED[key](d_out, dense, d_jagged, seq_offsets, tmap_base)
     return d_jagged
 
 
+# d_jagged's descriptor slots, one per %smid (B200: at most 160 SMs on the die).
+_DJAGGED_TMAP_SLOTS_N = 1024
 _DJAGGED_TMAP_SLOTS: dict = {}
 
 
-def _djagged_tmap_slots(device: torch.device, n_slots: int) -> torch.Tensor:
-    """d_jagged's per-CTA descriptor slots, per device: a (1,) int64 tensor holding the base
-    of a buffer of >= n_slots 128 B slots (the kernel addresses slot i at base + 128 i).
-    Grown, never shrunk; the kernels on one stream run in order, so reusing the buffer
-    across launches is safe."""
+def _djagged_tmap_slots(device: torch.device) -> torch.Tensor:
+    """d_jagged's per-SM descriptor slots, per device: a (1,) int64 tensor holding the base
+    of a buffer of _DJAGGED_TMAP_SLOTS_N 128 B slots (the kernel addresses slot i at
+    base + 128 i). Allocated once; the kernels on one stream run in order, so reusing the
+    buffer across launches is safe."""
     idx = device.index if device.index is not None else torch.cuda.current_device()
     cur = _DJAGGED_TMAP_SLOTS.get(idx)
-    if cur is None or cur[0].shape[0] < n_slots:
-        buf = torch.empty((n_slots, 128), dtype=torch.uint8, device=device)
+    if cur is None:
+        buf = torch.empty(
+            (_DJAGGED_TMAP_SLOTS_N, 128), dtype=torch.uint8, device=device
+        )
         base_t = torch.tensor([int(buf.data_ptr())], dtype=torch.int64, device=device)
         cur = (buf, base_t)
         _DJAGGED_TMAP_SLOTS[idx] = cur
@@ -3028,7 +2721,6 @@ def _cutedsl_jagged_dense_bmm_broadcast_add_ddense_dbias(
     seq_offsets: torch.Tensor,
     jagged: torch.Tensor,
     d_out: torch.Tensor,
-    max_seq_len: int,
 ) -> tuple:
     """d_dense[g] = jagged[g].T @ d_out[g] and d_bias[g] = d_out[g].sum(0), fused in one
     2-CTA kernel (TMA-OOB). Returns (d_dense, d_bias)."""
@@ -3046,19 +2738,16 @@ def _cutedsl_jagged_dense_bmm_broadcast_add_ddense_dbias(
     # Kernel output: C[k,d]=d_dense[g,d,k] written to mC=[K,D,G] (K-fast, COLUMN_MAJOR SMEM).
     d_dense = torch.empty(G, D, K, dtype=jagged.dtype, device=jagged.device)
     n_tiles_d = -(-D // JaggedDenseBmmBroadcastAddDDenseDBias._TILE_N)
-    d_bias_partial = torch.empty(
-        G,
-        n_tiles_d,
-        K,
-        dtype=torch.float32 if n_tiles_d > 1 else d_out.dtype,
-        device=jagged.device,
-    )
-    c3 = d_dense.permute(2, 1, 0)  # (K, D, G) — K-fast, correct for new A=d_out.T
-
-    _jag_3d = jagged_c.detach().permute(1, 0).unsqueeze(-1)  # (D, total_M, 1)
-    _dout_3d = d_out_c.detach().permute(1, 0).unsqueeze(-1)  # (K, total_M, 1)
-    # A = d_out.T [K, M], B = jagged.T [D, M]; int32 or int64 offsets, read on device (the
-    # dtype is in the key).
+    # One N tile: the kernel writes the bf16 d_bias itself, as (G, K). Several: fp32
+    # per-N-tile partial row sums, summed below in a fixed order.
+    if n_tiles_d == 1:
+        d_bias_partial = torch.empty(G, K, dtype=d_out.dtype, device=jagged.device)
+    else:
+        d_bias_partial = torch.empty(
+            G, n_tiles_d, K, dtype=torch.float32, device=jagged.device
+        )
+    # A = d_out.T [K, M], B = jagged.T [D, M], built in the kernel's __call__; int32 or
+    # int64 offsets, read on device (the dtype is in the key).
     key = (
         torch.cuda.current_device(),
         D,
@@ -3067,17 +2756,12 @@ def _cutedsl_jagged_dense_bmm_broadcast_add_ddense_dbias(
         jagged.dtype,
         seq_offsets.dtype,
     )
-    n_persist = _max_active_clusters(cluster_size=2)
-
     if key not in _COMPILED_BWD_DDENSE_DBIAS:
-        if get_cfg().clc:
-            n_clusters_grid = (
-                -(-K // JaggedDenseBmmBroadcastAddDDenseDBias._MMA_TILE_M)
-                * n_tiles_d
-                * G
-            )
-        else:
-            n_clusters_grid = n_persist
+        # Descriptor slots per CTA (A, B) and per cluster (C) of the grid: one cluster per
+        # tile, so the count follows D, K and G only.
+        n_clusters_grid = (
+            -(-K // JaggedDenseBmmBroadcastAddDDenseDBias._MMA_TILE_M) * n_tiles_d * G
+        )
         n_cta_slots = 2 * n_clusters_grid
         _tmap_buf_a = torch.empty(
             (n_cta_slots, 128), dtype=torch.uint8, device=jagged.device
@@ -3109,19 +2793,18 @@ def _cutedsl_jagged_dense_bmm_broadcast_add_ddense_dbias(
         _COMPILED_BWD_DDENSE_DBIAS[key] = (
             cute.compile(
                 op,
-                _ffi_tensor(_dout_3d).mark_compact_shape_dynamic(
-                    mode=1, stride_order=(2, 1, 0)
+                _ffi_tensor(d_out_c.detach()).mark_compact_shape_dynamic(
+                    mode=0, stride_order=(0, 1)
                 ),
-                _ffi_tensor(_jag_3d).mark_compact_shape_dynamic(
-                    mode=1, stride_order=(2, 1, 0)
+                _ffi_tensor(jagged_c.detach()).mark_compact_shape_dynamic(
+                    mode=0, stride_order=(0, 1)
                 ),
-                _ffi_tensor(c3),
+                _ffi_tensor(d_dense),
                 _ffi_tensor(d_bias_partial),
                 _ffi_tensor(seq_offsets, 8),
                 _ffi_tensor(_addrs_a, 8).mark_layout_dynamic(),
                 _ffi_tensor(_addrs_b, 8).mark_layout_dynamic(),
                 _ffi_tensor(_addrs_c, 8).mark_layout_dynamic(),
-                n_persist,
                 _env_stream(),
                 K,
                 D,
@@ -3135,8 +2818,15 @@ def _cutedsl_jagged_dense_bmm_broadcast_add_ddense_dbias(
 
     compiled, _bufs, addrs_a, addrs_b, addrs_c = _COMPILED_BWD_DDENSE_DBIAS[key]
     compiled(
-        _dout_3d, _jag_3d, c3, d_bias_partial, seq_offsets, addrs_a, addrs_b, addrs_c
+        d_out_c,
+        jagged_c,
+        d_dense,
+        d_bias_partial,
+        seq_offsets,
+        addrs_a,
+        addrs_b,
+        addrs_c,
     )
     if n_tiles_d == 1:
-        return d_dense, d_bias_partial.view(G, K)
+        return d_dense, d_bias_partial
     return d_dense, d_bias_partial.sum(dim=1).to(d_out.dtype)
