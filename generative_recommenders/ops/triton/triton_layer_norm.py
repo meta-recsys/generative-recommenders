@@ -449,6 +449,129 @@ def _weighted_layer_norm_bwd_dx(
     tl.store(db_ptrs, acc_db, mask=col_mask)
 
 
+def _get_weighted_layer_norm_bwd_large_n_configs() -> List[triton.Config]:
+    # (BLOCK_N, num_warps, NUM_STAGES)
+    params = [
+        (8, 2, 3),
+        (8, 4, 3),
+        (16, 2, 3),
+        (16, 4, 2),
+        (16, 4, 3),
+        (16, 4, 4),
+        (16, 8, 3),
+        (32, 4, 2),
+        (32, 4, 3),
+        (32, 8, 3),
+        (32, 8, 4),
+        (64, 8, 3),
+    ]
+    return [
+        triton.Config(
+            {"BLOCK_N": BLOCK_N, "NUM_STAGES": num_stages}, num_warps=num_warps
+        )
+        for BLOCK_N, num_warps, num_stages in params
+    ]
+
+
+def _prune_weighted_layer_norm_bwd_large_n_configs(
+    configs, named_args, **kwargs
+) -> List[triton.Config]:
+    # Keep a full 16-byte vector and at most 64 elements per thread. Each kept
+    # config then spreads a row over the same lanes, in the same per-thread
+    # chunks, as the num_warps=1 configs of _weighted_layer_norm_bwd_dx, so the
+    # dx row reductions, and dx itself, are bitwise the same.
+    block_d = kwargs.get("BLOCK_D", named_args.get("BLOCK_D", 0))
+    vec = 16 // named_args["X"].element_size()
+    return [
+        config
+        for config in configs
+        if vec <= config.kwargs["BLOCK_N"] * block_d // (32 * config.num_warps) <= 64
+    ]
+
+
+@triton_autotune(
+    configs=_get_weighted_layer_norm_bwd_large_n_configs(),
+    key=["BLOCK_D", "N_BUCKET"],
+    prune_configs_by={
+        "early_config_prune": _prune_weighted_layer_norm_bwd_large_n_configs
+    },
+)
+@triton.jit(do_not_specialize=["N_BUCKET"])
+def _weighted_layer_norm_bwd_large_n(  # triton-lint: disable=TR001 (triton_autotune)
+    DX,
+    DY,
+    DW,
+    DB,
+    X,
+    W,
+    Mean,
+    Rstd,
+    stride_dx,
+    stride_dy,
+    stride_x,
+    D,
+    N,
+    N_BUCKET,
+    BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+):
+    """_weighted_layer_norm_bwd_dx with IS_SWISH=False and the same dx math.
+
+    The dW/dB partials stay in [BLOCK_N, BLOCK_D] registers and are reduced
+    over rows once per program rather than once per block, which is what makes
+    multi-warp configs cheap here. N_BUCKET only keys the autotuner.
+    """
+    pid = tl.program_id(0)
+    tile_num = tl.num_programs(0)
+    num_blocks = tl.cdiv(N, BLOCK_N)
+
+    cols = tl.arange(0, BLOCK_D)
+    col_mask = cols < D
+    w = tl.load(W + cols, mask=col_mask, other=0.0).to(tl.float32)
+
+    acc_dw = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
+    acc_db = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
+
+    for block in tl.range(pid, num_blocks, tile_num, num_stages=NUM_STAGES):
+        rows = block * BLOCK_N + tl.arange(0, BLOCK_N)
+        row_mask = rows < N
+        mask = row_mask[:, None] & col_mask[None, :]
+        rows_64 = rows.to(tl.int64)[:, None]
+        x_block = tl.load(
+            X + rows_64 * stride_x + cols[None, :], mask=mask, other=0.0
+        ).to(tl.float32)
+        dy_block = tl.load(
+            DY + rows_64 * stride_dy + cols[None, :], mask=mask, other=0.0
+        ).to(tl.float32)
+        mean = tl.load(Mean + rows, row_mask, other=0.0)
+        rstd = tl.load(Rstd + rows, row_mask, other=0.0)
+        mean = tl.expand_dims(mean, 1)
+        rstd = tl.expand_dims(rstd, 1)
+
+        xhat = (x_block - mean) * rstd
+        xhat = tl.where(mask, xhat, 0.0)
+        wdy = w[None, :] * dy_block
+        wdy = tl.where(mask, wdy, 0.0)
+        c1 = tl.sum(xhat * wdy, axis=1) / D
+        c2 = tl.sum(wdy, axis=1) / D
+        c1 = tl.expand_dims(c1, 1)
+        c2 = tl.expand_dims(c2, 1)
+        dx = (wdy - (xhat * c1 + c2)) * rstd
+        tl.store(
+            DX + rows_64 * stride_dx + cols[None, :],
+            dx.to(DX.dtype.element_ty),
+            mask=mask,
+        )
+        acc_dw += dy_block * xhat
+        acc_db += dy_block
+
+    dw_ptrs = DW + pid.to(tl.int64) * D + cols
+    db_ptrs = DB + pid.to(tl.int64) * D + cols
+    tl.store(dw_ptrs, tl.sum(acc_dw, axis=0), mask=col_mask)
+    tl.store(db_ptrs, tl.sum(acc_db, axis=0), mask=col_mask)
+
+
 def _get_bwd_dwdb_configs() -> List[triton.Config]:
     configs = []
     BLOCK_N_CHOICES = [32, 64, 128, 256]
@@ -720,6 +843,103 @@ def _(
     return dx, dweight, dbias
 
 
+# A separate op rather than a flag on triton_weighted_layer_norm_bwd, so graphs
+# that call it can never share an FX graph cache entry with graphs that do not.
+@maybe_register_custom_op(
+    "generative_recommenders::triton_weighted_layer_norm_bwd_large_n",
+    mutates_args=(),
+)
+def _triton_weighted_layer_norm_bwd_large_n_impl(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    eps: float,
+    BLOCK_D: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    N, D = x.shape
+    vec = 16 // x.element_size()
+    aligned = all(
+        v % 16 == 0 for v in (D, x.stride(0), dy.stride(0), x.data_ptr(), dy.data_ptr())
+    )
+    if not (aligned and 8 * vec <= BLOCK_D <= 32 * vec):
+        # Otherwise the default kernel can lay a row out differently (across
+        # warps, or in chunks smaller than a 16-byte vector), and dx would no
+        # longer match it bitwise.
+        return _triton_weighted_layer_norm_bwd_impl(
+            dy, x, weight, bias, mean, rstd, True, eps, BLOCK_D
+        )
+    assert x.stride(1) == 1 and dy.stride(1) == 1
+    dx = torch.empty_like(x)
+    dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
+    dbias = torch.empty((D,), dtype=weight.dtype, device=x.device)
+    if N == 0:
+        dweight.zero_()
+        dbias.zero_()
+        return dx, dweight, dbias
+    sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+    # Many more programs than fit at once, so the last wave stays short
+    # whatever occupancy the autotuned config reaches.
+    tile_num = max(1, min(sms * 32, triton.cdiv(N, 64)))
+    _dweight = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
+    _dbias = torch.empty((tile_num, D), dtype=torch.float32, device=x.device)
+    # pyre-ignore[28]
+    _weighted_layer_norm_bwd_large_n[(tile_num,)](
+        dx,
+        dy,
+        _dweight,
+        _dbias,
+        x,
+        weight,
+        mean,
+        rstd,
+        dx.stride(0),
+        dy.stride(0),
+        x.stride(0),
+        D,
+        N,
+        N.bit_length(),
+        BLOCK_D=BLOCK_D,
+    )
+
+    def grid(META):
+        return (triton.cdiv(D, META["BLOCK_D"]),)
+
+    blocks = triton.next_power_of_2(sms * 4)
+    dwdb_BLOCK_D = triton.next_power_of_2(triton.cdiv(D, blocks))
+    dwdb_BLOCK_D = min(max(dwdb_BLOCK_D, 4), 128)
+    _layer_norm_bwd_dwdb[grid](
+        _dweight,
+        _dbias,
+        dweight,
+        dbias,
+        tile_num,
+        D,
+        BLOCK_D=dwdb_BLOCK_D,
+    )
+    return dx, dweight, dbias
+
+
+@_triton_weighted_layer_norm_bwd_large_n_impl.register_fake
+def _(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    eps: float,
+    BLOCK_D: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    D = x.shape[-1]
+    dx = torch.empty_like(x)
+    dweight = torch.empty((D,), dtype=weight.dtype, device=x.device)
+    dbias = torch.empty((D,), dtype=weight.dtype, device=x.device)
+    return dx, dweight, dbias
+
+
 def triton_weighted_layer_norm_bwd(
     dy: torch.Tensor,
     x: torch.Tensor,
@@ -750,6 +970,34 @@ def triton_weighted_layer_norm_bwd(
     if not learnable:
         return dx, None, None
     return dx, dweight, dbias
+
+
+def triton_weighted_layer_norm_bwd_large_n(
+    dy: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    mean: torch.Tensor,
+    rstd: torch.Tensor,
+    eps: float,
+    BLOCK_D: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """triton_weighted_layer_norm_bwd for a learnable norm, with dx in
+    multi-warp, pipelined configs autotuned per power-of-two bucket of N.
+    Shapes where the row layout could differ from the default kernel's
+    num_warps=1 configs fall back to the default op, so dx stays bitwise the
+    same; dW/dB sum in a different order.
+    """
+    return _triton_weighted_layer_norm_bwd_large_n_impl(
+        dy=dy,
+        x=x,
+        weight=weight,
+        bias=bias,
+        mean=mean,
+        rstd=rstd,
+        eps=eps,
+        BLOCK_D=BLOCK_D,
+    )
 
 
 class LayerNormFunction(torch.autograd.Function):
