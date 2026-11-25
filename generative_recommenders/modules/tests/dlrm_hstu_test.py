@@ -17,6 +17,7 @@
 import dataclasses
 import unittest
 from typing import Tuple
+from unittest import mock
 
 import torch
 from generative_recommenders.common import gpu_unavailable, HammerKernel
@@ -25,6 +26,7 @@ from generative_recommenders.dlrm_v3.configs import (
     get_hstu_configs,
 )
 from generative_recommenders.dlrm_v3.datasets.dataset import collate_fn, get_random_data
+from generative_recommenders.modules import dlrm_hstu
 from generative_recommenders.modules.dlrm_hstu import DlrmHSTU, DlrmHSTUConfig
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -108,6 +110,54 @@ class DlrmHSTUStaticShapeTest(unittest.TestCase):
     @unittest.skipIf(*gpu_unavailable)
     def test_static_matches_default_triton(self) -> None:
         self._check_static_matches_default(HammerKernel.TRITON)
+
+    @unittest.skipIf(*gpu_unavailable)
+    @torch.no_grad()
+    def test_reuse_merge_offsets_with_empty_rows(self) -> None:
+        model, cfg = _small_model(HammerKernel.TRITON)
+        model.eval()
+
+        def features(keys: list[str], row_lengths: list[int]) -> KeyedJaggedTensor:
+            lengths = torch.tensor(
+                [
+                    1 if key in cfg.contextual_feature_to_max_length else n
+                    for key in keys
+                    for n in row_lengths
+                ]
+            )
+            values = torch.arange(int(lengths.sum()), device="cuda") % 1000
+            return KeyedJaggedTensor(keys=keys, lengths=lengths.cuda(), values=values)
+
+        uih = features(cfg.hstu_uih_feature_names, [0, 3, 8])
+        candidates = features(cfg.hstu_candidate_feature_names, [2, 0, 1])
+        embeddings, payload, max_h, histories, max_c, counts = model.preprocess(
+            uih, candidates
+        )
+        reference, actual = dict(embeddings), dict(embeddings)
+        ref_preds = model.main_forward(
+            reference, payload, max_h, histories, max_c, counts
+        )[3]
+        cfg.reuse_precomputed_merge_offsets = True
+        with mock.patch.object(
+            dlrm_hstu, "concat_2D_jagged", wraps=dlrm_hstu.concat_2D_jagged
+        ) as concat:
+            actual_preds = model.main_forward(
+                actual, payload, max_h, histories, max_c, counts
+            )[3]
+        for key, _ in cfg.merge_uih_candidate_feature_mapping:
+            if key in embeddings:
+                (merge,) = (
+                    call.kwargs
+                    for call in concat.call_args_list
+                    if call.kwargs["values_left"] is embeddings[key].embedding
+                )
+                self.assertIs(merge["offsets_left"], payload["uih_offsets"])
+                self.assertIs(merge["offsets_right"], payload["candidate_offsets"])
+                torch.testing.assert_close(
+                    actual[key].embedding, reference[key].embedding, rtol=0, atol=0
+                )
+        self.assertIsNotNone(actual_preds)
+        torch.testing.assert_close(actual_preds, ref_preds, rtol=0, atol=0)
 
     @unittest.skipIf(*gpu_unavailable)
     def test_candidate_weights(self) -> None:
