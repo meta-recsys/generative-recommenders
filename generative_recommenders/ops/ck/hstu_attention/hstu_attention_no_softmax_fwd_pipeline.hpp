@@ -220,7 +220,8 @@ struct HstuAttentionNoSoftmaxFwdPipelineQRKSVS {
     });
 
     __builtin_amdgcn_sched_barrier(
-        LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+        LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+        LLVMSchedGroupMask::TRANS);
 
     // provide partition_index for LDS tile window so that warp_id is in vgpr
     array<index_t, 2> partition_index{get_warp_id<false>(), get_lane_id()};
@@ -364,7 +365,8 @@ struct HstuAttentionNoSoftmaxFwdPipelineQRKSVS {
       });
 
       __builtin_amdgcn_sched_barrier(
-          LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+          LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+          LLVMSchedGroupMask::TRANS);
 
       // STAGE 2, scale_s, add bias, mask, siLU
       if constexpr (kHasBias) {
@@ -409,7 +411,8 @@ struct HstuAttentionNoSoftmaxFwdPipelineQRKSVS {
       }
 
       __builtin_amdgcn_sched_barrier(
-          LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+          LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+          LLVMSchedGroupMask::TRANS);
 
       using v_shuffled_tile_type =
           decltype(make_static_distributed_tensor<QKVDataType>(
@@ -429,7 +432,8 @@ struct HstuAttentionNoSoftmaxFwdPipelineQRKSVS {
       store_tile(v_lds_windows[number<0>{}], v_shuffled_tile, partition_index);
 
       __builtin_amdgcn_sched_barrier(
-          LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+          LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+          LLVMSchedGroupMask::TRANS);
 
       tile_elementwise_inout(f_silu, pcomp_tile);
 

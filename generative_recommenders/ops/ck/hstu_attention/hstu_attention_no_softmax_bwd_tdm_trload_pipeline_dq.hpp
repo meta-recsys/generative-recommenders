@@ -204,17 +204,20 @@ struct HstuAttentionNoSoftmaxBwdTdmTrLoadPipelineQRKSVS_dQ {
         k_lds_monolithic_window_0,
         sequence<0, 0>{},
         sequence<kN0Sub, kQKHeaddim>{}));
-    statically_indexed_array<k_lds_window_type, n0_loops> k_lds_windows_0;
-    statically_indexed_array<k_lds_window_type, n0_loops> k_lds_windows_1;
-    static_for<0, n0_loops, 1>{}([&](auto i_buf) {
-      k_lds_windows_0[i_buf] = get_slice_tile(
+
+    statically_indexed_array<
+        statically_indexed_array<k_lds_window_type, n0_loops>,
+        2>
+        k_lds_windows;
+    static_for<0, n0_loops, 1>{}([&](auto i_sub) {
+      k_lds_windows[number<0>{}][i_sub] = get_slice_tile(
           k_lds_monolithic_window_0,
-          sequence<i_buf * kN0Sub, 0>{},
-          sequence<(i_buf + 1) * kN0Sub, kQKHeaddim>{});
-      k_lds_windows_1[i_buf] = get_slice_tile(
+          sequence<i_sub * kN0Sub, 0>{},
+          sequence<(i_sub + 1) * kN0Sub, kQKHeaddim>{});
+      k_lds_windows[number<1>{}][i_sub] = get_slice_tile(
           k_lds_monolithic_window_1,
-          sequence<i_buf * kN0Sub, 0>{},
-          sequence<(i_buf + 1) * kN0Sub, kQKHeaddim>{});
+          sequence<i_sub * kN0Sub, 0>{},
+          sequence<(i_sub + 1) * kN0Sub, kQKHeaddim>{});
     });
 
     // k_lds windows for trload read
@@ -222,19 +225,20 @@ struct HstuAttentionNoSoftmaxBwdTdmTrLoadPipelineQRKSVS_dQ {
         k_lds_monolithic_window_0,
         sequence<0, 0>{},
         sequence<kK1, kQKHeaddim>{}));
-    statically_indexed_array<k_lds_trload_window_type, k1_loops>
-        k_lds_trload_windows_0;
-    statically_indexed_array<k_lds_trload_window_type, k1_loops>
-        k_lds_trload_windows_1;
-    static_for<0, k1_loops, 1>{}([&](auto i_buf) {
-      k_lds_trload_windows_0[i_buf] = get_slice_tile(
+
+    statically_indexed_array<
+        statically_indexed_array<k_lds_trload_window_type, k1_loops>,
+        2>
+        k_lds_trload_windows;
+    static_for<0, k1_loops, 1>{}([&](auto i_sub) {
+      k_lds_trload_windows[number<0>{}][i_sub] = get_slice_tile(
           k_lds_monolithic_window_0,
-          sequence<i_buf * kK1, 0>{},
-          sequence<(i_buf + 1) * kK1, kQKHeaddim>{});
-      k_lds_trload_windows_1[i_buf] = get_slice_tile(
+          sequence<i_sub * kK1, 0>{},
+          sequence<(i_sub + 1) * kK1, kQKHeaddim>{});
+      k_lds_trload_windows[number<1>{}][i_sub] = get_slice_tile(
           k_lds_monolithic_window_1,
-          sequence<i_buf * kK1, 0>{},
-          sequence<(i_buf + 1) * kK1, kQKHeaddim>{});
+          sequence<i_sub * kK1, 0>{},
+          sequence<(i_sub + 1) * kK1, kQKHeaddim>{});
     });
 
     QKVDataType* v_lds_ptr = reinterpret_cast<QKVDataType*>(
@@ -263,17 +267,20 @@ struct HstuAttentionNoSoftmaxBwdTdmTrLoadPipelineQRKSVS_dQ {
         v_lds_monolithic_window_0,
         sequence<0, 0>{},
         sequence<kN0Sub, kVHeaddim>{}));
-    statically_indexed_array<v_lds_window_type, NumVLdsBuffers> v_lds_windows_0;
-    statically_indexed_array<v_lds_window_type, NumVLdsBuffers> v_lds_windows_1;
-    static_for<0, NumVLdsBuffers, 1>{}([&](auto i_buf) {
-      v_lds_windows_0[i_buf] = get_slice_tile(
+
+    statically_indexed_array<
+        statically_indexed_array<v_lds_window_type, NumVLdsBuffers>,
+        2>
+        v_lds_windows;
+    static_for<0, NumVLdsBuffers, 1>{}([&](auto i_sub) {
+      v_lds_windows[number<0>{}][i_sub] = get_slice_tile(
           v_lds_monolithic_window_0,
-          sequence<i_buf * kN0Sub, 0>{},
-          sequence<(i_buf + 1) * kN0Sub, kVHeaddim>{});
-      v_lds_windows_1[i_buf] = get_slice_tile(
+          sequence<i_sub * kN0Sub, 0>{},
+          sequence<(i_sub + 1) * kN0Sub, kVHeaddim>{});
+      v_lds_windows[number<1>{}][i_sub] = get_slice_tile(
           v_lds_monolithic_window_1,
-          sequence<i_buf * kN0Sub, 0>{},
-          sequence<(i_buf + 1) * kN0Sub, kVHeaddim>{});
+          sequence<i_sub * kN0Sub, 0>{},
+          sequence<(i_sub + 1) * kN0Sub, kVHeaddim>{});
     });
 
     array<index_t, 2> partition_index{get_warp_id<false>(), get_lane_id()};
@@ -335,10 +342,12 @@ struct HstuAttentionNoSoftmaxBwdTdmTrLoadPipelineQRKSVS_dQ {
     tdm_config_v.pad_config.pad_amount = pad_cfg_v[number<1>{}];
     tdm_config_v.pad_config.pad_interval = pad_cfg_v[number<2>{}];
 
-    load_tile_tdm(tdm_config_k, k_lds_windows_0[number<0>{}], k_dram_window);
+    load_tile_tdm(
+        tdm_config_k, k_lds_windows[number<0>{}][number<0>{}], k_dram_window);
     move_tile_window(k_dram_window, {kN0Sub, 0});
 
-    load_tile_tdm(tdm_config_v, v_lds_windows_0[number<0>{}], v_dram_window);
+    load_tile_tdm(
+        tdm_config_v, v_lds_windows[number<0>{}][number<0>{}], v_dram_window);
     move_tile_window(v_dram_window, {kN0Sub, 0});
 
     // SiLU activation: dsilu(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
@@ -346,15 +355,15 @@ struct HstuAttentionNoSoftmaxBwdTdmTrLoadPipelineQRKSVS_dQ {
       const auto one = type_convert<CompDataType>(1.0f);
       CompDataType sig;
       if constexpr (std::is_same_v<CompDataType, float>)
-        sig = __builtin_amdgcn_rcpf(one + __expf(-x));
+        sig = 0.5f * __builtin_amdgcn_tanhf(0.5f * x) + 0.5f;
       else
         sig = one / (one + exp(-x));
-      return sig * (one + x * (one - sig));
+      return sig + sig * (one - sig) * x;
     };
 
     auto seqlen_k_curr = seqlen_k_start;
 
-    auto main_loop_func = [&](auto EvenIter) {
+    auto main_loop_func = [&](auto i_buf) {
       // === STAGE 1: Gemm0 (S = Q@K) ===
       // === STAGE 2: Gemm2 (dP = dO@V) ===
       static_for<0, n0_loops, 1>{}([&](auto i_n0) {
@@ -364,59 +373,40 @@ struct HstuAttentionNoSoftmaxBwdTdmTrLoadPipelineQRKSVS_dQ {
         s_wait_tensorcnt_barrier<0>();
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Gemm0: sacc_tile = Q @ K_sub
         // Gemm2: dpacc_tile = dO @ V_sub
-        if constexpr (EvenIter) {
-          if constexpr (i_n0 < n0_loops - 1) {
-            load_tile_tdm(
-                tdm_config_k,
-                k_lds_windows_0[number<i_n0 + 1>{}],
-                k_dram_window);
-            move_tile_window(k_dram_window, {kN0Sub, 0});
-            load_tile_tdm(
-                tdm_config_v, v_lds_windows_0[i_lds_buf_1], v_dram_window);
-            move_tile_window(v_dram_window, {kN0Sub, 0});
-          } else {
-            load_tile_tdm(
-                tdm_config_k, k_lds_windows_1[number<0>{}], k_dram_window);
-            move_tile_window(k_dram_window, {kN0Sub, 0});
-            load_tile_tdm(
-                tdm_config_v, v_lds_windows_1[number<0>{}], v_dram_window);
-            move_tile_window(v_dram_window, {kN0Sub, 0});
-          }
-
-          __builtin_amdgcn_sched_barrier(
-              LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
-
-          gemm_0(sacc_tile, q_tile, k_lds_windows_0[i_n0]);
-          gemm_2(dpacc_tile, do_tile, v_lds_windows_0[i_lds_buf_0]);
+        if constexpr (i_n0 < n0_loops - 1) {
+          load_tile_tdm(
+              tdm_config_k,
+              k_lds_windows[i_buf][number<i_n0 + 1>{}],
+              k_dram_window);
+          move_tile_window(k_dram_window, {kN0Sub, 0});
+          load_tile_tdm(
+              tdm_config_v, v_lds_windows[i_buf][i_lds_buf_1], v_dram_window);
+          move_tile_window(v_dram_window, {kN0Sub, 0});
         } else {
-          if constexpr (i_n0 < n0_loops - 1) {
-            load_tile_tdm(
-                tdm_config_k,
-                k_lds_windows_1[number<i_n0 + 1>{}],
-                k_dram_window);
-            move_tile_window(k_dram_window, {kN0Sub, 0});
-            load_tile_tdm(
-                tdm_config_v, v_lds_windows_1[i_lds_buf_1], v_dram_window);
-            move_tile_window(v_dram_window, {kN0Sub, 0});
-          } else {
-            load_tile_tdm(
-                tdm_config_k, k_lds_windows_0[number<0>{}], k_dram_window);
-            move_tile_window(k_dram_window, {kN0Sub, 0});
-            load_tile_tdm(
-                tdm_config_v, v_lds_windows_0[number<0>{}], v_dram_window);
-            move_tile_window(v_dram_window, {kN0Sub, 0});
-          }
-
-          __builtin_amdgcn_sched_barrier(
-              LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
-
-          gemm_0(sacc_tile, q_tile, k_lds_windows_1[i_n0]);
-          gemm_2(dpacc_tile, do_tile, v_lds_windows_1[i_lds_buf_0]);
+          constexpr auto next_buf = number<1 - i_buf>{};
+          load_tile_tdm(
+              tdm_config_k,
+              k_lds_windows[next_buf][number<0>{}],
+              k_dram_window);
+          move_tile_window(k_dram_window, {kN0Sub, 0});
+          load_tile_tdm(
+              tdm_config_v,
+              v_lds_windows[next_buf][number<0>{}],
+              v_dram_window);
+          move_tile_window(v_dram_window, {kN0Sub, 0});
         }
+
+        __builtin_amdgcn_sched_barrier(
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
+
+        gemm_0(sacc_tile, q_tile, k_lds_windows[i_buf][i_n0]);
+        gemm_2(dpacc_tile, do_tile, v_lds_windows[i_buf][i_lds_buf_0]);
 
         auto s_tmp = cast_tile<CompDataType>(sacc_tile);
         set_slice_tile(
@@ -529,24 +519,20 @@ struct HstuAttentionNoSoftmaxBwdTdmTrLoadPipelineQRKSVS_dQ {
             sequence<kM0, (i_k1 + 1) * kK1>{}));
 
         // dQ += dS_sub @ KT_sub
-        if constexpr (EvenIter) {
-          gemm_4(dq_acc, ds_slice, k_lds_trload_windows_0[i_k1]);
-        } else {
-          gemm_4(dq_acc, ds_slice, k_lds_trload_windows_1[i_k1]);
-        }
+        gemm_4(dq_acc, ds_slice, k_lds_trload_windows[i_buf][i_k1]);
       });
     };
 
     while (seqlen_k_curr + kN0 < seqlen_k_end) {
-      main_loop_func(bool_constant<true>{});
+      main_loop_func(number<0>{});
       seqlen_k_curr += kN0;
 
-      main_loop_func(bool_constant<false>{});
+      main_loop_func(number<1>{});
       seqlen_k_curr += kN0;
     }
 
     if (seqlen_k_curr < seqlen_k_end)
-      main_loop_func(bool_constant<true>{});
+      main_loop_func(number<0>{});
 
     // Apply alpha scaling to accumulated dQ
     tile_elementwise_inout([&scale_s](auto& x) { x = x * scale_s; }, dq_acc);

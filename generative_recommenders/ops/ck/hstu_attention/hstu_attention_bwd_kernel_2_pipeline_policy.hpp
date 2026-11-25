@@ -11,10 +11,11 @@
 #include <ck_tile/ops/gemm/pipeline/tile_gemm_shape.hpp>
 #include <ck_tile/ops/gemm/warp/warp_gemm_dispatcher.hpp>
 
-#include "block_gemm_areg_bsmem_creg_v2_hack_1.hpp"
-#include "block_gemm_areg_bsmem_trload_creg_v2_hack_1.hpp"
-#include "block_gemm_asmem_breg_creg_v1_hack.hpp"
+#include "block_gemm_areg_bsmem_creg_slice_gemmk_full_gemmn.hpp"
+#include "block_gemm_areg_bsmem_trload_creg_slice_gemmk_full_gemmn.hpp"
+#include "block_gemm_asmem_breg_creg_full_gemmk_slice_gemmm.hpp"
 #include "block_gemm_tdm_group_prefetch.hpp"
+#include "block_gemm_tdm_group_prefetch_for_bwd.hpp"
 
 #include "hstu_attention_config.hpp"
 #include "hstu_attention_kernel_util.hpp"
@@ -1148,15 +1149,17 @@ struct HstuAttentionBwdKernel2PipelinePolicy {
     constexpr index_t KIterPerWarp =
         Problem::HstuAttentionTileSetting::kQKHeaddim / decltype(warp_gemm)::kK;
     constexpr index_t kTdmGemmPrefetchDepth = MIterPerWarp * KIterPerWarp / 2;
-    constexpr index_t kTdmGemmStepsPerGroup = 1;
+    constexpr index_t kTdmGemmStepsPerGroup = MIterPerWarp;
 
-    return BlockGemmASmemBRegCRegTdmGroupPrefetch<
+    return BlockGemmASmemBRegCRegTdmGroupPrefetchFullGemmKSliceGemmMWithPrologueHook<
         GemmProblem,
         BlockGemmPolicy,
         kTdmGemmPrefetchDepth,
         kTdmGemmStepsPerGroup>{};
 #else
-    return BlockGemmASmemBRegCRegV1Hack<GemmProblem, BlockGemmPolicy>{};
+    return BlockGemmASmemBRegCRegFullGemmKSliceGemmM<
+        GemmProblem,
+        BlockGemmPolicy>{};
 #endif
   }
 
@@ -1232,7 +1235,9 @@ struct HstuAttentionBwdKernel2PipelinePolicy {
         typename Problem::HstuAttentionTileSetting::Gemm0Gemm2BlockWarps,
         decltype(warp_gemm)>;
 
-    return BlockGemmASmemBRegCRegV1Hack<GemmProblem, BlockGemmPolicy>{};
+    return BlockGemmASmemBRegCRegFullGemmKSliceGemmM<
+        GemmProblem,
+        BlockGemmPolicy>{};
   }
 
   // Gemm2: dP = dO @ V   [kM0Sub, kN0] = [kM0Sub, kVHeaddim] x [kN0, kVHeaddim]
@@ -1311,15 +1316,17 @@ struct HstuAttentionBwdKernel2PipelinePolicy {
     constexpr index_t KIterPerWarp =
         Problem::HstuAttentionTileSetting::kQKHeaddim / decltype(warp_gemm)::kK;
     constexpr index_t kTdmGemmPrefetchDepth = MIterPerWarp * KIterPerWarp / 2;
-    constexpr index_t kTdmGemmStepsPerGroup = 1;
+    constexpr index_t kTdmGemmStepsPerGroup = MIterPerWarp;
 
-    return BlockGemmASmemBRegCRegTdmGroupPrefetch<
+    return BlockGemmASmemBRegCRegTdmGroupPrefetchFullGemmKSliceGemmMWithPrologueHook<
         GemmProblem,
         BlockGemmPolicy,
         kTdmGemmPrefetchDepth,
         kTdmGemmStepsPerGroup>{};
 #else
-    return BlockGemmASmemBRegCRegV1Hack<GemmProblem, BlockGemmPolicy>{};
+    return BlockGemmASmemBRegCRegFullGemmKSliceGemmM<
+        GemmProblem,
+        BlockGemmPolicy>{};
 #endif
   }
 
@@ -1629,7 +1636,9 @@ struct HstuAttentionBwdKernel2PipelinePolicy {
         decltype(warp_gemm)>;
 
     if constexpr (!kUseTrLoad) {
-      return BlockGemmARegBSmemCRegV2Hack_1<GemmProblem, BlockGemmPolicy>{};
+      return BlockGemmARegBSmemCRegSliceGemmKFullGemmN<
+          GemmProblem,
+          BlockGemmPolicy>{};
     } else {
 #if HSTU_LDS_STAGING_THROUGH_TDM_AVAILABLE
       constexpr index_t NIterPerWarp =
@@ -1640,13 +1649,13 @@ struct HstuAttentionBwdKernel2PipelinePolicy {
       constexpr index_t kTdmGemmPrefetchDepth = NIterPerWarp * KIterPerWarp / 2;
       constexpr index_t kTdmGemmStepsPerGroup = 1;
 
-      return BlockGemmARegBSmemTrLoadCRegTdmGroupPrefetch_1<
+      return BlockGemmARegBSmemTrLoadCRegTdmGroupPrefetchSliceGemmKFullGemmN<
           GemmProblem,
           BlockGemmPolicy,
           kTdmGemmPrefetchDepth,
           kTdmGemmStepsPerGroup>{};
 #else
-      return BlockGemmARegBSmemTrLoadCRegV2Hack_1<
+      return BlockGemmARegBSmemTrLoadCRegSliceGemmKFullGemmN<
           GemmProblem,
           BlockGemmPolicy>{};
 #endif
@@ -1754,7 +1763,9 @@ struct HstuAttentionBwdKernel2PipelinePolicy {
         decltype(warp_gemm)>;
 
     if constexpr (!kUseTrLoad) {
-      return BlockGemmARegBSmemCRegV2Hack_1<GemmProblem, BlockGemmPolicy>{};
+      return BlockGemmARegBSmemCRegSliceGemmKFullGemmN<
+          GemmProblem,
+          BlockGemmPolicy>{};
     } else {
 #if HSTU_LDS_STAGING_THROUGH_TDM_AVAILABLE
       constexpr index_t NIterPerWarp =
@@ -1765,13 +1776,13 @@ struct HstuAttentionBwdKernel2PipelinePolicy {
       constexpr index_t kTdmGemmPrefetchDepth = NIterPerWarp * KIterPerWarp / 2;
       constexpr index_t kTdmGemmStepsPerGroup = 1;
 
-      return BlockGemmARegBSmemTrLoadCRegTdmGroupPrefetch_1<
+      return BlockGemmARegBSmemTrLoadCRegTdmGroupPrefetchSliceGemmKFullGemmN<
           GemmProblem,
           BlockGemmPolicy,
           kTdmGemmPrefetchDepth,
           kTdmGemmStepsPerGroup>{};
 #else
-      return BlockGemmARegBSmemTrLoadCRegV2Hack_1<
+      return BlockGemmARegBSmemTrLoadCRegSliceGemmKFullGemmN<
           GemmProblem,
           BlockGemmPolicy>{};
 #endif

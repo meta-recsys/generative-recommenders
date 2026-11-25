@@ -88,7 +88,7 @@ CK_TILE_HOST_DEVICE constexpr auto GetTdmRawPaddingConfig() {
 template <index_t kRowBytes, bool kIsNormalRead>
 CK_TILE_HOST_DEVICE constexpr index_t GetTdmPadIntervalBytes() {
   constexpr index_t BankSpanBytes = 64 * 4; // gfx1250 has 64 banks
-  if constexpr (is_power_of_two_integer(kRowBytes) || !kIsNormalRead)
+  if constexpr (is_power_of_two_integer(kRowBytes))
     return max(kRowBytes, BankSpanBytes);
   else
     return kRowBytes & (-kRowBytes);

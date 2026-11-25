@@ -239,17 +239,20 @@ struct HstuAttentionNoSoftmaxBwdTdmTrLoadPipelineKRVRQS_dK_dV {
         q_lds_monolithic_window_0,
         sequence<0, 0>{},
         sequence<kM0Sub, kQKHeaddim>{}));
-    statically_indexed_array<q_lds_window_type, m0_loops> q_lds_windows_0;
-    statically_indexed_array<q_lds_window_type, m0_loops> q_lds_windows_1;
-    static_for<0, m0_loops, 1>{}([&](auto i_buf) {
-      q_lds_windows_0[i_buf] = get_slice_tile(
+
+    statically_indexed_array<
+        statically_indexed_array<q_lds_window_type, m0_loops>,
+        2>
+        q_lds_windows;
+    static_for<0, m0_loops, 1>{}([&](auto i_sub) {
+      q_lds_windows[number<0>{}][i_sub] = get_slice_tile(
           q_lds_monolithic_window_0,
-          sequence<i_buf * kM0Sub, 0>{},
-          sequence<(i_buf + 1) * kM0Sub, kQKHeaddim>{});
-      q_lds_windows_1[i_buf] = get_slice_tile(
+          sequence<i_sub * kM0Sub, 0>{},
+          sequence<(i_sub + 1) * kM0Sub, kQKHeaddim>{});
+      q_lds_windows[number<1>{}][i_sub] = get_slice_tile(
           q_lds_monolithic_window_1,
-          sequence<i_buf * kM0Sub, 0>{},
-          sequence<(i_buf + 1) * kM0Sub, kQKHeaddim>{});
+          sequence<i_sub * kM0Sub, 0>{},
+          sequence<(i_sub + 1) * kM0Sub, kQKHeaddim>{});
     });
 
     // q_lds windows for trload read
@@ -257,19 +260,20 @@ struct HstuAttentionNoSoftmaxBwdTdmTrLoadPipelineKRVRQS_dK_dV {
         q_lds_monolithic_window_0,
         sequence<0, 0>{},
         sequence<kK1, kQKHeaddim>{}));
-    statically_indexed_array<q_lds_trload_window_type, k1_loops>
-        q_lds_trload_windows_0;
-    statically_indexed_array<q_lds_trload_window_type, k1_loops>
-        q_lds_trload_windows_1;
-    static_for<0, k1_loops, 1>{}([&](auto i_buf) {
-      q_lds_trload_windows_0[i_buf] = get_slice_tile(
+
+    statically_indexed_array<
+        statically_indexed_array<q_lds_trload_window_type, k1_loops>,
+        2>
+        q_lds_trload_windows;
+    static_for<0, k1_loops, 1>{}([&](auto i_sub) {
+      q_lds_trload_windows[number<0>{}][i_sub] = get_slice_tile(
           q_lds_monolithic_window_0,
-          sequence<i_buf * kK1, 0>{},
-          sequence<(i_buf + 1) * kK1, kQKHeaddim>{});
-      q_lds_trload_windows_1[i_buf] = get_slice_tile(
+          sequence<i_sub * kK1, 0>{},
+          sequence<(i_sub + 1) * kK1, kQKHeaddim>{});
+      q_lds_trload_windows[number<1>{}][i_sub] = get_slice_tile(
           q_lds_monolithic_window_1,
-          sequence<i_buf * kK1, 0>{},
-          sequence<(i_buf + 1) * kK1, kQKHeaddim>{});
+          sequence<i_sub * kK1, 0>{},
+          sequence<(i_sub + 1) * kK1, kQKHeaddim>{});
     });
 
     // do_lds, the same tensor_view for write/read
@@ -300,17 +304,20 @@ struct HstuAttentionNoSoftmaxBwdTdmTrLoadPipelineKRVRQS_dK_dV {
         do_lds_monolithic_window_0,
         sequence<0, 0>{},
         sequence<kM0Sub, kVHeaddim>{}));
-    statically_indexed_array<do_lds_window_type, m0_loops> do_lds_windows_0;
-    statically_indexed_array<do_lds_window_type, m0_loops> do_lds_windows_1;
-    static_for<0, m0_loops, 1>{}([&](auto i_buf) {
-      do_lds_windows_0[i_buf] = get_slice_tile(
+
+    statically_indexed_array<
+        statically_indexed_array<do_lds_window_type, m0_loops>,
+        2>
+        do_lds_windows;
+    static_for<0, m0_loops, 1>{}([&](auto i_sub) {
+      do_lds_windows[number<0>{}][i_sub] = get_slice_tile(
           do_lds_monolithic_window_0,
-          sequence<i_buf * kM0Sub, 0>{},
-          sequence<(i_buf + 1) * kM0Sub, kVHeaddim>{});
-      do_lds_windows_1[i_buf] = get_slice_tile(
+          sequence<i_sub * kM0Sub, 0>{},
+          sequence<(i_sub + 1) * kM0Sub, kVHeaddim>{});
+      do_lds_windows[number<1>{}][i_sub] = get_slice_tile(
           do_lds_monolithic_window_1,
-          sequence<i_buf * kM0Sub, 0>{},
-          sequence<(i_buf + 1) * kM0Sub, kVHeaddim>{});
+          sequence<i_sub * kM0Sub, 0>{},
+          sequence<(i_sub + 1) * kM0Sub, kVHeaddim>{});
     });
 
     // do_lds windows for trload read
@@ -318,19 +325,20 @@ struct HstuAttentionNoSoftmaxBwdTdmTrLoadPipelineKRVRQS_dK_dV {
         do_lds_monolithic_window_0,
         sequence<0, 0>{},
         sequence<kK1, kVHeaddim>{}));
-    statically_indexed_array<do_lds_trload_window_type, k1_loops>
-        do_lds_trload_windows_0;
-    statically_indexed_array<do_lds_trload_window_type, k1_loops>
-        do_lds_trload_windows_1;
-    static_for<0, k1_loops, 1>{}([&](auto i_buf) {
-      do_lds_trload_windows_0[i_buf] = get_slice_tile(
+
+    statically_indexed_array<
+        statically_indexed_array<do_lds_trload_window_type, k1_loops>,
+        2>
+        do_lds_trload_windows;
+    static_for<0, k1_loops, 1>{}([&](auto i_sub) {
+      do_lds_trload_windows[number<0>{}][i_sub] = get_slice_tile(
           do_lds_monolithic_window_0,
-          sequence<i_buf * kK1, 0>{},
-          sequence<(i_buf + 1) * kK1, kVHeaddim>{});
-      do_lds_trload_windows_1[i_buf] = get_slice_tile(
+          sequence<i_sub * kK1, 0>{},
+          sequence<(i_sub + 1) * kK1, kVHeaddim>{});
+      do_lds_trload_windows[number<1>{}][i_sub] = get_slice_tile(
           do_lds_monolithic_window_1,
-          sequence<i_buf * kK1, 0>{},
-          sequence<(i_buf + 1) * kK1, kVHeaddim>{});
+          sequence<i_sub * kK1, 0>{},
+          sequence<(i_sub + 1) * kK1, kVHeaddim>{});
     });
 
     array<index_t, 2> partition_index{get_warp_id<false>(), get_lane_id()};
@@ -374,37 +382,156 @@ struct HstuAttentionNoSoftmaxBwdTdmTrLoadPipelineKRVRQS_dK_dV {
     tdm_config_do.pad_config.pad_amount = pad_cfg_do[number<1>{}];
     tdm_config_do.pad_config.pad_interval = pad_cfg_do[number<2>{}];
 
-    load_tile_tdm(tdm_config_q, q_lds_windows_0[number<0>{}], q_dram_window);
+    load_tile_tdm(
+        tdm_config_q, q_lds_windows[number<0>{}][number<0>{}], q_dram_window);
     move_tile_window(q_dram_window, {kM0Sub, 0});
 
-    load_tile_tdm(tdm_config_do, do_lds_windows_0[number<0>{}], do_dram_window);
+    load_tile_tdm(
+        tdm_config_do,
+        do_lds_windows[number<0>{}][number<0>{}],
+        do_dram_window);
     move_tile_window(do_dram_window, {kM0Sub, 0});
+
+    __builtin_amdgcn_sched_barrier(
+        LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+        LLVMSchedGroupMask::TRANS);
 
     clear_tile(dk_acc);
     clear_tile(dv_acc);
 
-    // SiLU activation
-    const auto f_dsilu = [](CompDataType x) -> CompDataType {
+    const auto f_sigmoid = [](CompDataType x) -> CompDataType {
       const auto one = type_convert<CompDataType>(1.0f);
       CompDataType sig;
       if constexpr (std::is_same_v<CompDataType, float>)
-        sig = __builtin_amdgcn_rcpf(one + __expf(-x));
+        sig = 0.5f * __builtin_amdgcn_tanhf(0.5f * x) + 0.5f;
       else
         sig = one / (one + exp(-x));
-      return sig * (one + x * (one - sig));
+
+      return sig;
     };
 
-    const auto f_silu = [](CompDataType x) -> CompDataType {
+    // SiLU activation
+    const auto f_dsilu = [](CompDataType x, CompDataType sig) -> CompDataType {
       const auto one = type_convert<CompDataType>(1.0f);
-      if constexpr (std::is_same_v<CompDataType, float>)
-        return x * __builtin_amdgcn_rcpf(one + __expf(-x));
-      else
-        return x / (one + exp(-x));
+
+      return sig + sig * (one - sig) * x;
+    };
+
+    const auto f_silu = [](CompDataType x, CompDataType sig) -> CompDataType {
+      return x * sig;
     };
 
     auto seqlen_q_curr = seqlen_q_start;
 
-    auto main_loop_func = [&](auto EvenIter) {
+    auto main_loop_func = [&](auto i_buf) {
+      bool need_mask;
+
+      auto mask_tile = make_static_distributed_tensor<int8_t>(
+          pcomp_tile.get_tile_distribution());
+
+      // dsilu(S) with the mask / dropout decision folded in, computed together
+      // with P in mask_and_calc_func(). pcomp_tile holds P (not S) after that,
+      // so dS = dP * scale_p * dsilu_tile must not re-derive anything from
+      // pcomp_tile.
+      PcompBlockTileType dsilu_tile;
+
+      auto mask_and_calc_func = [&]() {
+        need_mask = !mask.IsFullTileInsideMask(
+            seqlen_q_curr, i_n0, number<kN0>{}, number<kM0>{});
+
+        tile_elementwise_inout(
+            [](auto& x) { x = type_convert<int8_t>(1); }, mask_tile);
+
+        if constexpr (kHasDropout) {
+          auto& combined_mask = mask_tile;
+
+          // BlockDropoutBwd::Run is M-major and needs no LDS scratch (no
+          // transpose). Signature: Run<BlockGemm,
+          // RandValOutputDataType>(start_m0_idx, start_n0_idx,
+          //                                                   p_compute,
+          //                                                   randval_dram_window).
+          dropout.template Run<Gemm0Combined, uint8_t>(
+              seqlen_q_curr, i_n0, combined_mask, null_randval_window);
+
+          constexpr auto spans = PcompBlockTileType::get_distributed_spans();
+
+          if (need_mask) {
+            sweep_tile_span(spans[number<0>{}], [&](auto idx0) {
+              sweep_tile_span(spans[number<1>{}], [&](auto idx1) {
+                const auto tile_idx = get_x_indices_from_distributed_indices(
+                    pcomp_tile.get_tile_distribution(),
+                    make_tuple(idx0, idx1),
+                    partition_index);
+                const auto row = seqlen_q_curr + tile_idx.at(number<0>{});
+                const auto col = i_n0 + tile_idx.at(number<1>{});
+                constexpr auto ij = make_tuple(idx0, idx1);
+                if (!mask.IsTokenPairInsideMask(row, col))
+                  combined_mask(ij) = type_convert<int8_t>(-1);
+              });
+            });
+          }
+
+          sweep_tile_span(spans[number<0>{}], [&](auto idx0) {
+            sweep_tile_span(spans[number<1>{}], [&](auto idx1) {
+              constexpr auto ij = make_tuple(idx0, idx1);
+              const CompDataType s = pcomp_tile[ij];
+              const CompDataType sig = f_sigmoid(s);
+              CompDataType p = f_silu(s, sig);
+              CompDataType dsilu = f_dsilu(s, sig);
+
+              // Dropout propagates through the chain rule: kept -> *rp_undrop
+              // on BOTH P (-> dV) and dS (-> dK); dropped -> 0. drop_mask > 0
+              // means kept. The *rp_undrop of dS is applied after Gemm2.
+              if (combined_mask[ij] > 0) {
+                p = p * dropout.rp_undrop;
+              } else {
+                p = type_convert<CompDataType>(0.0f);
+                dsilu = type_convert<CompDataType>(0.0f);
+              }
+              // P stored back into pcomp_tile for dV (Gemm1)
+              pcomp_tile(ij) = p;
+              // dsilu(S) (0 if dropped / masked out) kept for dS (Gemm3)
+              dsilu_tile(ij) = dsilu;
+            });
+          });
+        } else {
+          auto& hstu_mask = mask_tile;
+
+          constexpr auto spans = PcompBlockTileType::get_distributed_spans();
+
+          if (need_mask) {
+            sweep_tile_span(spans[number<0>{}], [&](auto idx0) {
+              sweep_tile_span(spans[number<1>{}], [&](auto idx1) {
+                const auto tile_idx = get_x_indices_from_distributed_indices(
+                    pcomp_tile.get_tile_distribution(),
+                    make_tuple(idx0, idx1),
+                    partition_index);
+                const auto row = seqlen_q_curr + tile_idx.at(number<0>{});
+                const auto col = i_n0 + tile_idx.at(number<1>{});
+                constexpr auto ij = make_tuple(idx0, idx1);
+                if (!mask.IsTokenPairInsideMask(row, col))
+                  hstu_mask(ij) = type_convert<int8_t>(0);
+              });
+            });
+          }
+
+          sweep_tile_span(spans[number<0>{}], [&](auto idx0) {
+            sweep_tile_span(spans[number<1>{}], [&](auto idx1) {
+              constexpr auto ij = make_tuple(idx0, idx1);
+              const CompDataType s = pcomp_tile[ij];
+              const CompDataType sig = f_sigmoid(s);
+              CompDataType p = f_silu(s, sig);
+              const CompDataType m = type_convert<CompDataType>(hstu_mask[ij]);
+
+              // P stored back into pcomp_tile for dV (Gemm1)
+              pcomp_tile(ij) = p * m;
+              // dsilu(S) * mask kept for dS (Gemm3); the mask is 0 or 1
+              dsilu_tile(ij) = f_dsilu(s, sig) * m;
+            });
+          });
+        }
+      };
+
       // =======================================================================
       // Loop 1: Gemm0 (S = Q@K); prefetch Q to LDS
       // Loop 2: Gemm2 (dP = dO@V); prefetch dO to LDS
@@ -413,77 +540,98 @@ struct HstuAttentionNoSoftmaxBwdTdmTrLoadPipelineKRVRQS_dK_dV {
         s_wait_tensorcnt_barrier<0>();
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Gemm0: sacc_tile = Q_sub @ K
         // Gemm2: dpacc_tile = dO_sub @ V
-        if constexpr (EvenIter) {
-          if constexpr (i_m0 < m0_loops - 1) {
+        if constexpr (i_m0 < m0_loops - 1) {
+          const auto load_q_tile = [&]() {
             load_tile_tdm(
                 tdm_config_q,
-                q_lds_windows_0[number<i_m0 + 1>{}],
+                q_lds_windows[i_buf][number<i_m0 + 1>{}],
                 q_dram_window);
             move_tile_window(q_dram_window, {kM0Sub, 0});
+          };
+          gemm_0(sacc_tile, q_lds_windows[i_buf][i_m0], k_tile, load_q_tile);
+
+          auto s_tmp = cast_tile<CompDataType>(sacc_tile);
+          // Place the [kM0Sub, kN0] sub-tile into the combined [kM0, kN0]
+          // pcomp_tile by a direct thread-buffer copy. M (the sub-tiled dim) is
+          // the outermost Y-dim of the C distribution, so sub-tile i_m0
+          // occupies a contiguous thread-buffer block at offset i_m0 *
+          // sacc_tbuf_size. This avoids set_slice_tile, which miscomputes the
+          // write offsets when slicing the register-interleaved M axis of the
+          // MFMA C fragment.
+          constexpr index_t sacc_tbuf_size =
+              decltype(s_tmp)::get_thread_buffer_size();
+          static_for<0, sacc_tbuf_size, 1>{}([&](auto j) {
+            pcomp_tile.get_thread_buffer()(
+                number<i_m0 * sacc_tbuf_size + j>{}) =
+                s_tmp.get_thread_buffer()(number<j>{});
+          });
+
+          const auto load_do_tile = [&]() {
             load_tile_tdm(
                 tdm_config_do,
-                do_lds_windows_0[number<i_m0 + 1>{}],
+                do_lds_windows[i_buf][number<i_m0 + 1>{}],
                 do_dram_window);
             move_tile_window(do_dram_window, {kM0Sub, 0});
-          } else {
-            load_tile_tdm(
-                tdm_config_q, q_lds_windows_1[number<0>{}], q_dram_window);
-            move_tile_window(q_dram_window, {kM0Sub, 0});
-            load_tile_tdm(
-                tdm_config_do, do_lds_windows_1[number<0>{}], do_dram_window);
-            move_tile_window(do_dram_window, {kM0Sub, 0});
-          }
-
-          __builtin_amdgcn_sched_barrier(
-              LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
-
-          gemm_0(sacc_tile, q_lds_windows_0[i_m0], k_tile);
-          gemm_2(dpacc_tile, do_lds_windows_0[i_m0], v_tile);
+          };
+          gemm_2(dpacc_tile, do_lds_windows[i_buf][i_m0], v_tile, load_do_tile);
         } else {
-          if constexpr (i_m0 < m0_loops - 1) {
+          constexpr auto next_buf = number<1 - i_buf>{};
+
+          const auto load_q_tile = [&]() {
             load_tile_tdm(
                 tdm_config_q,
-                q_lds_windows_1[number<i_m0 + 1>{}],
+                q_lds_windows[next_buf][number<0>{}],
                 q_dram_window);
             move_tile_window(q_dram_window, {kM0Sub, 0});
+          };
+          gemm_0(sacc_tile, q_lds_windows[i_buf][i_m0], k_tile, load_q_tile);
+
+          auto s_tmp = cast_tile<CompDataType>(sacc_tile);
+          // Place the [kM0Sub, kN0] sub-tile into the combined [kM0, kN0]
+          // pcomp_tile by a direct thread-buffer copy. M (the sub-tiled dim) is
+          // the outermost Y-dim of the C distribution, so sub-tile i_m0
+          // occupies a contiguous thread-buffer block at offset i_m0 *
+          // sacc_tbuf_size. This avoids set_slice_tile, which miscomputes the
+          // write offsets when slicing the register-interleaved M axis of the
+          // MFMA C fragment.
+          constexpr index_t sacc_tbuf_size =
+              decltype(s_tmp)::get_thread_buffer_size();
+          static_for<0, sacc_tbuf_size, 1>{}([&](auto j) {
+            pcomp_tile.get_thread_buffer()(
+                number<i_m0 * sacc_tbuf_size + j>{}) =
+                s_tmp.get_thread_buffer()(number<j>{});
+          });
+
+          const auto load_do_tile = [&]() {
             load_tile_tdm(
                 tdm_config_do,
-                do_lds_windows_1[number<i_m0 + 1>{}],
+                do_lds_windows[next_buf][number<0>{}],
                 do_dram_window);
             move_tile_window(do_dram_window, {kM0Sub, 0});
-          } else {
-            load_tile_tdm(
-                tdm_config_q, q_lds_windows_0[number<0>{}], q_dram_window);
-            move_tile_window(q_dram_window, {kM0Sub, 0});
-            load_tile_tdm(
-                tdm_config_do, do_lds_windows_0[number<0>{}], do_dram_window);
-            move_tile_window(do_dram_window, {kM0Sub, 0});
-          }
 
-          __builtin_amdgcn_sched_barrier(
-              LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            if constexpr (kHasBias) {
+              const auto bias_tile = load_tile(bias_dram_window);
+              tile_elementwise_inout(
+                  [&scale_s](auto& x, const auto& y) {
+                    x = x * scale_s + type_convert<CompDataType>(y);
+                  },
+                  pcomp_tile,
+                  bias_tile);
+              move_tile_window(bias_dram_window, {kM0, 0});
+            } else {
+              tile_elementwise_inout(
+                  [&scale_s](auto& x) { x = x * scale_s; }, pcomp_tile);
+            }
 
-          gemm_0(sacc_tile, q_lds_windows_1[i_m0], k_tile);
-          gemm_2(dpacc_tile, do_lds_windows_1[i_m0], v_tile);
+            mask_and_calc_func();
+          };
+          gemm_2(dpacc_tile, do_lds_windows[i_buf][i_m0], v_tile, load_do_tile);
         }
-
-        auto s_tmp = cast_tile<CompDataType>(sacc_tile);
-        // Place the [kM0Sub, kN0] sub-tile into the combined [kM0, kN0]
-        // pcomp_tile by a direct thread-buffer copy. M (the sub-tiled dim) is
-        // the outermost Y-dim of the C distribution, so sub-tile i_m0 occupies
-        // a contiguous thread-buffer block at offset i_m0 * sacc_tbuf_size.
-        // This avoids set_slice_tile, which miscomputes the write offsets when
-        // slicing the register-interleaved M axis of the MFMA C fragment.
-        constexpr index_t sacc_tbuf_size =
-            decltype(s_tmp)::get_thread_buffer_size();
-        static_for<0, sacc_tbuf_size, 1>{}([&](auto j) {
-          pcomp_tile.get_thread_buffer()(number<i_m0 * sacc_tbuf_size + j>{}) =
-              s_tmp.get_thread_buffer()(number<j>{});
-        });
 
         // Gemm2: dpacc_tile = dO_sub @ V
         auto dp_tmp = cast_tile<CompDataType>(dpacc_tile);
@@ -499,139 +647,35 @@ struct HstuAttentionNoSoftmaxBwdTdmTrLoadPipelineKRVRQS_dK_dV {
         });
       });
 
-      // ---- Scale, optional bias, mask ----
-      if constexpr (kHasBias) {
-        const auto bias_tile = load_tile(bias_dram_window);
-        tile_elementwise_inout(
-            [&scale_s](auto& x, const auto& y) {
-              x = x * scale_s + type_convert<CompDataType>(y);
-            },
-            pcomp_tile,
-            bias_tile);
-        move_tile_window(bias_dram_window, {kM0, 0});
-      } else {
-        tile_elementwise_inout(
-            [&scale_s](auto& x) { x = x * scale_s; }, pcomp_tile);
-      }
-
-      const bool need_mask = !mask.IsFullTileInsideMask(
-          seqlen_q_curr, i_n0, number<kN0>{}, number<kM0>{});
-
-      if constexpr (kHasDropout) {
-        auto combined_mask = make_static_distributed_tensor<int8_t>(
-            pcomp_tile.get_tile_distribution());
-
-        tile_elementwise_inout(
-            [](auto& x) { x = type_convert<int8_t>(1); }, combined_mask);
-
-        // BlockDropoutBwd::Run is M-major and needs no LDS scratch (no
-        // transpose). Signature: Run<BlockGemm,
-        // RandValOutputDataType>(start_m0_idx, start_n0_idx,
-        //                                                   p_compute,
-        //                                                   randval_dram_window).
-        dropout.template Run<Gemm0Combined, uint8_t>(
-            seqlen_q_curr, i_n0, combined_mask, null_randval_window);
-
+      {
         constexpr auto spans = PcompBlockTileType::get_distributed_spans();
 
-        if (need_mask) {
-          sweep_tile_span(spans[number<0>{}], [&](auto idx0) {
-            sweep_tile_span(spans[number<1>{}], [&](auto idx1) {
-              const auto tile_idx = get_x_indices_from_distributed_indices(
-                  pcomp_tile.get_tile_distribution(),
-                  make_tuple(idx0, idx1),
-                  partition_index);
-              const auto row = seqlen_q_curr + tile_idx.at(number<0>{});
-              const auto col = i_n0 + tile_idx.at(number<1>{});
-              constexpr auto ij = make_tuple(idx0, idx1);
-              if (!mask.IsTokenPairInsideMask(row, col))
-                combined_mask(ij) = type_convert<int8_t>(-1);
-            });
-          });
-        }
-
-        // ---- Compute P = silu(S) * scale_p and dS = dP * scale_p * dsilu(S)
-        // ---- Corrections applied here:
+        // ---- Compute dS = dP * scale_p * dsilu(S) ----
+        // pcomp_tile already holds P (computed in mask_and_calc_func), so
+        // dsilu(S) comes from dsilu_tile, where the corrections are already
+        // folded in:
         //  - masked-out pairs: P is already 0 (silu(0) = 0), but dsilu(0) = 0.5
         //  != 0, so dS
         //    must be explicitly forced to 0 (reference: locals_dS = 0 for
-        //    masked-out).
+        //    masked-out); dsilu_tile is 0 there.
         //  - padded tail Q rows (row >= seqlen_q_end): Kernel 2 reduces over Q,
-        //  so these rows
-        //    must contribute nothing; force BOTH P (-> dV) and dS (-> dK) to 0.
-        //    Their S was not zeroed above (IsTokenPairInsideMask can clamp and
-        //    accept padded rows), so P would otherwise be silu(garbage) != 0.
+        //  so these
+        //    rows must contribute nothing; BOTH P (-> dV) and dS (-> dK) are 0
+        //    because pcomp_tile and dsilu_tile are both 0 there.
+        //  - dropout: dropped pairs have dsilu_tile = 0; kept pairs get
+        //  *rp_undrop here, as
+        //    P got it in mask_and_calc_func.
         sweep_tile_span(spans[number<0>{}], [&](auto idx0) {
           sweep_tile_span(spans[number<1>{}], [&](auto idx1) {
             constexpr auto ij = make_tuple(idx0, idx1);
-            const CompDataType s = pcomp_tile[ij];
             const CompDataType dp = dscomp_tile[ij];
-            CompDataType p = f_silu(s) * type_convert<CompDataType>(scale_p);
-            CompDataType ds =
-                dp * type_convert<CompDataType>(scale_p) * f_dsilu(s);
-            // Dropout propagates through the chain rule: kept -> *rp_undrop on
-            // BOTH P (-> dV) and dS (-> dK); dropped -> 0. drop_mask > 0 means
-            // kept.
-            if (combined_mask[ij] > 0) {
-              p = p * dropout.rp_undrop;
+            CompDataType ds = dp * dsilu_tile[ij];
+
+            if constexpr (kHasDropout)
               ds = ds * dropout.rp_undrop;
-            } else {
-              p = type_convert<CompDataType>(0.0f);
-              ds = type_convert<CompDataType>(0.0f);
-            }
-            // P stored back into pcomp_tile for dV (Gemm1)
-            pcomp_tile(ij) = p;
+
             // dS stored into dscomp_tile for dK (Gemm3)
             dscomp_tile(ij) = ds;
-          });
-        });
-      } else {
-        auto hstu_mask = make_static_distributed_tensor<int8_t>(
-            pcomp_tile.get_tile_distribution());
-
-        tile_elementwise_inout(
-            [](auto& x) { x = type_convert<int8_t>(1); }, hstu_mask);
-
-        constexpr auto spans = PcompBlockTileType::get_distributed_spans();
-
-        if (need_mask) {
-          sweep_tile_span(spans[number<0>{}], [&](auto idx0) {
-            sweep_tile_span(spans[number<1>{}], [&](auto idx1) {
-              const auto tile_idx = get_x_indices_from_distributed_indices(
-                  pcomp_tile.get_tile_distribution(),
-                  make_tuple(idx0, idx1),
-                  partition_index);
-              const auto row = seqlen_q_curr + tile_idx.at(number<0>{});
-              const auto col = i_n0 + tile_idx.at(number<1>{});
-              constexpr auto ij = make_tuple(idx0, idx1);
-              if (!mask.IsTokenPairInsideMask(row, col))
-                hstu_mask(ij) = type_convert<int8_t>(0);
-            });
-          });
-        }
-
-        // ---- Compute P = silu(S) * scale_p and dS = dP * scale_p * dsilu(S)
-        // ---- Corrections applied here:
-        //  - masked-out pairs: P is already 0 (silu(0) = 0), but dsilu(0) = 0.5
-        //  != 0, so dS
-        //    must be explicitly forced to 0 (reference: locals_dS = 0 for
-        //    masked-out).
-        //  - padded tail Q rows (row >= seqlen_q_end): Kernel 2 reduces over Q,
-        //  so these rows
-        //    must contribute nothing; force BOTH P (-> dV) and dS (-> dK) to 0.
-        //    Their S was not zeroed above (IsTokenPairInsideMask can clamp and
-        //    accept padded rows), so P would otherwise be silu(garbage) != 0.
-        sweep_tile_span(spans[number<0>{}], [&](auto idx0) {
-          sweep_tile_span(spans[number<1>{}], [&](auto idx1) {
-            constexpr auto ij = make_tuple(idx0, idx1);
-            const CompDataType s = pcomp_tile[ij];
-            const CompDataType dp = dscomp_tile[ij];
-            CompDataType p = f_silu(s) * type_convert<CompDataType>(scale_p);
-            CompDataType ds =
-                dp * type_convert<CompDataType>(scale_p) * f_dsilu(s);
-
-            pcomp_tile(ij) = p * type_convert<CompDataType>(hstu_mask(ij));
-            dscomp_tile(ij) = ds * type_convert<CompDataType>(hstu_mask(ij));
           });
         });
       }
@@ -652,15 +696,13 @@ struct HstuAttentionNoSoftmaxBwdTdmTrLoadPipelineKRVRQS_dK_dV {
             pt_tile,
             sequence<0, i_k1 * kK1>{},
             sequence<kN0, (i_k1 + 1) * kK1>{});
-        if constexpr (EvenIter) {
-          gemm_1(dv_acc, pt_slice, do_lds_trload_windows_0[i_k1]);
-        } else {
-          gemm_1(dv_acc, pt_slice, do_lds_trload_windows_1[i_k1]);
-        }
+
+        gemm_1(dv_acc, pt_slice, do_lds_trload_windows[i_buf][i_k1]);
       });
 
       __builtin_amdgcn_sched_barrier(
-          LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+          LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+          LLVMSchedGroupMask::TRANS);
 
       auto ds_gemm_tile = cast_tile<QKVDataType>(dscomp_tile);
 
@@ -678,27 +720,26 @@ struct HstuAttentionNoSoftmaxBwdTdmTrLoadPipelineKRVRQS_dK_dV {
             dst_tile,
             sequence<0, i_k1 * kK1>{},
             sequence<kN0, (i_k1 + 1) * kK1>{});
-        if constexpr (EvenIter) {
-          gemm_3(dk_acc, dst_slice, q_lds_trload_windows_0[i_k1]);
-        } else {
-          gemm_3(dk_acc, dst_slice, q_lds_trload_windows_1[i_k1]);
-        }
+
+        gemm_3(dk_acc, dst_slice, q_lds_trload_windows[i_buf][i_k1]);
       });
     };
 
     while (seqlen_q_curr + kM0 < seqlen_q_end) {
-      main_loop_func(bool_constant<true>{});
+      main_loop_func(number<0>{});
       seqlen_q_curr += kM0;
 
-      main_loop_func(bool_constant<false>{});
+      main_loop_func(number<1>{});
       seqlen_q_curr += kM0;
     }
 
     if (seqlen_q_curr < seqlen_q_end)
-      main_loop_func(bool_constant<true>{});
+      main_loop_func(number<0>{});
 
     // Apply alpha scaling to accumulated dK
-    tile_elementwise_inout([&scale_s](auto& x) { x = x * scale_s; }, dk_acc);
+    tile_elementwise_inout(
+        [&scale_s, &scale_p](auto& x) { x = x * (scale_s * scale_p); }, dk_acc);
+    tile_elementwise_inout([&scale_p](auto& x) { x = x * scale_p; }, dv_acc);
 
     return make_tuple(dk_acc, dv_acc);
   }

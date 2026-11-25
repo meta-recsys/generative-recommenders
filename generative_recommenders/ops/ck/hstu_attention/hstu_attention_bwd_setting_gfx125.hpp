@@ -111,8 +111,10 @@ using HstuAttentionBwdKernel2BlockTile_Hdim64_M0_32_N128_Sub32_K1_32 =
 using HstuAttentionBwdKernel2BlockTile_Hdim96_M0_64_N64_Sub32_K1_32 =
     ck_tile::sequence<64, 64, 32, 32, 96>;
 
-using HstuAttentionBwdKernel2BlockTile_Hdim128_M0_32_N64_Sub32_K1_32 =
+using HstuAttentionBwdKernel2BlockTile_Hdim128_M0_32_N64_Sub32_K1_32_silu =
     ck_tile::sequence<32, 64, 32, 32, 128>;
+using HstuAttentionBwdKernel2BlockTile_Hdim128_M0_64_N64_Sub64_K1_64_softmax =
+    ck_tile::sequence<64, 64, 64, 64, 128>;
 
 using HstuAttentionBwdKernel2BlockTile_Hdim256_M0_32_N64_Sub16_K1_32 =
     ck_tile::sequence<32, 64, 16, 32, 256>;
@@ -141,14 +143,25 @@ static constexpr auto GetHstuAttentionBwdKernel2TileSetting() {
         HstuAttentionBwdKernel2Gemm3Warps,
         WarpTile_16x16x32>{};
   } else if constexpr (MaxK == 128) {
-    return ck_tile::HstuAttentionBwdTileSettingClassForKernel2<
-        HstuAttentionBwdKernel2BlockTile_Hdim128_M0_32_N64_Sub32_K1_32,
-        HstuAttentionBwdKernel2Gemm0Gemm2Warps,
-        WarpTile_16x16x32,
-        HstuAttentionBwdKernel2Gemm1Warps,
-        WarpTile_16x16x32,
-        HstuAttentionBwdKernel2Gemm3Warps,
-        WarpTile_16x16x32>{};
+    if constexpr (kUseSoftmax) {
+      return ck_tile::HstuAttentionBwdTileSettingClassForKernel2<
+          HstuAttentionBwdKernel2BlockTile_Hdim128_M0_64_N64_Sub64_K1_64_softmax,
+          HstuAttentionBwdKernel2Gemm0Gemm2Warps,
+          WarpTile_16x16x32,
+          HstuAttentionBwdKernel2Gemm1Warps,
+          WarpTile_16x16x32,
+          HstuAttentionBwdKernel2Gemm3Warps,
+          WarpTile_16x16x32>{};
+    } else {
+      return ck_tile::HstuAttentionBwdTileSettingClassForKernel2<
+          HstuAttentionBwdKernel2BlockTile_Hdim128_M0_32_N64_Sub32_K1_32_silu,
+          HstuAttentionBwdKernel2Gemm0Gemm2Warps,
+          WarpTile_16x16x32,
+          HstuAttentionBwdKernel2Gemm1Warps,
+          WarpTile_16x16x32,
+          HstuAttentionBwdKernel2Gemm3Warps,
+          WarpTile_16x16x32>{};
+    }
   } else if constexpr (MaxK == 256) {
     return ck_tile::HstuAttentionBwdTileSettingClassForKernel2<
         HstuAttentionBwdKernel2BlockTile_Hdim256_M0_32_N64_Sub16_K1_32,

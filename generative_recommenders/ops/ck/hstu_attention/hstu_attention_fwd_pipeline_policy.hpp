@@ -12,9 +12,9 @@
 #include <ck_tile/ops/gemm/block/block_gemm_areg_bsmem_creg_one_warp_v1.hpp>
 #include <ck_tile/ops/gemm/block/block_gemm_areg_bsmem_creg_v2_custom_policy.hpp>
 
-#include "block_gemm_areg_bsmem_creg_v2_hack_0.hpp"
-#include "block_gemm_areg_bsmem_creg_v2_hack_1.hpp"
-#include "block_gemm_areg_bsmem_trload_creg_v2_hack_1.hpp"
+#include "block_gemm_areg_bsmem_creg_full_gemmk_slice_gemmn.hpp"
+#include "block_gemm_areg_bsmem_creg_slice_gemmk_full_gemmn.hpp"
+#include "block_gemm_areg_bsmem_trload_creg_slice_gemmk_full_gemmn.hpp"
 #include "block_gemm_tdm_group_prefetch.hpp"
 
 #include "hstu_attention_config.hpp"
@@ -954,7 +954,9 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy {
         decltype(warp_gemm)>;
 
     if constexpr (1 < Problem::kNumGemm0Warps)
-      return BlockGemmARegBSmemCRegV2Hack_0<GemmProblem, BlockGemmPolicy>{};
+      return BlockGemmARegBSmemCRegFullGemmKSliceGemmN<
+          GemmProblem,
+          BlockGemmPolicy>{};
     else
       return BlockGemmARegBSmemCRegOneWarpV1<GemmProblem, BlockGemmPolicy>{};
   }
@@ -1025,7 +1027,9 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy {
         decltype(warp_gemm)>;
 
     if constexpr (1 < Problem::kNumGemm0Warps)
-      return BlockGemmARegBSmemCRegV2Hack_0<GemmProblem, BlockGemmPolicy>{};
+      return BlockGemmARegBSmemCRegFullGemmKSliceGemmN<
+          GemmProblem,
+          BlockGemmPolicy>{};
     else
       return BlockGemmARegBSmemCRegOneWarpV1<GemmProblem, BlockGemmPolicy>{};
   }
@@ -1123,9 +1127,11 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy {
         WarpGemm>;
 
     if constexpr (!kUseTrLoad) {
-      return BlockGemmARegBSmemCRegV2Hack_1<GemmProblem, BlockGemmPolicy>{};
+      return BlockGemmARegBSmemCRegSliceGemmKFullGemmN<
+          GemmProblem,
+          BlockGemmPolicy>{};
     } else {
-      return BlockGemmARegBSmemTrLoadCRegV2Hack_1<
+      return BlockGemmARegBSmemTrLoadCRegSliceGemmKFullGemmN<
           GemmProblem,
           BlockGemmPolicy>{};
     };
@@ -1134,8 +1140,8 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy {
 #if HSTU_LDS_STAGING_THROUGH_TDM_AVAILABLE
   // Tdm pipelines: the hdim128 tiles with more than one gemm0 warp (M64 and
   // M128) get the group-prefetch variant of the Q@K block gemm,
-  // BlockGemmASmemBSmemCRegTdmGroupPrefetch_0 (Q read from Lds as well) where
-  // IsQInLdsTdm(); everything else keeps GetQKBlockGemm().
+  // BlockGemmASmemBSmemCRegTdmGroupPrefetchFullGemmKSliceGemmN (Q read from Lds
+  // as well) where IsQInLdsTdm(); everything else keeps GetQKBlockGemm().
   template <typename Problem>
   CK_TILE_HOST_DEVICE static constexpr auto GetQKBlockGemmTdm() {
     using BaseGemm = remove_cvref_t<decltype(GetQKBlockGemm<Problem>())>;
@@ -1150,13 +1156,13 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy {
       constexpr index_t kStepsPerGroup = kIsM128 ? 4 : 8;
 
       if constexpr (IsQInLdsTdm<Problem>())
-        return BlockGemmASmemBSmemCRegTdmGroupPrefetch_0<
+        return BlockGemmASmemBSmemCRegTdmGroupPrefetchFullGemmKSliceGemmN<
             typename BaseGemm::Problem,
             typename BaseGemm::Policy,
             kPrefetchDepth,
             kStepsPerGroup>{};
       else
-        return BlockGemmARegBSmemCRegTdmGroupPrefetch_0<
+        return BlockGemmARegBSmemCRegTdmGroupPrefetchFullGemmKSliceGemmN<
             typename BaseGemm::Problem,
             typename BaseGemm::Policy,
             kPrefetchDepth,
@@ -1180,7 +1186,7 @@ struct HstuAttentionFwdPipelineQRKSVSPolicy {
       constexpr index_t kPrefetchDepth = kIsM128 ? 4 : 8;
       constexpr index_t kStepsPerGroup = kIsM128 ? 2 : 8;
 
-      return BlockGemmARegBSmemTrLoadCRegTdmGroupPrefetch_1<
+      return BlockGemmARegBSmemTrLoadCRegTdmGroupPrefetchSliceGemmKFullGemmN<
           typename BaseGemm::Problem,
           typename BaseGemm::Policy,
           kPrefetchDepth,

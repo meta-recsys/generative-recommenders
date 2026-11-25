@@ -83,7 +83,7 @@ The tests compare against the PyTorch reference in
 The kernel sources in `hstu_attention/` come from AMD's
 [Composable Kernel](https://github.com/ROCm/composable_kernel)
 `example/ck_tile/18_hstu_attention`, branch `hstu_attention_fwd_bwd`, commit
-[`0ea9398523f9313ad2d89eed86927313a3b46e71`](https://github.com/ROCm/composable_kernel/tree/0ea9398523f9313ad2d89eed86927313a3b46e71/example/ck_tile/18_hstu_attention).
+[`906a64928c3ae2ebd06cf0325ff38b103c555053`](https://github.com/ROCm/composable_kernel/tree/906a64928c3ae2ebd06cf0325ff38b103c555053/example/ck_tile/18_hstu_attention).
 They are licensed under the MIT license in
 [`hstu_attention/LICENSE`](hstu_attention/LICENSE), including Meta's later
 changes to them. Files that Meta changed beyond formatting carry an additional

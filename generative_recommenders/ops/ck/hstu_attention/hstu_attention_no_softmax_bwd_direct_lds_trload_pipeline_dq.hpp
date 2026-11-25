@@ -253,19 +253,20 @@ struct HstuAttentionNoSoftmaxBwdDirectLdsTrLoadPipelineQRKSVS_dQ {
         k_lds_read_monolithic_window_0,
         sequence<0, 0>{},
         sequence<kN0Sub, kQKHeaddim>{}));
-    statically_indexed_array<k_lds_read_window_type, n0_loops>
-        k_lds_read_windows_0;
-    statically_indexed_array<k_lds_read_window_type, n0_loops>
-        k_lds_read_windows_1;
-    static_for<0, n0_loops, 1>{}([&](auto i_buf) {
-      k_lds_read_windows_0[i_buf] = get_slice_tile(
+
+    statically_indexed_array<
+        statically_indexed_array<k_lds_read_window_type, n0_loops>,
+        2>
+        k_lds_read_windows;
+    static_for<0, n0_loops, 1>{}([&](auto i_sub) {
+      k_lds_read_windows[number<0>{}][i_sub] = get_slice_tile(
           k_lds_read_monolithic_window_0,
-          sequence<i_buf * kN0Sub, 0>{},
-          sequence<(i_buf + 1) * kN0Sub, kQKHeaddim>{});
-      k_lds_read_windows_1[i_buf] = get_slice_tile(
+          sequence<i_sub * kN0Sub, 0>{},
+          sequence<(i_sub + 1) * kN0Sub, kQKHeaddim>{});
+      k_lds_read_windows[number<1>{}][i_sub] = get_slice_tile(
           k_lds_read_monolithic_window_1,
-          sequence<i_buf * kN0Sub, 0>{},
-          sequence<(i_buf + 1) * kN0Sub, kQKHeaddim>{});
+          sequence<i_sub * kN0Sub, 0>{},
+          sequence<(i_sub + 1) * kN0Sub, kQKHeaddim>{});
     });
 
     // k_lds windows for trload read
@@ -273,19 +274,20 @@ struct HstuAttentionNoSoftmaxBwdDirectLdsTrLoadPipelineQRKSVS_dQ {
         k_lds_read_monolithic_window_0,
         sequence<0, 0>{},
         sequence<kK1, kQKHeaddim>{}));
-    statically_indexed_array<k_lds_trload_window_type, k1_loops>
-        k_lds_trload_windows_0;
-    statically_indexed_array<k_lds_trload_window_type, k1_loops>
-        k_lds_trload_windows_1;
-    static_for<0, k1_loops, 1>{}([&](auto i_buf) {
-      k_lds_trload_windows_0[i_buf] = get_slice_tile(
+
+    statically_indexed_array<
+        statically_indexed_array<k_lds_trload_window_type, k1_loops>,
+        2>
+        k_lds_trload_windows;
+    static_for<0, k1_loops, 1>{}([&](auto i_sub) {
+      k_lds_trload_windows[number<0>{}][i_sub] = get_slice_tile(
           k_lds_read_monolithic_window_0,
-          sequence<i_buf * kK1, 0>{},
-          sequence<(i_buf + 1) * kK1, kQKHeaddim>{});
-      k_lds_trload_windows_1[i_buf] = get_slice_tile(
+          sequence<i_sub * kK1, 0>{},
+          sequence<(i_sub + 1) * kK1, kQKHeaddim>{});
+      k_lds_trload_windows[number<1>{}][i_sub] = get_slice_tile(
           k_lds_read_monolithic_window_1,
-          sequence<i_buf * kK1, 0>{},
-          sequence<(i_buf + 1) * kK1, kQKHeaddim>{});
+          sequence<i_sub * kK1, 0>{},
+          sequence<(i_sub + 1) * kK1, kQKHeaddim>{});
     });
 
     QKVDataType* v_lds_ptr = reinterpret_cast<QKVDataType*>(
@@ -295,12 +297,16 @@ struct HstuAttentionNoSoftmaxBwdDirectLdsTrLoadPipelineQRKSVS_dQ {
         Policy::template MakeVLdsBlockDescriptor<
             Problem,
             true /*kUseDirectLds*/>());
-    auto v_lds_write_monolithic_window = make_tile_window(
+    auto v_lds_write_monolithic_window_0 = make_tile_window(
         v_lds_write_view,
         Policy::
             template MakeVLdsBlockDescriptor<Problem, true /*kUseDirectLds*/>()
                 .get_lengths(),
         {0, 0});
+
+    auto v_lds_write_monolithic_window_1 = v_lds_write_monolithic_window_0;
+    v_lds_write_monolithic_window_1.set_bottom_tensor_view_data_ptr(
+        v_lds_ptr + v_smem_size / sizeof(QKVDataType));
 
     static_assert(
         Policy::template MakeVLdsBlockDescriptor<
@@ -321,7 +327,7 @@ struct HstuAttentionNoSoftmaxBwdDirectLdsTrLoadPipelineQRKSVS_dQ {
             Problem,
             true /*kUseDirectLds*/,
             true /*kUseXor*/>());
-    auto v_lds_read_monolithic_window = make_tile_window(
+    auto v_lds_read_monolithic_window_0 = make_tile_window(
         v_lds_read_view,
         Policy::template MakeVLdsBlockDescriptor<
             Problem,
@@ -330,17 +336,28 @@ struct HstuAttentionNoSoftmaxBwdDirectLdsTrLoadPipelineQRKSVS_dQ {
             .get_lengths(),
         {0, 0});
 
+    auto v_lds_read_monolithic_window_1 = v_lds_read_monolithic_window_0;
+    v_lds_read_monolithic_window_1.set_bottom_tensor_view_data_ptr(
+        v_lds_ptr + v_smem_size / sizeof(QKVDataType));
+
     using v_lds_read_window_type = decltype(get_slice_tile(
-        v_lds_read_monolithic_window,
+        v_lds_read_monolithic_window_0,
         sequence<0, 0>{},
         sequence<kN0Sub, kVHeaddim>{}));
-    statically_indexed_array<v_lds_read_window_type, NumVLdsBuffers>
+
+    statically_indexed_array<
+        statically_indexed_array<v_lds_read_window_type, NumVLdsBuffers>,
+        2>
         v_lds_read_windows;
-    static_for<0, NumVLdsBuffers, 1>{}([&](auto i_buf) {
-      v_lds_read_windows[i_buf] = get_slice_tile(
-          v_lds_read_monolithic_window,
-          sequence<i_buf * kN0Sub, 0>{},
-          sequence<(i_buf + 1) * kN0Sub, kVHeaddim>{});
+    static_for<0, NumVLdsBuffers, 1>{}([&](auto i_sub) {
+      v_lds_read_windows[number<0>{}][i_sub] = get_slice_tile(
+          v_lds_read_monolithic_window_0,
+          sequence<i_sub * kN0Sub, 0>{},
+          sequence<(i_sub + 1) * kN0Sub, kVHeaddim>{});
+      v_lds_read_windows[number<1>{}][i_sub] = get_slice_tile(
+          v_lds_read_monolithic_window_1,
+          sequence<i_sub * kN0Sub, 0>{},
+          sequence<(i_sub + 1) * kN0Sub, kVHeaddim>{});
     });
 
     array<index_t, 2> partition_index{get_warp_id<false>(), get_lane_id()};
@@ -406,25 +423,22 @@ struct HstuAttentionNoSoftmaxBwdDirectLdsTrLoadPipelineQRKSVS_dQ {
         amd_wave_read_first_lane(seqlen_k_start * k_row_stride);
     const index_t k_row_step = kN0Sub * k_row_stride;
 
-    const auto k_issues_0 = generate_tuple(
+    const auto k_issues = generate_tuple(
         [&](auto i_buf) {
-          return detail::
-              MakeDirectLdsIssues<n0_loops, kBlockSize / get_warp_size()>(
-                  k_lds_write_monolithic_window_0,
-                  number<i_buf % n0_loops>{},
-                  k_dram_window);
+          const auto& k_lds_write_monolithic_window = (i_buf == 0)
+              ? k_lds_write_monolithic_window_0
+              : k_lds_write_monolithic_window_1;
+          return generate_tuple(
+              [&](auto i_sub) {
+                return detail::
+                    MakeDirectLdsIssues<n0_loops, kBlockSize / get_warp_size()>(
+                        k_lds_write_monolithic_window,
+                        number<i_sub % n0_loops>{},
+                        k_dram_window);
+              },
+              number<n0_loops>{});
         },
-        number<n0_loops>{});
-
-    const auto k_issues_1 = generate_tuple(
-        [&](auto i_buf) {
-          return detail::
-              MakeDirectLdsIssues<n0_loops, kBlockSize / get_warp_size()>(
-                  k_lds_write_monolithic_window_1,
-                  number<i_buf % n0_loops>{},
-                  k_dram_window);
-        },
-        number<n0_loops>{});
+        number<2>{});
 
     const auto& v_dram_desc =
         v_dram_window.get_bottom_tensor_view().get_tensor_descriptor();
@@ -441,25 +455,33 @@ struct HstuAttentionNoSoftmaxBwdDirectLdsTrLoadPipelineQRKSVS_dQ {
 
     const auto v_issues = generate_tuple(
         [&](auto i_buf) {
-          return detail::
-              MakeDirectLdsIssues<NumVLdsBuffers, kBlockSize / get_warp_size()>(
-                  v_lds_write_monolithic_window,
-                  number<i_buf % NumVLdsBuffers>{},
-                  v_dram_window);
+          const auto& v_lds_write_monolithic_window = (i_buf == 0)
+              ? v_lds_write_monolithic_window_0
+              : v_lds_write_monolithic_window_1;
+          return generate_tuple(
+              [&](auto i_sub) {
+                return detail::MakeDirectLdsIssues<
+                    NumVLdsBuffers,
+                    kBlockSize / get_warp_size()>(
+                    v_lds_write_monolithic_window,
+                    number<i_sub % NumVLdsBuffers>{},
+                    v_dram_window);
+              },
+              number<n0_loops>{});
         },
-        number<n0_loops>{});
+        number<2>{});
 
     detail::IssueDirectLds(
         static_cast<QKVDataType*>(smem_ptr),
         k_dram_window,
-        k_issues_0(number<0>{}),
+        k_issues[number<0>{}][number<0>{}],
         k_row_offset);
     k_row_offset += k_row_step;
 
     detail::IssueDirectLds(
         static_cast<QKVDataType*>(smem_ptr),
         v_dram_window,
-        v_issues(number<0>{}),
+        v_issues[number<0>{}][number<0>{}],
         v_row_offset);
     v_row_offset += v_row_step;
 
@@ -476,7 +498,7 @@ struct HstuAttentionNoSoftmaxBwdDirectLdsTrLoadPipelineQRKSVS_dQ {
 
     auto seqlen_k_curr = seqlen_k_start;
 
-    auto main_loop_func = [&](auto EvenIter) {
+    auto main_loop_func = [&](auto i_buf) {
       // === STAGE 1: Gemm0 (S = Q@K) ===
       // === STAGE 2: Gemm2 (dP = dO@V) ===
       static_for<0, n0_loops, 1>{}([&](auto i_n0) {
@@ -486,28 +508,15 @@ struct HstuAttentionNoSoftmaxBwdDirectLdsTrLoadPipelineQRKSVS_dQ {
         s_waitcnt_barrier<0, waitcnt_arg::kMaxExpCnt>();
 
         // Gemm0: sacc_tile = Q @ K_sub
-        if constexpr (EvenIter) {
-          gemm_0(sacc_tile, q_tile, k_lds_read_windows_0[i_n0]);
+        gemm_0(sacc_tile, q_tile, k_lds_read_windows[i_buf][i_n0]);
 
-          if constexpr (i_n0 < n0_loops - 1) {
-            detail::IssueDirectLds(
-                static_cast<QKVDataType*>(smem_ptr),
-                k_dram_window,
-                k_issues_0(number<i_n0 + 1>{}),
-                k_row_offset);
-            k_row_offset += k_row_step;
-          }
-        } else {
-          gemm_0(sacc_tile, q_tile, k_lds_read_windows_1[i_n0]);
-
-          if constexpr (i_n0 < n0_loops - 1) {
-            detail::IssueDirectLds(
-                static_cast<QKVDataType*>(smem_ptr),
-                k_dram_window,
-                k_issues_1(number<i_n0 + 1>{}),
-                k_row_offset);
-            k_row_offset += k_row_step;
-          }
+        if constexpr (i_n0 < n0_loops - 1) {
+          detail::IssueDirectLds(
+              static_cast<QKVDataType*>(smem_ptr),
+              k_dram_window,
+              k_issues[i_buf][number<i_n0 + 1>{}],
+              k_row_offset);
+          k_row_offset += k_row_step;
         }
 
         auto s_tmp = cast_tile<CompDataType>(sacc_tile);
@@ -518,13 +527,13 @@ struct HstuAttentionNoSoftmaxBwdDirectLdsTrLoadPipelineQRKSVS_dQ {
             sequence<kM0, (i_n0 + 1) * kN0Sub>{});
 
         // Gemm2: dpacc_tile = dO @ V_sub
-        gemm_2(dpacc_tile, do_tile, v_lds_read_windows[i_lds_buf_0]);
+        gemm_2(dpacc_tile, do_tile, v_lds_read_windows[i_buf][i_lds_buf_0]);
 
         if constexpr (i_n0 < n0_loops - 1) {
           detail::IssueDirectLds(
               static_cast<QKVDataType*>(smem_ptr),
               v_dram_window,
-              v_issues(number<i_n0 + 1>{}),
+              v_issues[i_buf][number<i_n0 + 1>{}],
               v_row_offset);
           v_row_offset += v_row_step;
         }
@@ -538,32 +547,20 @@ struct HstuAttentionNoSoftmaxBwdDirectLdsTrLoadPipelineQRKSVS_dQ {
       });
 
       __builtin_amdgcn_sched_barrier(
-          LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+          LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+          LLVMSchedGroupMask::TRANS);
 
-      if constexpr (EvenIter) {
-        detail::IssueDirectLds(
-            static_cast<QKVDataType*>(smem_ptr),
-            k_dram_window,
-            k_issues_1(number<0>{}),
-            k_row_offset);
-        k_row_offset += k_row_step;
-      } else {
-        detail::IssueDirectLds(
-            static_cast<QKVDataType*>(smem_ptr),
-            k_dram_window,
-            k_issues_0(number<0>{}),
-            k_row_offset);
-        k_row_offset += k_row_step;
-      }
-
-      // wait normal reading of the whole v_lds tile in gemm_2() of current
-      // iteration to be done
-      __builtin_amdgcn_s_barrier();
-
+      constexpr auto next_buf = number<1 - i_buf>{};
+      detail::IssueDirectLds(
+          static_cast<QKVDataType*>(smem_ptr),
+          k_dram_window,
+          k_issues[next_buf][number<0>{}],
+          k_row_offset);
+      k_row_offset += k_row_step;
       detail::IssueDirectLds(
           static_cast<QKVDataType*>(smem_ptr),
           v_dram_window,
-          v_issues(number<0>{}),
+          v_issues[next_buf][number<0>{}],
           v_row_offset);
       v_row_offset += v_row_step;
 
@@ -592,8 +589,8 @@ struct HstuAttentionNoSoftmaxBwdDirectLdsTrLoadPipelineQRKSVS_dQ {
       if constexpr (kHasDropout) {
         __builtin_amdgcn_sched_barrier(0);
 
-        auto randval_lds_ptr =
-            reinterpret_cast<char*>(smem_ptr) + k_smem_size * 2 + v_smem_size;
+        auto randval_lds_ptr = reinterpret_cast<char*>(smem_ptr) +
+            k_smem_size * 2 + v_smem_size * 2;
 
         // Dropout propagates through the chain rule onto dP, NOT onto S. The
         // forward is
@@ -630,8 +627,7 @@ struct HstuAttentionNoSoftmaxBwdDirectLdsTrLoadPipelineQRKSVS_dQ {
           constexpr auto ij = make_tuple(idx0, idx1);
           const CompDataType s = pcomp_tile[ij];
           const CompDataType dp = dpcomp_tile[ij];
-          CompDataType ds =
-              dp * type_convert<CompDataType>(scale_p) * f_dsilu(s);
+          CompDataType ds = dp * f_dsilu(s);
 
           dpcomp_tile(ij) = ds;
         });
@@ -663,27 +659,24 @@ struct HstuAttentionNoSoftmaxBwdDirectLdsTrLoadPipelineQRKSVS_dQ {
             sequence<kM0, (i_k1 + 1) * kK1>{}));
 
         // dQ += dS_sub @ KT_sub
-        if constexpr (EvenIter) {
-          gemm_4(dq_acc, ds_slice, k_lds_trload_windows_0[i_k1]);
-        } else {
-          gemm_4(dq_acc, ds_slice, k_lds_trload_windows_1[i_k1]);
-        }
+        gemm_4(dq_acc, ds_slice, k_lds_trload_windows[i_buf][i_k1]);
       });
     };
 
     while (seqlen_k_curr + kN0 < seqlen_k_end) {
-      main_loop_func(bool_constant<true>{});
+      main_loop_func(number<0>{});
       seqlen_k_curr += kN0;
 
-      main_loop_func(bool_constant<false>{});
+      main_loop_func(number<1>{});
       seqlen_k_curr += kN0;
     }
 
     if (seqlen_k_curr < seqlen_k_end)
-      main_loop_func(bool_constant<true>{});
+      main_loop_func(number<0>{});
 
     // Apply alpha scaling to accumulated dQ
-    tile_elementwise_inout([&scale_s](auto& x) { x = x * scale_s; }, dq_acc);
+    tile_elementwise_inout(
+        [&scale_s, &scale_p](auto& x) { x = x * (scale_s * scale_p); }, dq_acc);
 
     return dq_acc;
   }

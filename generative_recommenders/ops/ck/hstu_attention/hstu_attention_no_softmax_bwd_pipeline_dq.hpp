@@ -379,7 +379,8 @@ struct HstuAttentionNoSoftmaxBwdPipelineQRKSVS_dQ {
             partition_index);
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Prefetch next K tile while current stores are in flight
         if constexpr (i_n0 + 1 < n0_loops) {
@@ -388,13 +389,15 @@ struct HstuAttentionNoSoftmaxBwdPipelineQRKSVS_dQ {
         }
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Ensure all LDS stores are visible before Gemm0 reads
         block_sync_lds();
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Gemm0: sacc_tile = Q @ K_sub
         gemm_0(sacc_tile, q_tile, k_lds_windows[i_lds_buf_0]);
@@ -425,7 +428,8 @@ struct HstuAttentionNoSoftmaxBwdPipelineQRKSVS_dQ {
             partition_index);
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Prefetch next V tile while current stores are in flight
         if constexpr (i_n0 + 1 < n0_loops) {
@@ -434,7 +438,8 @@ struct HstuAttentionNoSoftmaxBwdPipelineQRKSVS_dQ {
         }
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Ensure all LDS stores are visible before Gemm2 reads
         block_sync_lds();
@@ -450,7 +455,8 @@ struct HstuAttentionNoSoftmaxBwdPipelineQRKSVS_dQ {
       });
 
       __builtin_amdgcn_sched_barrier(
-          LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+          LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+          LLVMSchedGroupMask::TRANS);
 
       // === STAGE 3: scale, optional bias, mask, then compute P and dS ===
 
@@ -476,7 +482,8 @@ struct HstuAttentionNoSoftmaxBwdPipelineQRKSVS_dQ {
 
       if constexpr (kHasDropout) {
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         auto randval_lds_ptr = reinterpret_cast<char*>(smem_ptr) + k_smem_size +
             v_smem_size + kt_smem_size;
@@ -494,7 +501,8 @@ struct HstuAttentionNoSoftmaxBwdPipelineQRKSVS_dQ {
             randval_lds_ptr, seqlen_k_curr, dpcomp_tile, null_randval_window);
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
       }
 
       // === STAGE 4: dS = dP * scale_p * dsilu(S), then dQ += alpha * dS @ K^T
@@ -517,8 +525,7 @@ struct HstuAttentionNoSoftmaxBwdPipelineQRKSVS_dQ {
           constexpr auto ij = make_tuple(idx0, idx1);
           const CompDataType s = pcomp_tile[ij];
           const CompDataType dp = dpcomp_tile[ij];
-          CompDataType ds =
-              dp * type_convert<CompDataType>(scale_p) * f_dsilu(s);
+          CompDataType ds = dp * f_dsilu(s);
 
           dpcomp_tile(ij) = ds;
         });
@@ -566,7 +573,8 @@ struct HstuAttentionNoSoftmaxBwdPipelineQRKSVS_dQ {
     } while (seqlen_k_curr < seqlen_k_end);
 
     // Apply alpha scaling to accumulated dQ
-    tile_elementwise_inout([&scale_s](auto& x) { x = x * scale_s; }, dq_acc);
+    tile_elementwise_inout(
+        [&scale_s, &scale_p](auto& x) { x = x * (scale_s * scale_p); }, dq_acc);
 
     return dq_acc;
   }

@@ -247,7 +247,8 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVS {
     });
 
     __builtin_amdgcn_sched_barrier(
-        LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+        LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+        LLVMSchedGroupMask::TRANS);
 
     // provide partition_index for LDS tile window so that warp_id is in vgpr
     array<index_t, 2> partition_index{get_warp_id<false>(), get_lane_id()};
@@ -545,7 +546,8 @@ struct HstuAttentionWithSoftmaxFwdPipelineQRKSVS {
       auto p = cast_tile<PDataType>(pcomp_tile);
 
       __builtin_amdgcn_sched_barrier(
-          LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+          LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+          LLVMSchedGroupMask::TRANS);
 
       // STAGE 3, Gemm_1 ( O = P@V )
       static_for<0, k1_loops, 1>{}([&](auto i_k1) {

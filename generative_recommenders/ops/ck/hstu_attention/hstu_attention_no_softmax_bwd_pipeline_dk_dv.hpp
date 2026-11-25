@@ -450,23 +450,26 @@ struct HstuAttentionNoSoftmaxBwdPipelineKRVRQS_dK_dV {
     do_tiles[number<0>{}] = load_tile(do_dram_window);
     move_tile_window(do_dram_window, {kM0Sub, 0});
 
-    // SiLU activation
-    const auto f_dsilu = [](CompDataType x) -> CompDataType {
+    const auto f_sigmoid = [](CompDataType x) -> CompDataType {
       const auto one = type_convert<CompDataType>(1.0f);
       CompDataType sig;
       if constexpr (std::is_same_v<CompDataType, float>)
         sig = __builtin_amdgcn_rcpf(one + __expf(-x));
       else
         sig = one / (one + exp(-x));
+
+      return sig;
+    };
+
+    // SiLU activation
+    const auto f_dsilu = [](CompDataType x, CompDataType sig) -> CompDataType {
+      const auto one = type_convert<CompDataType>(1.0f);
+
       return sig * (one + x * (one - sig));
     };
 
-    const auto f_silu = [](CompDataType x) -> CompDataType {
-      const auto one = type_convert<CompDataType>(1.0f);
-      if constexpr (std::is_same_v<CompDataType, float>)
-        return x * __builtin_amdgcn_rcpf(one + __expf(-x));
-      else
-        return x / (one + exp(-x));
+    const auto f_silu = [](CompDataType x, CompDataType sig) -> CompDataType {
+      return x * sig;
     };
 
     auto seqlen_q_curr = seqlen_q_start;
@@ -495,13 +498,15 @@ struct HstuAttentionNoSoftmaxBwdPipelineKRVRQS_dK_dV {
         }
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Ensure all stores for q_lds are visible before Gemm0 reads
         block_sync_lds();
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Gemm0: sacc_tile = Q_sub @ K
         gemm_0(sacc_tile, q_lds_windows[i_lds_buf_0], k_tile);
@@ -550,13 +555,15 @@ struct HstuAttentionNoSoftmaxBwdPipelineKRVRQS_dK_dV {
         }
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Ensure all stores for do_lds are visible before Gemm2 reads
         block_sync_lds();
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Gemm2: dpacc_tile = dO_sub @ V
         gemm_2(dpacc_tile, do_lds_windows[i_lds_buf_0], v_tile);
@@ -581,7 +588,8 @@ struct HstuAttentionNoSoftmaxBwdPipelineKRVRQS_dK_dV {
       });
 
       __builtin_amdgcn_sched_barrier(
-          LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+          LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+          LLVMSchedGroupMask::TRANS);
 
       // ---- Scale, optional bias, mask ----
       if constexpr (kHasBias) {
@@ -649,10 +657,10 @@ struct HstuAttentionNoSoftmaxBwdPipelineKRVRQS_dK_dV {
           sweep_tile_span(spans[number<1>{}], [&](auto idx1) {
             constexpr auto ij = make_tuple(idx0, idx1);
             const CompDataType s = pcomp_tile[ij];
+            const CompDataType sig = f_sigmoid(s);
             const CompDataType dp = dscomp_tile[ij];
-            CompDataType p = f_silu(s) * type_convert<CompDataType>(scale_p);
-            CompDataType ds =
-                dp * type_convert<CompDataType>(scale_p) * f_dsilu(s);
+            CompDataType p = f_silu(s, sig);
+            CompDataType ds = dp * f_dsilu(s, sig);
             // Dropout propagates through the chain rule: kept -> *rp_undrop on
             // BOTH P (-> dV) and dS (-> dK); dropped -> 0. drop_mask > 0 means
             // kept.
@@ -709,10 +717,10 @@ struct HstuAttentionNoSoftmaxBwdPipelineKRVRQS_dK_dV {
           sweep_tile_span(spans[number<1>{}], [&](auto idx1) {
             constexpr auto ij = make_tuple(idx0, idx1);
             const CompDataType s = pcomp_tile[ij];
+            const CompDataType sig = f_sigmoid(s);
             const CompDataType dp = dscomp_tile[ij];
-            CompDataType p = f_silu(s) * type_convert<CompDataType>(scale_p);
-            CompDataType ds =
-                dp * type_convert<CompDataType>(scale_p) * f_dsilu(s);
+            CompDataType p = f_silu(s, sig);
+            CompDataType ds = dp * f_dsilu(s, sig);
 
             pcomp_tile(ij) = p * type_convert<CompDataType>(hstu_mask(ij));
             dscomp_tile(ij) = ds * type_convert<CompDataType>(hstu_mask(ij));
@@ -772,7 +780,9 @@ struct HstuAttentionNoSoftmaxBwdPipelineKRVRQS_dK_dV {
     } while (seqlen_q_curr < seqlen_q_end);
 
     // Apply alpha scaling to accumulated dK
-    tile_elementwise_inout([&scale_s](auto& x) { x = x * scale_s; }, dk_acc);
+    tile_elementwise_inout(
+        [&scale_s, &scale_p](auto& x) { x = x * (scale_s * scale_p); }, dk_acc);
+    tile_elementwise_inout([&scale_p](auto& x) { x = x * scale_p; }, dv_acc);
 
     return make_tuple(dk_acc, dv_acc);
   }

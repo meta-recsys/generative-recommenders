@@ -14,7 +14,7 @@ namespace ck_tile {
 template <
     typename Problem_,
     typename Policy_ = BlockGemmARegBSmemCRegV2DefaultPolicy>
-struct BlockGemmARegBSmemCRegV2Hack_1 {
+struct BlockGemmARegBSmemCRegSliceGemmKFullGemmN {
   using Problem = remove_cvref_t<Problem_>;
   using Policy = remove_cvref_t<Policy_>;
   using ADataType = remove_cvref_t<typename Problem::ADataType>;

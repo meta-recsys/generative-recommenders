@@ -419,7 +419,8 @@ struct HstuAttentionWithSoftmaxBwdTrLoadPipelineQRKSVS_dQ_D {
             partition_index);
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Prefetch next K tile while current stores are in flight
         if constexpr (i_n0 + 1 < n0_loops) {
@@ -434,13 +435,15 @@ struct HstuAttentionWithSoftmaxBwdTrLoadPipelineQRKSVS_dQ_D {
         }
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Ensure all LDS stores are visible before Gemm0 reads
         block_sync_lds();
 
         __builtin_amdgcn_sched_barrier(
-            LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+            LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+            LLVMSchedGroupMask::TRANS);
 
         // Gemm0: sacc_tile = Q @ K_sub
         gemm_0(sacc_tile, q_tile, k_lds_windows[i_n0]);
@@ -462,7 +465,8 @@ struct HstuAttentionWithSoftmaxBwdTrLoadPipelineQRKSVS_dQ_D {
       });
 
       __builtin_amdgcn_sched_barrier(
-          LLVMSchedGroupMask::ALU | LLVMSchedGroupMask::TRANS);
+          LLVMSchedGroupMask::VALU | LLVMSchedGroupMask::SALU |
+          LLVMSchedGroupMask::TRANS);
 
       // === STAGE 3: scale, bias, mask, then compute P = exp(S - LSE) ===
 
