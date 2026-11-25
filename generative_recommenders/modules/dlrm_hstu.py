@@ -103,6 +103,8 @@ class DlrmHSTUConfig:
     use_layer_norm_postprocessor: bool = False
     hstu_ultra_stack_name: Optional[str] = None
     hstu_fp8_addmm_fwd: bool = False
+    # Opt in only when the payload offsets describe the supplied per-row lengths.
+    reuse_precomputed_merge_offsets: bool = False
 
 
 def _get_supervision_labels_and_weights(
@@ -587,7 +589,19 @@ class DlrmHSTU(HammerModule):
     ]:
         """``candidate_weights`` (``[total_candidates]``), when given, is the
         supervision weight of every task, e.g. 0 for padding candidates so they
-        drop out of the loss and metrics."""
+        drop out of the loss and metrics.
+
+        Reused payload offsets must be contiguous, complete prefix sums of the
+        matching lengths on the same device and in the same row order. A missing
+        key falls back for the embedding merge only; ``_user_forward`` still
+        requires both offset keys to merge timestamps.
+        """
+        precomputed_uih_offsets: Optional[torch.Tensor] = None
+        precomputed_candidate_offsets: Optional[torch.Tensor] = None
+        if self._hstu_configs.reuse_precomputed_merge_offsets:
+            precomputed_uih_offsets = payload_features.get("uih_offsets")
+            precomputed_candidate_offsets = payload_features.get("candidate_offsets")
+
         # merge uih and candidates embeddings
         for (
             uih_feature_name,
@@ -599,13 +613,21 @@ class DlrmHSTU(HammerModule):
                     embedding=concat_2D_jagged(
                         max_seq_len=max_uih_len + max_num_candidates,
                         max_len_left=max_uih_len,
-                        offsets_left=torch.ops.fbgemm.asynchronous_complete_cumsum(
-                            uih_seq_lengths
+                        offsets_left=(
+                            precomputed_uih_offsets
+                            if precomputed_uih_offsets is not None
+                            else torch.ops.fbgemm.asynchronous_complete_cumsum(
+                                uih_seq_lengths
+                            )
                         ),
                         values_left=seq_embeddings[uih_feature_name].embedding,
                         max_len_right=max_num_candidates,
-                        offsets_right=torch.ops.fbgemm.asynchronous_complete_cumsum(
-                            num_candidates
+                        offsets_right=(
+                            precomputed_candidate_offsets
+                            if precomputed_candidate_offsets is not None
+                            else torch.ops.fbgemm.asynchronous_complete_cumsum(
+                                num_candidates
+                            )
                         ),
                         values_right=seq_embeddings[candidate_feature_name].embedding,
                         kernel=self.hammer_kernel(),
