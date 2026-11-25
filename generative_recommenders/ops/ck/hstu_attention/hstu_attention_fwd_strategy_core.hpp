@@ -127,8 +127,9 @@ inline const HstuFwdStrategy& gfx1250_hstu_fwd_strategy() {
 
 inline const HstuFwdStrategy& hstu_fwd_strategy_for_arch(
     std::string_view arch) {
-  if (arch == gfx1250_hstu_fwd_strategy().arch)
+  if (arch == gfx1250_hstu_fwd_strategy().arch) {
     return gfx1250_hstu_fwd_strategy();
+  }
   return default_hstu_fwd_strategy();
 }
 
